@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use player_core::{AudioChunk, AudioDecoder, AudioFormat};
+use player_core::{AudioChunk, AudioDecoder, AudioFormat, FfmpegSource, MediaEvent, MediaSource};
 
 /// 素材里的主频（Hz）。用 ffmpeg 解出的参考 PCM 做 FFT 得到。
 const DOMINANT_HZ: f64 = 172.0;
@@ -202,5 +202,206 @@ fn resamples_to_device_rate_and_channels() {
     assert!(
         at_main > at_shifted,
         "主频仍应是 {DOMINANT_HZ}Hz，而非被比率写反后偏移的那个"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MediaSource 统一出口
+// ---------------------------------------------------------------------------
+
+fn device_format() -> AudioFormat {
+    AudioFormat {
+        sample_rate: 48_000,
+        channels: 2,
+    }
+}
+
+/// 把整个媒体拉完，分别收集音视频的 PTS。
+fn drain_events(src: &mut FfmpegSource) -> (Vec<Duration>, Vec<Duration>, Duration) {
+    let (mut video, mut audio) = (Vec::new(), Vec::new());
+    let mut audio_total = Duration::ZERO;
+    loop {
+        match src.next_event().expect("next_event") {
+            Some(MediaEvent::Video(f)) => video.push(f.pts),
+            Some(MediaEvent::Audio(c)) => {
+                audio_total += c.duration();
+                audio.push(c.pts);
+            }
+            None => break,
+        }
+        assert!(
+            video.len() + audio.len() < 10_000,
+            "产出的单元数远超样本总量，疑似死循环"
+        );
+    }
+    (video, audio, audio_total)
+}
+
+#[test]
+fn source_yields_both_streams_when_audio_enabled() {
+    let mut src =
+        FfmpegSource::open_with(&sample_path(), Some(device_format())).expect("open_with");
+
+    let info = src.audio_info().expect("样本有音轨，应报告音频信息");
+    assert_eq!(info.sample_rate, 48_000);
+    assert_eq!(info.channels, 1, "源是单声道（输出才是设备的 2 声道）");
+
+    let (video, audio, audio_total) = drain_events(&mut src);
+
+    // 10s @ 30fps ≈ 300 帧，与纯视频路径应当一致——加了音频不该少解视频。
+    assert!(
+        (280..=320).contains(&video.len()),
+        "视频帧数 {} 不在预期区间",
+        video.len()
+    );
+    assert!(!audio.is_empty(), "应当产出音频块");
+    assert!(
+        (audio_total.as_secs_f64() - SAMPLE_SECS).abs() < 0.2,
+        "音频总时长 {:.3}s 应接近 {SAMPLE_SECS}s",
+        audio_total.as_secs_f64()
+    );
+}
+
+/// 两路必须**交错**产出，而不是先把一路全吐完再吐另一路。
+///
+/// 这是统一出口最容易写错的地方：只要 demux 循环里有一处按流过滤，
+/// 就会变成「先解完整条视频，再解音频」。功能测试全都能过（数量、时长都对），
+/// 但播放时需要把整条视频缓存在内存里才能等到第一块音频——
+/// 短样本看不出来，长片直接 OOM。
+#[test]
+fn streams_are_interleaved_not_batched() {
+    let mut src =
+        FfmpegSource::open_with(&sample_path(), Some(device_format())).expect("open_with");
+
+    // 记录产出顺序，看两种类型是否穿插。
+    let mut order = Vec::new();
+    loop {
+        match src.next_event().expect("next_event") {
+            Some(MediaEvent::Video(_)) => order.push('v'),
+            Some(MediaEvent::Audio(_)) => order.push('a'),
+            None => break,
+        }
+    }
+
+    // 统计类型切换次数。真交错时会有几百次；一路吐完再吐另一路只有 1 次。
+    let switches = order.windows(2).filter(|w| w[0] != w[1]).count();
+    assert!(
+        switches > 50,
+        "音视频应当交错产出，实际只切换了 {switches} 次（看起来是分批吐的）"
+    );
+
+    // 头部也不该被某一路独占：前 20 个单元里两种都该出现。
+    let head: String = order.iter().take(20).collect();
+    assert!(
+        head.contains('v') && head.contains('a'),
+        "开头 20 个单元应两种都有，实际是 {head}"
+    );
+}
+
+/// 两路的 PTS 必须同步推进，不能一路跑到片尾另一路还在开头。
+#[test]
+fn audio_and_video_pts_advance_together() {
+    let mut src =
+        FfmpegSource::open_with(&sample_path(), Some(device_format())).expect("open_with");
+
+    let mut last_v = Duration::ZERO;
+    let mut last_a = Duration::ZERO;
+    let mut worst_gap = 0.0f64;
+    let (mut n_v, mut n_a) = (0usize, 0usize);
+
+    loop {
+        match src.next_event().expect("next_event") {
+            Some(MediaEvent::Video(f)) => {
+                last_v = f.pts;
+                n_v += 1;
+            }
+            Some(MediaEvent::Audio(c)) => {
+                last_a = c.pts;
+                n_a += 1;
+            }
+            None => break,
+        }
+        // 两路都开始产出之后才比较，否则启动阶段的空档会误判。
+        if last_v > Duration::ZERO && last_a > Duration::ZERO {
+            let gap = (last_v.as_secs_f64() - last_a.as_secs_f64()).abs();
+            worst_gap = worst_gap.max(gap);
+        }
+    }
+
+    // 先确认两路都真的产出过。少了这一条，"音频完全没解出来"会让上面的
+    // 比较一次都不执行，worst_gap 停在 0，测试反而绿灯通过。
+    assert!(
+        n_v > 0 && n_a > 0,
+        "两路都该有产出，实际 video={n_v} audio={n_a}"
+    );
+
+    // 容器本身的交错间隔通常在几百毫秒内。放宽到 1s 仍能抓住"分批吐"这种
+    // 量级的错误（那会让间隔一路涨到接近整个片长）。
+    assert!(
+        worst_gap < 1.0,
+        "音视频 PTS 最大偏离 {worst_gap:.3}s，两路没有同步推进"
+    );
+}
+
+#[test]
+fn audio_stays_off_unless_requested() {
+    // 默认 open 不解音频：ocr-lab 那种纯抽帧场景不该为音频付出代价。
+    let mut src = FfmpegSource::open(&sample_path()).expect("open");
+    assert!(src.audio_info().is_none(), "未开启音频时不该报告音频信息");
+
+    let (video, audio, _) = drain_events(&mut src);
+    assert!(audio.is_empty(), "未开启音频时不该产出音频块");
+    assert!((280..=320).contains(&video.len()));
+}
+
+/// `next_frame` 在开了音频时也要照常工作——它会把音频丢掉，但不能卡住。
+#[test]
+fn next_frame_skips_audio_without_stalling() {
+    let mut src =
+        FfmpegSource::open_with(&sample_path(), Some(device_format())).expect("open_with");
+
+    let mut count = 0;
+    while src.next_frame().expect("next_frame").is_some() {
+        count += 1;
+        assert!(count < 1_000, "疑似死循环");
+    }
+    assert!(
+        (280..=320).contains(&count),
+        "开了音频后 next_frame 仍应解出约 300 帧，实际 {count}"
+    );
+}
+
+/// seek 之后两路都要回到新位置，且不能因为之前播到过结尾就直接报 EOF。
+#[test]
+fn seek_resets_both_streams() {
+    let mut src =
+        FfmpegSource::open_with(&sample_path(), Some(device_format())).expect("open_with");
+
+    // 先一路播到结尾，把 draining 状态点亮。
+    let _ = drain_events(&mut src);
+
+    src.seek(Duration::from_secs(2)).expect("seek");
+
+    let mut got_v = None;
+    let mut got_a = None;
+    for _ in 0..500 {
+        match src.next_event().expect("next_event") {
+            Some(MediaEvent::Video(f)) => got_v = got_v.or(Some(f.pts)),
+            Some(MediaEvent::Audio(c)) => got_a = got_a.or(Some(c.pts)),
+            None => break,
+        }
+        if got_v.is_some() && got_a.is_some() {
+            break;
+        }
+    }
+
+    // 关键：播到过结尾之后 seek 回去，必须还能继续解。
+    // 若 draining 标志没撤销，这里会立刻拿到 None。
+    let v = got_v.expect("seek 后应能解出视频帧（draining 状态没撤销？）");
+    let a = got_a.expect("seek 后应能解出音频块");
+    // seek 落到最近关键帧，允许比目标早一些。
+    assert!(
+        v.as_secs_f64() < 3.0 && a.as_secs_f64() < 3.0,
+        "seek 到 2s 后，首个单元应在附近，实际 video={v:?} audio={a:?}"
     );
 }

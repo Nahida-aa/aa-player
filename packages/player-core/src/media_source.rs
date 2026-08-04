@@ -5,7 +5,11 @@
 //! 解码后端，只需再实现一个 `MediaSource` 即可。
 //!
 //! [`FfmpegSource`] 是当前基于 `ffmpeg-next`（动态链接系统 ffmpeg）的实现，
-//! 提供逐帧拉取（BGRA）+ 运行时 seek 的能力。
+//! 提供音视频逐单元拉取（视频 BGRA / 音频交错 f32）+ 运行时 seek 的能力。
+//!
+//! 音视频从**同一个** [`MediaSource::next_event`] 出口交付（见 [`MediaEvent`]），
+//! 因为容器里本就只有一条 packet 流；分成两个方法必然要缓冲另一路，
+//! 而那个缓冲要么无界（吃光内存）要么会死锁。
 
 use std::path::Path;
 use std::time::Duration;
@@ -17,21 +21,65 @@ use ffmpeg_next::{
     util::frame::Video,
 };
 
+use crate::audio_decoder::{AudioDecoder, AudioInfo};
+use crate::audio_output::AudioFormat;
 use crate::error::Result;
-use crate::frame::{DecodedFrame, VideoInfo};
+use crate::frame::{AudioChunk, DecodedFrame, VideoInfo};
 
-/// 媒体源：一个可打开、可逐帧解码、可 seek 的视频。
+/// 从媒体里解出来的一个单元。
+///
+/// 音频和视频**共享同一条 demux 流**，谁的包先到就先产出谁，
+/// 因此调用方拿到的顺序天然接近二者的 PTS 顺序。
+///
+/// 为什么不是 `next_video()` / `next_audio()` 两个方法：容器里只有一条
+/// packet 流，分开拉就必须把另一路的包缓冲起来。而缓冲无上界时，
+/// 「只拉音频」会把整条视频攒进内存；有上界时又会死锁（缓冲满了，
+/// 但调用方偏偏还在要另一路）。统一出口把这个两难消掉了。
+#[derive(Debug, Clone)]
+pub enum MediaEvent {
+    /// 一帧视频。
+    Video(DecodedFrame),
+    /// 一块音频（已重采样到打开时指定的设备格式）。
+    Audio(AudioChunk),
+}
+
+/// 媒体源：一个可打开、可逐单元解码、可 seek 的媒体。
 pub trait MediaSource {
-    /// 打开一个本地文件或 URL。
+    /// 打开一个本地文件，只解视频。
     fn open(path: &Path) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// 打开并同时解码音频，重采样到 `audio` 指定的设备格式。
+    ///
+    /// 传 `None` 等价于 [`open`](Self::open)。文件本身没有音轨时不算错误，
+    /// 只是不会产出 [`MediaEvent::Audio`]。
+    fn open_with(path: &Path, audio: Option<AudioFormat>) -> Result<Self>
     where
         Self: Sized;
 
     /// 视频流元信息（宽高、时长、帧率）。
     fn video_info(&self) -> VideoInfo;
 
-    /// 拉取下一帧。到文件末尾返回 `Ok(None)`。
-    fn next_frame(&mut self) -> Result<Option<DecodedFrame>>;
+    /// 音频流元信息；没有音轨或未开启音频解码时为 `None`。
+    fn audio_info(&self) -> Option<AudioInfo>;
+
+    /// 拉取下一个单元。到文件末尾返回 `Ok(None)`。
+    fn next_event(&mut self) -> Result<Option<MediaEvent>>;
+
+    /// 拉取下一帧视频，丢弃途中遇到的音频。
+    ///
+    /// 给纯视频场景（逐帧分析、缩略图）的便利方法。开了音频解码时用它
+    /// 会把声音悄悄丢掉，所以要播放请用 [`next_event`](Self::next_event)。
+    fn next_frame(&mut self) -> Result<Option<DecodedFrame>> {
+        loop {
+            match self.next_event()? {
+                Some(MediaEvent::Video(f)) => return Ok(Some(f)),
+                Some(MediaEvent::Audio(_)) => continue,
+                None => return Ok(None),
+            }
+        }
+    }
 
     /// 跳转到指定时间点（最近关键帧）。已解码的残帧需注意在调用方处理。
     fn seek(&mut self, ts: Duration) -> Result<()>;
@@ -58,17 +106,33 @@ pub struct FfmpegSource {
     height: u32,
     duration: Duration,
     fps: f64,
+    /// 音频解码器；未开启音频或文件无音轨时为 `None`。
+    audio: Option<AudioTrack>,
+    /// 已 send_eof、正在把解码器内部缓冲吐干净。
+    draining: bool,
+}
+
+/// 音频那一路的状态。
+struct AudioTrack {
+    index: usize,
+    decoder: AudioDecoder,
+    /// 解码器已 drain 完，接下来该把重采样器里的残留也吐出来。
+    flushing_resampler: bool,
 }
 
 impl MediaSource for FfmpegSource {
     fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, None)
+    }
+
+    fn open_with(path: &Path, audio: Option<AudioFormat>) -> Result<Self> {
         ffmpeg_next::init()?;
 
         if !path.exists() {
             return Err(anyhow::anyhow!("source not found: {}", path.display()));
         }
 
-        Self::from_input(ffmpeg_next::format::input(&path)?)
+        Self::from_input_with(ffmpeg_next::format::input(&path)?, audio)
     }
 
     fn video_info(&self) -> VideoInfo {
@@ -80,49 +144,52 @@ impl MediaSource for FfmpegSource {
         }
     }
 
-    fn next_frame(&mut self) -> Result<Option<DecodedFrame>> {
+    fn audio_info(&self) -> Option<AudioInfo> {
+        self.audio.as_ref().map(|a| a.decoder.info())
+    }
+
+    fn next_event(&mut self) -> Result<Option<MediaEvent>> {
         // ffmpeg 官方 demux/decode 状态机：
         //   - receive_frame 返回 EAGAIN  ⇒ 解码器要更多 packet，继续送
         //   - send_packet  返回 EAGAIN  ⇒ 解码器输入缓冲满，先 receive 排空（暂存 packet 重试）
         //   - receive_frame 返回 Eof    ⇒ 仅当已 send_eof（draining）后才表示真正结束
-        let mut eof_sent = false;
+        //
+        // 两路解码器共用这一套流程：读到的 packet 按 stream index 分发，
+        // 每轮先看看有没有现成的解码结果可以交付。
         loop {
-            // 1) 确保解码器有 packet 可吃，或已进入 draining 模式。
-            if !eof_sent {
-                let packet = match self.pending.take() {
-                    Some(p) => Some(p),
-                    None => self.read_video_packet()?,
-                };
-
-                match packet {
-                    Some(packet) => match self.decoder.send_packet(&packet) {
-                        Ok(()) => {}
-                        Err(Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-                            // 解码器输入满：暂存，先去 receive 排空，下轮重试。
-                            self.pending = Some(packet);
-                        }
-                        Err(e) => return Err(e.into()),
-                    },
-                    None => {
-                        // 文件读完：进入 draining。draining 重复调用会返回 Eof，
-                        // 这是正常终止信号，忽略错误。
-                        let _ = self.decoder.send_eof();
-                        eof_sent = true;
-                    }
-                }
+            // 1) 优先把已解出的东西交出去，不必等下一个 packet。
+            if let Some(ev) = self.take_ready()? {
+                return Ok(Some(ev));
             }
 
-            // 2) 收一帧。
-            match self.decoder.receive_frame(&mut self.raw_frame) {
-                Ok(()) => return Ok(Some(self.frame_to_decoded()?)),
-                Err(Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => continue,
-                Err(Error::Eof) => {
-                    if eof_sent {
-                        return Ok(None); // 真正结束
-                    }
-                    continue;
+            if self.draining {
+                // 两个解码器都吐干净了，还要收走重采样器尾部的残留。
+                if let Some(a) = self.audio.as_mut()
+                    && a.flushing_resampler
+                    && let Some(c) = a.decoder.flush_resampler()?
+                {
+                    return Ok(Some(MediaEvent::Audio(c)));
                 }
-                Err(e) => return Err(e.into()),
+                return Ok(None); // 真正结束
+            }
+
+            // 2) 喂一个 packet 进去。
+            let packet = match self.pending.take() {
+                Some(p) => Some(p),
+                None => self.read_packet()?,
+            };
+
+            match packet {
+                Some(packet) => self.dispatch(packet)?,
+                None => {
+                    // 文件读完：两路一起进入 draining。
+                    // draining 期间重复 send_eof 会返回 Eof，是正常信号，忽略。
+                    let _ = self.decoder.send_eof();
+                    if let Some(a) = self.audio.as_mut() {
+                        a.decoder.send_eof();
+                    }
+                    self.draining = true;
+                }
             }
         }
     }
@@ -133,6 +200,15 @@ impl MediaSource for FfmpegSource {
         self.input.seek(ts_us, ..ts_us)?;
         // seek 后必须 flush 解码器，丢弃残留守帧，否则花屏。
         self.decoder.flush();
+        if let Some(a) = self.audio.as_mut() {
+            a.decoder.flush();
+            a.flushing_resampler = false;
+        }
+        // 暂存的 packet 属于 seek 前的位置，留着会在新位置插进一段旧内容。
+        self.pending = None;
+        // seek 到文件中间后又能继续读了，draining 状态必须撤销，
+        // 否则播到过结尾再 seek 回去会立刻又报 EOF。
+        self.draining = false;
         Ok(())
     }
 }
@@ -143,7 +219,10 @@ impl FfmpegSource {
     /// 与 [`MediaSource::open`] 的区别只在于「怎么拿到 `Input`」：
     /// `open` 负责本地路径校验，这里则接受任何来源（含测试里构造的流），
     /// 好处是解码逻辑可以脱离文件系统单独测试。
-    pub(crate) fn from_input(input: ffmpeg_next::format::context::Input) -> Result<Self> {
+    pub(crate) fn from_input_with(
+        input: ffmpeg_next::format::context::Input,
+        audio_format: Option<AudioFormat>,
+    ) -> Result<Self> {
         // 找最佳视频流。
         let stream = input
             .streams()
@@ -180,6 +259,23 @@ impl FfmpegSource {
             }
         };
 
+        // 音频是可选的：没开启、或文件本身无音轨，都只是"没有声音"，
+        // 不该让打开失败——纯视频素材是常见输入。
+        let audio = match audio_format {
+            Some(fmt) => match input.streams().best(ffmpeg_next::media::Type::Audio) {
+                Some(s) => {
+                    let index = s.index();
+                    Some(AudioTrack {
+                        index,
+                        decoder: AudioDecoder::new(&s, fmt)?,
+                        flushing_resampler: false,
+                    })
+                }
+                None => None,
+            },
+            None => None,
+        };
+
         Ok(Self {
             input,
             stream_index,
@@ -193,10 +289,69 @@ impl FfmpegSource {
             height,
             duration,
             fps,
+            audio,
+            draining: false,
         })
     }
 
-    /// 读出下一个**视频流**的 packet；返回 `Ok(None)` 表示文件真正读完。
+    /// 看看两个解码器里有没有已经解好、可以直接交付的东西。
+    ///
+    /// 视频优先只是个任意选择：同一轮里两者都有产出的情况很少，
+    /// 且调用方本来就要按 PTS 自行调度，谁先出来不影响正确性。
+    fn take_ready(&mut self) -> Result<Option<MediaEvent>> {
+        match self.decoder.receive_frame(&mut self.raw_frame) {
+            Ok(()) => return Ok(Some(MediaEvent::Video(self.frame_to_decoded()?))),
+            Err(Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {}
+            // Eof 只说明**这一路**吐完了，另一路可能还有货，所以不能就此返回 None。
+            Err(Error::Eof) => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        if let Some(a) = self.audio.as_mut() {
+            match a.decoder.receive()? {
+                Some(c) => return Ok(Some(MediaEvent::Audio(c))),
+                // receive 把 EAGAIN 和 Eof 都映射成 None。draining 阶段的 None
+                // 就意味着解码器空了，该轮到重采样器交尾巴了。
+                None if self.draining => a.flushing_resampler = true,
+                None => {}
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// 把一个 packet 送进它所属的解码器。
+    ///
+    /// 输入满（EAGAIN）时暂存到 `pending`，下一轮先 receive 排空再重试
+    /// ——**不能丢弃**，丢一个音频包就是一段静音，丢一个视频包会花屏到下个关键帧。
+    fn dispatch(&mut self, packet: Packet) -> Result<()> {
+        let index = packet.stream();
+
+        if index == self.stream_index {
+            match self.decoder.send_packet(&packet) {
+                Ok(()) => {}
+                Err(Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
+                    self.pending = Some(packet);
+                }
+                Err(e) => return Err(e.into()),
+            }
+            return Ok(());
+        }
+
+        if let Some(a) = self.audio.as_mut()
+            && index == a.index
+            && !a.decoder.send(&packet)?
+        {
+            self.pending = Some(packet);
+        }
+        // 其余流（字幕等）无人认领，丢弃。
+        Ok(())
+    }
+
+    /// 读出下一个 packet（不分流）；返回 `Ok(None)` 表示文件真正读完。
+    ///
+    /// 分流交给 [`dispatch`](Self::dispatch)：在这里过滤会让「跳过的包」和
+    /// 「没有的包」混在一起，音频那一路就永远等不到自己的数据。
     ///
     /// 这里刻意不用 `input.packets()` 迭代器：它把「真 EOF」和「I/O 错误」
     /// 都折叠成 `None`（见 rust-ffmpeg `PacketIter::next`），调用方无从区分，
@@ -208,18 +363,13 @@ impl FfmpegSource {
     ///
     /// 注意终止性错误**不能重试**：它会被记录进 `AVIOContext->pb->error`，
     /// 之后每次 `av_read_frame` 都返回同一个错误。实测旧写法遇到连接中断时
-    /// 会 98% CPU 空转且永不退出——回归测试见
-    /// `tests/decode.rs::read_error_surfaces_instead_of_looking_like_eof`。
-    fn read_video_packet(&mut self) -> Result<Option<Packet>> {
+    /// 会 98% CPU 空转且永不退出——回归测试见本文件底部的
+    /// `read_error_surfaces_instead_of_looking_like_eof`。
+    fn read_packet(&mut self) -> Result<Option<Packet>> {
         loop {
             let mut packet = Packet::empty();
             match packet.read(&mut self.input) {
-                Ok(()) => {
-                    // 只要视频流的包；其余（音频/字幕）当前直接丢弃。
-                    if packet.stream() == self.stream_index {
-                        return Ok(Some(packet));
-                    }
-                }
+                Ok(()) => return Ok(Some(packet)),
                 Err(Error::Eof) => return Ok(None),
                 // 坏包：解复用器能越过 AVERROR_INVALIDDATA 重新同步，跳过即可。
                 Err(Error::InvalidData) => continue,
@@ -235,7 +385,7 @@ impl FfmpegSource {
 
         let width = self.width;
         let height = self.height;
-        let stride = self.rgba_frame.stride(0) as usize;
+        let stride = self.rgba_frame.stride(0);
         // 注意：PTS 必须取自解码出的原始帧 raw_frame，而非 scaler 输出帧 rgba_frame。
         // swscale 生成的输出帧不带时间戳，rgba_frame.timestamp() 恒为 None。
         let pts = match self.raw_frame.timestamp() {
@@ -297,8 +447,8 @@ mod tests {
     /// 只有声明了预期长度的协议才能发现缺斤少两，故这里起一个假 HTTP 服务：
     /// 响应头写完整的 `Content-Length`，实际只发 1/4 就断开。
     ///
-    /// 注意这里走 [`FfmpegSource::from_input`] 而非 `open`：`open` 只接受存在的
-    /// 本地路径，这是有意的约束，不该为了测试去放宽它。
+    /// 注意这里走 [`FfmpegSource::from_input_with`] 而非 `open`：`open` 只接受
+    /// 存在的本地路径，这是有意的约束，不该为了测试去放宽它。
     #[test]
     fn read_error_surfaces_instead_of_looking_like_eof() {
         use std::io::{Read, Write};
@@ -343,8 +493,8 @@ mod tests {
                 ffmpeg_next::init().map_err(|e| format!("ffmpeg init 失败: {e}"))?;
                 let input = ffmpeg_next::format::input(&url)
                     .map_err(|e| format!("截断的 TS 应该能正常打开，却失败了: {e}"))?;
-                let mut src =
-                    FfmpegSource::from_input(input).map_err(|e| format!("构造失败: {e}"))?;
+                let mut src = FfmpegSource::from_input_with(input, None)
+                    .map_err(|e| format!("构造失败: {e}"))?;
 
                 let mut count = 0u32;
                 loop {
