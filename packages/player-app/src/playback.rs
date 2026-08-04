@@ -45,13 +45,14 @@ const SEND_BACKOFF: Duration = Duration::from_millis(2);
 /// 反过来拖慢 worker，污染我们要测的东西。
 const DECODE_LOG_EVERY: u64 = 60;
 
-/// 送往渲染侧的一帧：图像 + 显示时刻（PTS，微秒）+ 文件总时长（微秒）。
+/// 送往渲染侧的一帧：图像、显示时刻（PTS，微秒）、文件总时长（微秒）、
+/// 以及是否**预览帧**（拖动中 Preview seek 解出，应直接显示，不走音频时钟同步）。
 /// `None` 表示流结束（EOF 或出错）。
 ///
 /// 总时长随每帧带上，渲染侧无需自行 open 文件就能画进度条。
 /// 它是常量（每帧都相同），但 `Duration` 是 `Copy`、队列又很浅，
 /// 顺带捎带的成本可忽略。
-pub type FrameMsg = Option<(Arc<RenderImage>, u64, u64)>;
+pub type FrameMsg = Option<(Arc<RenderImage>, u64, u64, bool)>;
 
 pub type FrameSender = mpsc::Sender<FrameMsg>;
 pub type FrameReceiver = mpsc::Receiver<FrameMsg>;
@@ -261,7 +262,10 @@ fn run_until_eof(
     frame_no: &mut u64,
     duration_us: u64,
 ) {
-    let mut next_frame: Option<(Arc<RenderImage>, u64)> = None;
+    let mut next_frame: Option<(Arc<RenderImage>, u64, bool)> = None;
+    // 是否处于"拖动预览"模式（Preview seek）。此模式下解出的帧标记 preview，
+    // 渲染循环直接显示，不走音频时钟同步。
+    let mut previewing = false;
     // 是否已放完（EOF）。之后线程不退出，继续轮询命令，好让"播完后点进度条"
     // 还能 seek 回中间重新播（见 Err/EOF 分支）。
     let mut finished = false;
@@ -337,14 +341,16 @@ fn run_until_eof(
                     match kind {
                         SeekKind::Preview => {
                             // 拖动中预览：只 seek 视频出预览帧，**不重建音频流**、
-                            // 不重锚 offset（不进入正常播放态）。丢弃目标前帧，
-                            // 解出目标附近帧送渲染；渲染循环在 dragging 时直接显示。
+                            // 不重锚 offset（不进入正常播放态）。解出的帧标记
+                            // preview，渲染循环直接显示。
+                            previewing = true;
                             video_seek_target = Some(ts);
                         }
                         SeekKind::Commit => {
                             // 完整 seek：重建声卡流 + 重锚，进入正常播放。
                             // 偏移由下一个视频帧的实际 pts 设定（见 Video 分支），
                             // 而非请求值 ts——否则 keyframe gap 会造成永久偏差。
+                            previewing = false;
                             pending_anchor = true;
                             start_audio = true;
                             video_seek_target = Some(ts);
@@ -370,8 +376,8 @@ fn run_until_eof(
         }
 
         // 有条暂存的待发帧？先发掉（投递会背压），再解下一帧。
-        if let Some((render, pts_us)) = next_frame.take() {
-            if !send_blocking(tx, (render, pts_us, duration_us), running) {
+        if let Some((render, pts_us, preview)) = next_frame.take() {
+            if !send_blocking(tx, (render, pts_us, duration_us, preview), running) {
                 return;
             }
             // 首个 post-seek 视频帧已送出；若音频缓冲也够，就开播。
@@ -416,8 +422,8 @@ fn run_until_eof(
                 // 挂在成功分支上会让"队列持续满"表现为 fps=0（曾误判成线程死亡）。
                 stats.record_decoded(decode_us);
                 let pts_us = f.pts.as_micros() as u64;
-                // 交给下一轮发，避免在 seek 后发送 seek 前的帧。
-                next_frame = Some((render, pts_us));
+                // 交给下一轮发，避免在 seek 后发送 seek 前的帧。带上 preview 标记。
+                next_frame = Some((render, pts_us, previewing));
             }
             Ok(Some(MediaEvent::Audio(chunk))) => {
                 if let Some(target) = audio_seek_target {
@@ -538,7 +544,7 @@ fn drain_audio(audio: &AudioOutput, running: &AtomicBool) {
 /// 表现为忽快忽卡。早期版本"重试一次仍满就丢弃"正是卡顿的根源。
 fn send_blocking(
     tx: &mut FrameSender,
-    item: (Arc<RenderImage>, u64, u64),
+    item: (Arc<RenderImage>, u64, u64, bool),
     running: &AtomicBool,
 ) -> bool {
     let mut pending = Some(item);
@@ -1146,7 +1152,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let mut got_target = false;
         while std::time::Instant::now() < deadline {
-            if let Ok(Some((_, pts_us, _))) = rx.try_recv() {
+            if let Ok(Some((_, pts_us, _, _))) = rx.try_recv() {
                 let pts = Duration::from_micros(pts_us);
                 if (pts.as_secs_f64() - 2.0).abs() < 1.0 {
                     got_target = true;
@@ -1200,7 +1206,7 @@ mod tests {
         // 首个 post-seek 帧到达时音频已走到的位置（应 ≈0，若音频提前起播则很大）。
         let mut first_anchor_pos_us: Option<u64> = None;
         while std::time::Instant::now() < deadline {
-            if let Ok(Some((_, pts_us, _))) = rx.try_recv() {
+            if let Ok(Some((_, pts_us, _, _))) = rx.try_recv() {
                 n += 1;
                 let (_, offset_us, clock) = clock_source.get_with_generation();
                 let pos_us = clock.map(|c| c.position().as_micros() as i64).unwrap_or(0);
@@ -1279,7 +1285,7 @@ mod tests {
         let mut latency_ms = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
         while std::time::Instant::now() < deadline {
-            if let Ok(Some((_, pts_us, _))) = rx.try_recv() {
+            if let Ok(Some((_, pts_us, _, _))) = rx.try_recv() {
                 if pts_us >= 900_000 {
                     latency_ms = Some(seek_t.elapsed().as_millis());
                     println!("seek 到近开头后首个 post-seek 帧延迟 {}ms", seek_t.elapsed().as_millis());
@@ -1299,7 +1305,7 @@ mod tests {
         let mut frame_count = 0u32;
         let collect_deadline = std::time::Instant::now() + Duration::from_secs(4);
         while std::time::Instant::now() < collect_deadline {
-            if let Ok(Some((_, pts_us, _))) = rx.try_recv() {
+            if let Ok(Some((_, pts_us, _, _))) = rx.try_recv() {
                 frame_count += 1;
                 let (_, offset_us, clock) = clock_source.get_with_generation();
                 let pos_us = clock.map(|c| c.position().as_micros() as i64).unwrap_or(0);
@@ -1319,6 +1325,68 @@ mod tests {
             max_behind_us < 300_000,
             "seek 到近开头后最大 behind {}ms，应 <300ms（音频从错误位置解码会虚高）",
             max_behind_us / 1000
+        );
+
+        running.store(false, Ordering::Relaxed);
+        drop(tx);
+    }
+
+    /// 模拟"拖动中快速 Preview seek"：播放中连续发多个 Preview（不同位置），
+    /// 验证解码线程能响应并出帧（画面预览跟手的根基）。若 Preview 后不出帧，
+    /// 画面会完全不动——正是用户"拖动时画面不动"的现象。
+    #[test]
+    #[ignore = "需要真实音频设备"]
+    fn drag_preview_emits_frames() {
+        let (tx, mut rx) = frame_channel();
+        let (cmd, cmd_rx) = command_channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let stats = Arc::new(ProfileStats::default());
+        let clock_source = Arc::new(AudioClockSource::default());
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../player-core/tests/assets/sample.mp4");
+        spawn_decode_thread(
+            path,
+            tx.clone(),
+            running.clone(),
+            stats.clone(),
+            clock_source.clone(),
+            cmd_rx,
+        );
+
+        // 播 ~1s 后开始"拖动"：快速发多个 Preview（不同位置，模拟 mouse 扫过）。
+        std::thread::sleep(Duration::from_millis(1000));
+        for ms in [2000u64, 2500, 3000, 3500, 4000, 4500] {
+            cmd.unbounded_send(PlaybackCommand::Seek(
+                Duration::from_millis(ms),
+                SeekKind::Preview,
+            ))
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(30)); // 拖动节流间隔
+        }
+
+        // 收集拖动结束后 1s 内的帧，看是否有 Preview 位置的帧送出。
+        let mut got_preview_frame = false;
+        let mut got_pts = 0u64;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some((_, pts_us, _, _))) = rx.try_recv() {
+                got_pts = pts_us;
+                // 拖动最后一个 Preview 是 4500ms，覆盖合并应只执行它附近。
+                if pts_us >= 4_000_000 {
+                    got_preview_frame = true;
+                    break;
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        println!(
+            "拖动后收到帧 pts={got_pts}us，命中目标={got_preview_frame}"
+        );
+        assert!(
+            got_preview_frame,
+            "拖动中 Preview 应解出目标附近帧（收到 pts={got_pts}us），否则画面完全不动"
         );
 
         running.store(false, Ordering::Relaxed);
