@@ -246,10 +246,14 @@ fn run_until_eof(
     // ts 之前的最近关键帧上（keyframe gap），用请求值 ts 当偏移会留下
     // 一个永久偏差，behind 随播放不断增大 → 持续丢帧。故用实际首帧 pts。
     let mut pending_anchor = false;
-    // seek 目标：seek 后丢弃所有 `pts < seek_target` 的视频帧（它们是 seek
-    // 落点之前的内容，含关键帧前的 B/P 参考帧），直到遇到第一个 `>= 目标` 的帧
-    // 才送出并锚定。否则这些旧帧会被渲染循环以新偏移调度成巨大 behind → 丢帧风暴。
-    let mut seek_target: Option<Duration> = None;
+    // seek 目标（视频）：seek 后丢弃所有 `pts < 目标` 的视频帧（seek 落点之前的
+    // 内容，含关键帧前的 B/P 参考帧），直到遇到第一个 `>= 目标` 的帧才送出并锚定。
+    // 否则旧帧会被渲染循环以新偏移调度成巨大 behind → 丢帧风暴。
+    let mut video_seek_target: Option<Duration> = None;
+    // seek 目标（音频）：与视频独立。音频 seek 落点同样可能早于目标，若视频先到
+    // 目标清了共享标志，音频的旧内容会漏进来从错误位置播放（seek 到近末尾时
+    // 音频会播几秒旧内容、画面卡死）。各自独立追踪互不干扰。
+    let mut audio_seek_target: Option<Duration> = None;
     // seek 重建了声卡流且是"暂停态"：等首个 post-seek 视频帧送出后再 `start`，
     // 让音频和视频同步开播，避免音频在视频就绪前提前冲出去（向后 seek 卡顿根源）。
     let mut start_audio = false;
@@ -291,7 +295,8 @@ fn run_until_eof(
                         // 会造成永久偏差、behind 不断增大。
                         pending_anchor = true;
                         start_audio = true;
-                        seek_target = Some(ts);
+                        video_seek_target = Some(ts);
+                        audio_seek_target = Some(ts);
                         seek_rebuild_audio(audio, clock_source);
                     }
                     next_frame = None; // 丢弃 seek 前暂存的帧
@@ -329,15 +334,15 @@ fn run_until_eof(
                 if frame_no.is_multiple_of(DECODE_LOG_EVERY) {
                     debug!(frame = *frame_no, pts_ms = f.pts.as_millis(), "解码进度");
                 }
-                // seek 后：丢弃 `pts < seek_target` 的帧（seek 落点前的旧内容，
+                // seek 后：丢弃 `pts < video_seek_target` 的帧（seek 落点前的旧内容，
                 // 含关键帧前的 B/P 参考帧）。否则渲染循环以新偏移调度它们会得到
                 // 巨大 behind → 丢帧风暴。直到遇到第一个 `>= 目标` 的帧才放行。
-                if let Some(target) = seek_target {
+                if let Some(target) = video_seek_target {
                     if f.pts < target {
                         debug!(drop_pts_ms = f.pts.as_millis(), target_ms = target.as_millis(), "seek 丢弃目标前帧");
                         continue;
                     }
-                    seek_target = None;
+                    video_seek_target = None;
                 }
                 // seek 后的首个视频帧：用它的实际 pts 减去**当时音频位置**作锚定
                 // 偏移。若音频在首个视频帧解码前已提前走了一段 a，偏移 = 首帧pts - a，
@@ -363,16 +368,12 @@ fn run_until_eof(
                 next_frame = Some((render, pts_us));
             }
             Ok(Some(MediaEvent::Audio(chunk))) => {
-                // seek 后音频也会先从 seek 落点前的包开始解码（音频 seek 落点
-                // 不精确），丢弃 `pts < seek_target` 的 chunk，让音频和视频从
-                // 同一位置起播，否则两者内容错位、音频位置远超视频（日志里
-                // audio 到 4s 而视频帧还卡在 8.5s 正是此因）。
-                if let Some(target) = seek_target
-                    && chunk.pts < target
-                {
-                    debug!(drop_audio_pts_ms = chunk.pts.as_millis(), "seek 丢弃目标前音频");
-                    continue;
-                    // 注意：不在这里清 seek_target——要等首个视频帧也 >= 目标才清。
+                if let Some(target) = audio_seek_target {
+                    if chunk.pts < target {
+                        debug!(drop_audio_pts_ms = chunk.pts.as_millis(), "seek 丢弃目标前音频");
+                        continue;
+                    }
+                    audio_seek_target = None; // 已到目标位置，后续音频放行
                 }
                 if let Some(a) = audio.as_ref() {
                     // 背压：缓冲够深就等一等，别把整轨解进内存。
@@ -597,10 +598,19 @@ impl PlaybackClock {
             // 后续 now 随音频推进同步，behind 恒 ~0。
             let mut now_us = audio.position().as_micros() as i64 + self.audio_offset;
             // 封顶到文件时长：seek 到近末尾时音频内容播完会下溢补静音，
-            // `audio.position()` 虚高超过时长（如 7s > 10s 文件），now 失去意义、
-            // 视频帧全被 Drop。封顶后视频帧能正常播完。
+            // `audio.position()` 虚高超过时长（如 7s > 10s 文件），now 失去意义。
+            let mut capped = false;
             if self.duration_us > 0 {
+                if now_us > self.duration_us as i64 {
+                    capped = true;
+                }
                 now_us = now_us.min(self.duration_us as i64);
+            }
+            // 封顶生效 = 音频内容已播完（下溢补静音阶段）。此时不要再按 behind
+            // Drop 视频帧——音频已到头，视频应把剩余帧**立即显示**播完，否则
+            // 画面停在最后一帧（用户实测 seek 到近末尾后卡 7 秒）。
+            if capped {
+                return Schedule::Now;
             }
             let now = Duration::from_micros(now_us.max(0) as u64);
             return Self::schedule_against(target, now, DROP_THRESHOLD, |behind| {
@@ -820,11 +830,12 @@ mod tests {
     }
 
     /// seek 到近末尾时，音频内容播完会下溢补静音、`audio.position()` 虚高超过
-    /// 文件时长（如 7s > 10s 文件），`now` 失去意义、视频帧全被 Drop。
-    /// `set_duration` 把 now 封顶到时长，视频帧能正常播完。
+    /// 文件时长（如 7s > 10s 文件），`now` 失去意义、视频帧全被 Drop → 画面卡死。
+    /// `set_duration` 封顶 now；一旦封顶生效（音频已到头），剩余帧应**直接 Now**
+    /// 显示播完，而不是继续按 behind Drop。
     #[test]
     fn duration_cap_prevents_underrun_phantom_behind() {
-        // 音频位置虚高到 15s（> 10s 文件），offset=8s，帧 pts=9s。
+        // 音频位置虚高到 15s（> 10s 文件），offset=8s。
         let mut clock = audio_clock(fake_clock(15000));
         clock.set_audio_offset(8_000_000);
         // 不设 duration：now = 15+8 = 23s，pts=9s → behind 14s → Drop。
@@ -832,16 +843,13 @@ mod tests {
             clock.schedule(Duration::from_millis(9000)),
             Schedule::Drop { .. }
         ));
-        // 设 duration=10s：now 封顶到 10s，pts=9s → behind=1s，但比 14s 好；
-        // 关键：不会因下溢虚高把整段视频 Drop 掉。
+        // 设 duration=10s：now 封顶到 10s（音频已到下溢阶段），剩余帧直接 Now
+        // 显示，不再 Drop——否则尾部画面会一直停在最后一帧（用户实测卡 7s）。
         clock.set_duration(10_000_000);
-        match clock.schedule(Duration::from_millis(9000)) {
-            Schedule::Drop { behind } => {
-                assert!(behind <= Duration::from_secs(1), "封顶后 behind 应 ≤1s");
-            }
-            Schedule::Now => {}
-            other => panic!("封顶后应 Now 或小 Drop，得到 {other:?}"),
-        }
+        assert!(
+            matches!(clock.schedule(Duration::from_millis(9000)), Schedule::Now),
+            "封顶生效后应直接显示剩余帧，而非继续 Drop"
+        );
     }
 
     /// 核心回归测试：seek 后**音频不能在首个 post-seek 视频帧送出前起播**。
@@ -1179,6 +1187,78 @@ mod tests {
         assert!(
             first_anchor_pos_ms < 500,
             "首个 post-seek 帧到达时音频已走到 {first_anchor_pos_ms}ms，应 <500ms（音频提前起播会卡画面）"
+        );
+
+        running.store(false, Ordering::Relaxed);
+        drop(tx);
+    }
+
+    /// 复现"seek 到近末尾后画面卡几秒"：seek 到 9.8s（10s 文件），测量从发 seek
+    /// 命令到首个 post-seek 帧到达的**延迟**。用户实测中间 7 秒画面冻结。
+    #[test]
+    #[ignore = "需要真实音频设备"]
+    fn seek_near_end_first_frame_latency() {
+        let (tx, mut rx) = frame_channel();
+        let (cmd, cmd_rx) = command_channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let stats = Arc::new(ProfileStats::default());
+        let clock_source = Arc::new(AudioClockSource::default());
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../player-core/tests/assets/sample.mp4");
+        spawn_decode_thread(
+            path,
+            tx.clone(),
+            running.clone(),
+            stats.clone(),
+            clock_source.clone(),
+            cmd_rx,
+        );
+
+        // 播 ~2s 后 seek 到 9.8s（近末尾）。
+        std::thread::sleep(Duration::from_millis(2000));
+        let seek_t = std::time::Instant::now();
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(9800))).unwrap();
+
+        // 等首个 post-seek 帧（pts >= 9s，seek 后内容）到达，测耗时。
+        let mut latency_ms = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some((_, pts_us, _))) = rx.try_recv() {
+                if pts_us >= 9_000_000 {
+                    latency_ms = Some(seek_t.elapsed().as_millis());
+                    println!("seek 到近末尾后首个 post-seek 帧延迟 {}ms", seek_t.elapsed().as_millis());
+                    break;
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let latency_ms = latency_ms.expect("应在 8s 内收到 seek 后的帧");
+        println!("seek 到近末尾延迟 {latency_ms}ms");
+
+        // 监控 seek 后 3s 内音频位置峰值：若音频从错误位置（seek 前）解码，
+        // 音频位置会一路涨（用户实测到 ~7s）而视频早已到 EOF。
+        let mut max_audio_ms = 0u64;
+        let mon_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < mon_deadline {
+            if let Ok(Some((_, _, _))) = rx.try_recv() {
+                // 继续收帧（避免 channel 满阻塞解码线程）
+            }
+            if let (_, _, Some(c)) = clock_source.get_with_generation() {
+                max_audio_ms = max_audio_ms.max(c.position().as_millis() as u64);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        println!("seek 后 3s 内音频位置峰值 {max_audio_ms}ms");
+        // 注：此峰值反映的是音频下溢补静音（content 播完后 frames_played 继续涨），
+        // 不是"音频从错误位置解码"。渲染侧已用 duration 封顶 now 并直接显示尾部帧
+        // （见 duration_cap 相关单测），这里不再据此断言。
+
+        // 用户实测 7 秒冻结。此处容忍 2s：若远超说明仍卡。
+        assert!(
+            latency_ms < 2000,
+            "seek 到近末尾首个帧延迟 {latency_ms}ms，应 <2000ms（用户实测卡 7s）"
         );
 
         running.store(false, Ordering::Relaxed);

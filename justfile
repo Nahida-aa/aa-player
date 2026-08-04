@@ -1,10 +1,11 @@
 # aa-player 的常用命令 —— 沿用 gpui_learn / ocr-lab 的 justfile 风格
 #
 # 用法：just <recipe>   例如：just dev / just check / just test / just build
-# 不带参数时默认执行 `default`（即 dev）。
+# 不带参数时默认执行 `default`。
 
 # 默认 recipe：启动 GUI 应用
-default: run
+default:
+    @just --list
 
 # 启动播放器 GUI（首次会从 zed git 源编译 GPUI，较慢）
 run:
