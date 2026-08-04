@@ -131,7 +131,15 @@ impl PlayerView {
                 clock.set_duration(duration_us);
 
                 match clock.schedule(pts) {
-                    Schedule::Wait(d) => cx.background_executor().timer(d).await,
+                    // 用 GPUI timer 精确等待。但**封顶等待时长**：若某帧被判 1 秒后
+                    // 才显示，几乎必然是 seek 后残留的旧帧（pts 远大于新 offset）——
+                    // 真等会卡住画面数秒、音频趁机超前（用户实测卡 7s）。直接丢弃。
+                    Schedule::Wait(d) => {
+                        if d.as_millis() > 1000 {
+                            continue; // 旧帧/时钟错位，丢弃
+                        }
+                        cx.background_executor().timer(d).await;
+                    }
                     Schedule::Now => {}
                     // 音频主时钟下落后太多：跳过这一帧，让画面追上声音，
                     // 不能反过来把已经播出去的音频拽慢。

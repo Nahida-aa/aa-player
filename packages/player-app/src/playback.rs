@@ -1215,19 +1215,19 @@ mod tests {
             cmd_rx,
         );
 
-        // 播 ~2s 后 seek 到 9.8s（近末尾）。
+        // 播 ~2s 后 seek 到 0.95s（近开头，用户最新日志 seek=951 的场景）。
         std::thread::sleep(Duration::from_millis(2000));
         let seek_t = std::time::Instant::now();
-        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(9800))).unwrap();
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(951))).unwrap();
 
-        // 等首个 post-seek 帧（pts >= 9s，seek 后内容）到达，测耗时。
+        // 等首个 post-seek 帧（pts >= 0.9s，seek 后内容）到达，测耗时。
         let mut latency_ms = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
         while std::time::Instant::now() < deadline {
             if let Ok(Some((_, pts_us, _))) = rx.try_recv() {
-                if pts_us >= 9_000_000 {
+                if pts_us >= 900_000 {
                     latency_ms = Some(seek_t.elapsed().as_millis());
-                    println!("seek 到近末尾后首个 post-seek 帧延迟 {}ms", seek_t.elapsed().as_millis());
+                    println!("seek 到近开头后首个 post-seek 帧延迟 {}ms", seek_t.elapsed().as_millis());
                     break;
                 }
             } else {
@@ -1235,35 +1235,35 @@ mod tests {
             }
         }
         let latency_ms = latency_ms.expect("应在 8s 内收到 seek 后的帧");
-        println!("seek 到近末尾首帧延迟 {latency_ms}ms");
+        println!("seek 到近开头首帧延迟 {latency_ms}ms");
 
-        // 测 **time-to-EOF**：从发 seek 到收到 `None`（文件末尾）的总时间。
-        // 用户实测 seek 到近末尾后 7 秒才到 EOF——如果这里也 ~7s，说明解码管线
-        // 慢；如果这里很快（<1s），说明 7s 在渲染循环。
-        let mut eof_seen = false;
-        let mut total_frames = 0u32;
-        let eof_deadline = std::time::Instant::now() + Duration::from_secs(8);
-        while std::time::Instant::now() < eof_deadline {
-            match rx.try_recv() {
-                Ok(Some(_)) => total_frames += 1,
-                Ok(None) => {
-                    eof_seen = true;
-                    break;
-                }
-                _ => std::thread::sleep(Duration::from_millis(20)),
+        // 收集 seek 后 4s 内的帧，算 `now = audio.position() + offset`，对照帧 pts，
+        // 测最大 behind（这是渲染循环 Drop 的依据）。用户 seek=951 后 behind 达
+        // 7000ms——若这里也大，说明音频从错误位置解码。
+        let mut max_behind_us = 0u64;
+        let mut frame_count = 0u32;
+        let collect_deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while std::time::Instant::now() < collect_deadline {
+            if let Ok(Some((_, pts_us, _))) = rx.try_recv() {
+                frame_count += 1;
+                let (_, offset_us, clock) = clock_source.get_with_generation();
+                let pos_us = clock.map(|c| c.position().as_micros() as i64).unwrap_or(0);
+                let now_us = pos_us + offset_us;
+                let behind = now_us.saturating_sub(pts_us as i64).max(0) as u64;
+                max_behind_us = max_behind_us.max(behind);
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
-        let time_to_eof_ms = seek_t.elapsed().as_millis();
         println!(
-            "seek 到近末尾 time-to-EOF {time_to_eof_ms}ms（{total_frames} 帧，EOF={eof_seen}）"
+            "seek 到近开头后 {frame_count} 帧，最大 behind {}ms",
+            max_behind_us / 1000
         );
-
-        // 用户实测 7 秒。解码管线应在 <2s 内到 EOF；若远超说明解码慢（需查
-        // seek_target 丢弃是否卡住解码循环）。
-        assert!(eof_seen, "应在 8s 内到 EOF");
+        // 用户实测 behind 7000ms。解码线程应保持同步（behind < 300ms）。
         assert!(
-            time_to_eof_ms < 2000,
-            "seek 到近末尾到 EOF 耗时 {time_to_eof_ms}ms，应 <2000ms（用户实测 7s）"
+            max_behind_us < 300_000,
+            "seek 到近开头后最大 behind {}ms，应 <300ms（音频从错误位置解码会虚高）",
+            max_behind_us / 1000
         );
 
         running.store(false, Ordering::Relaxed);
