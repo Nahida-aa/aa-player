@@ -435,9 +435,10 @@ fn run_until_eof(
                 }
                 if let Some(a) = audio.as_ref() {
                     // 背压：缓冲够深就等一等，别把整轨解进内存。
-                    // 注意：seek 后音频是暂停态（start_audio 未清），队列不会被消费，
-                    // 此时若还按 AUDIO_BUFFER 背压会永久卡死。故仅在音频已开播后背压。
-                    if !start_audio {
+                    // 注意：seek 后音频是暂停态（start_audio 未清）或拖动预览
+                    // （previewing，MuteAudio 停声卡），队列都不会被消费，此时若还
+                    // 按 AUDIO_BUFFER 背压会永久卡死。故仅在音频已开播且非预览时背压。
+                    if !start_audio && !previewing {
                         while running.load(Ordering::Relaxed)
                             && a.queued_duration() > AUDIO_BUFFER
                         {
@@ -1354,8 +1355,9 @@ mod tests {
             cmd_rx,
         );
 
-        // 播 ~1s 后开始"拖动"：快速发多个 Preview（不同位置，模拟 mouse 扫过）。
+        // 播 ~1s 后开始"拖动"：先 MuteAudio（真实拖动静音），再快速发多个 Preview。
         std::thread::sleep(Duration::from_millis(1000));
+        cmd.unbounded_send(PlaybackCommand::MuteAudio).unwrap();
         for ms in [2000u64, 2500, 3000, 3500, 4000, 4500] {
             cmd.unbounded_send(PlaybackCommand::Seek(
                 Duration::from_millis(ms),

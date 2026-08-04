@@ -156,6 +156,11 @@ impl MediaSource for FfmpegSource {
         //
         // 两路解码器共用这一套流程：读到的 packet 按 stream index 分发，
         // 每轮先看看有没有现成的解码结果可以交付。
+        // 防死锁：连续多次「send EAGAIN 存 pending + receive EAGAIN 无输出」且
+        // 没读到新 packet 时，说明解码器状态卡死（seek + flush 后可能出现）。
+        // 若放任会无限循环、解码线程挂死、画面冻结。这里限次后按 EOF 结束本次
+        // 调用，让调用方能重新 seek 驱动，而不是永久卡住。
+        let mut stalled = 0u32;
         loop {
             // 1) 优先把已解出的东西交出去，不必等下一个 packet。
             if let Some(ev) = self.take_ready()? {
@@ -180,7 +185,20 @@ impl MediaSource for FfmpegSource {
             };
 
             match packet {
-                Some(packet) => self.dispatch(packet)?,
+                Some(packet) => {
+                    self.dispatch(packet)?;
+                    // 若 dispatch 又 EAGAIN 存回 pending（没能送进解码器），且本轮
+                    // 也没解出帧，说明没进展。累计到阈值即视为卡死，提前结束。
+                    if self.pending.is_some() {
+                        stalled += 1;
+                        if stalled > 64 {
+                            tracing::warn!("解码状态卡死（send/receive 均 EAGAIN），按 EOF 结束本次读取");
+                            return Ok(None);
+                        }
+                    } else {
+                        stalled = 0; // 送进去了，重置
+                    }
+                }
                 None => {
                     // 文件读完：两路一起进入 draining。
                     // draining 期间重复 send_eof 会返回 Eof，是正常信号，忽略。
