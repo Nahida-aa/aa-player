@@ -363,8 +363,10 @@ fn run_until_eof(
                     if a.take_underrun() {
                         warn!("音频欠载：解码跟不上声卡消费");
                     }
-                    // 缓冲够就开播（seek 后）。
-                    try_start_audio(audio, &mut start_audio);
+                    // 注意：**不要**在这里 try_start_audio——seek 后若音频事件先到、
+                    // 缓冲填满就起播，而首个 post-seek 视频帧还没就绪，音频会提前跑出去，
+                    // 等视频追上时 behind 已巨大（seek 后卡顿的根源）。音频必须在
+                    // 首个 post-seek 视频帧送出后才起播（见 Video 送出分支）。
                 }
             }
             Ok(None) => {
@@ -389,17 +391,33 @@ fn run_until_eof(
     }
 }
 
+/// 是否该起播音频（seek 后）。
+///
+/// 三个条件缺一不可：seek 待启动（`start_audio`）、首个 post-seek 视频帧已送出
+/// （`video_frame_sent`）、缓冲已填到 `AUDIO_START_MIN`。
+///
+/// 关键：**必须等视频帧送出才起播**。若音频事件先把缓冲填满就起播，而首个
+/// 视频帧还没就绪，音频会提前跑出去，等视频追上时 behind 已巨大——这正是
+/// seek 后画面持续卡顿的根源（音频不应在视频就绪前起播，mpv 同理）。
+/// 抽成纯函数便于确定性单测。
+fn audio_start_ready(start_audio: bool, video_frame_sent: bool, queued: Duration) -> bool {
+    start_audio && video_frame_sent && queued >= AUDIO_START_MIN
+}
+
 /// seek 后重建声卡流，让音频时钟归零。
 ///
 /// seek 重建的音频是暂停态：等首个 post-seek 视频帧送出**且**音频缓冲填到
 /// `AUDIO_START_MIN` 才 `start()`，让音视频同步起跑，避免音频提前冲出去
 /// 或几乎空缓冲起播导致欠载爆音。
+///
+/// 此函数**只在视频帧送出分支调用**（`video_frame_sent=true`），音频推入分支
+/// 不得调用——否则音频事件先到就会提前起播。
 fn try_start_audio(audio: &Option<AudioOutput>, start_audio: &mut bool) {
     if !*start_audio {
         return;
     }
     let Some(a) = audio.as_ref() else { return };
-    if a.queued_duration() >= AUDIO_START_MIN {
+    if audio_start_ready(*start_audio, true, a.queued_duration()) {
         *start_audio = false;
         a.start();
         debug!("seek 后音频已启动（缓冲 {:#?}）", a.queued_duration());
@@ -733,6 +751,30 @@ mod tests {
             }
             other => panic!("origin 被清掉了，首帧之后本应等待，得到 {other:?}"),
         }
+    }
+
+    /// 核心回归测试：seek 后**音频不能在首个 post-seek 视频帧送出前起播**。
+    ///
+    /// 若音频事件先把缓冲填满就起播（`video_frame_sent=false`），音频会提前跑出去，
+    /// 等视频首帧追上时 behind 已巨大 → 持续丢帧/卡顿（用户实测 behind 5.7s/7s）。
+    /// `audio_start_ready` 必须要求 `video_frame_sent` 为真。
+    #[test]
+    fn audio_start_ready_requires_first_video_frame_sent() {
+        let buf_ok = Duration::from_millis(100); // ≥ AUDIO_START_MIN(80ms)
+
+        // 音频事件先填满缓冲，但视频帧还没送出：**不应**起播。
+        assert!(
+            !audio_start_ready(true, false, buf_ok),
+            "音频事件填满缓冲也不能提前起播（首个视频帧未就绪）"
+        );
+        // 缓冲不足，即使视频帧已送出也不起播（避免空缓冲起播欠载爆音）。
+        assert!(!audio_start_ready(true, true, Duration::from_millis(20)));
+        // 非 seek 场景（start_audio=false）不起播。
+        assert!(!audio_start_ready(false, true, buf_ok));
+        // 三者齐备：seek 待启动 + 视频帧已送出 + 缓冲够 → 起播。
+        assert!(audio_start_ready(true, true, buf_ok));
+        // 边界：缓冲恰好等于阈值也起播。
+        assert!(audio_start_ready(true, true, AUDIO_START_MIN));
     }
 
     /// 构造一个"已出声、读数可控"的假音频时钟。
