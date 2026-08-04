@@ -323,8 +323,10 @@ impl PlayerView {
 
     /// 拖动中的**预览 seek**（Preview）：只 seek 视频出预览帧，画面跟手，
     /// 不重建音频流。松开时才发 Commit 正式 seek。
+    /// 同时更新本地 position，让进度条跟随鼠标。
     fn seek_preview(&mut self, target: Duration) {
         let target = target.min(self.duration);
+        self.position = target;
         let _ = self.cmd.unbounded_send(playback::PlaybackCommand::Seek(
             target,
             playback::SeekKind::Preview,
