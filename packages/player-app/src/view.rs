@@ -11,7 +11,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use gpui::{
     Context, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    Render, RenderImage, Task, Window, div, green, prelude::*, px, relative, rgba, white,
+    MouseMoveEvent, MouseUpEvent, Render, RenderImage, Task, Window, div, green, prelude::*, px,
+    relative, rgba, white,
 };
 use tracing::{info, warn};
 
@@ -27,6 +28,11 @@ const SEEK_STEP: Duration = Duration::from_secs(5);
 /// 进度条左右留白（像素）。轨道宽度 = 窗口宽 − 2×此值；
 /// 点击映射用同一常量换算，保证轨道/填充/点击三者对齐。
 const PROGRESS_INSET: f32 = 12.0;
+
+/// 拖动进度条时是否实时 seek（画面/声音随鼠标跳，拖到哪看到哪）。
+/// `false` = 拖动中只移动进度条视觉，松开才跳到最终位置。
+/// 默认 `true`（对齐主流播放器的实时跟随手感）。将来可接配置文件。
+const LIVE_SEEK: bool = true;
 
 /// 播放器视图：持有一帧最新的解码画面，并接收键盘/鼠标控制。
 pub struct PlayerView {
@@ -45,6 +51,9 @@ pub struct PlayerView {
     position: Duration,
     /// 是否暂停（仅 UI 侧镜像，真正的暂停在解码线程）。
     paused: bool,
+    /// 是否正在拖动进度条。拖动中（非 live 模式）渲染循环不更新 position，
+    /// 让进度条视觉跟随鼠标。
+    dragging: bool,
     /// 键盘焦点句柄：让本视图能收到按键。
     focus_handle: FocusHandle,
 }
@@ -164,7 +173,10 @@ impl PlayerView {
                     this.latest_frame = Some(render);
                     // 进度：首帧也确认总时长。
                     this.duration = Duration::from_micros(duration_us);
-                    this.position = pts;
+                    // 拖动中（非 live）不覆盖 position，让进度条跟随鼠标。
+                    if !this.dragging {
+                        this.position = pts;
+                    }
                     cx.notify();
                 })
                 .ok();
@@ -197,6 +209,7 @@ impl PlayerView {
             duration: Duration::ZERO,
             position: Duration::ZERO,
             paused: false,
+            dragging: false,
             focus_handle,
         }
     }
@@ -296,21 +309,51 @@ impl PlayerView {
         let _ = self.cmd.unbounded_send(playback::PlaybackCommand::Seek(target));
     }
 
-    /// 点击进度条：把窗口内 x 坐标映射到播放时间。
+    /// 把窗口内 x 坐标映射到播放时间。
     ///
     /// 轨道相对窗口左右各缩进 [`PROGRESS_INSET`] 像素，所以换算要减去缩进、
     /// 再除以轨道宽（窗口宽 − 2×缩进），与 fill 的 `relative(比例)` 对齐。
-    fn seek_click(&mut self, x: gpui::Pixels, window: &mut Window) {
+    fn x_to_time(&self, x: gpui::Pixels, window: &mut Window) -> Option<Duration> {
         let bounds = window.bounds();
         let window_w = bounds.size.width;
         let track_w = window_w - px(PROGRESS_INSET * 2.0);
         if track_w == px(0.0) {
-            return;
+            return None;
         }
         // Pixels/Pixels → f32 比例。
         let frac = ((x - bounds.origin.x - px(PROGRESS_INSET)) / track_w).clamp(0.0, 1.0);
-        let target = self.duration.mul_f32(frac);
-        self.seek_to(target);
+        Some(self.duration.mul_f32(frac))
+    }
+
+    /// 点击进度条：立即 seek 到点击位置（也作为拖动开始）。
+    fn seek_click(&mut self, x: gpui::Pixels, window: &mut Window) {
+        if let Some(target) = self.x_to_time(x, window) {
+            self.seek_to(target);
+        }
+    }
+
+    /// 拖动进度条移动（按下后移动 / 拖动中）。
+    ///
+    /// - `live_seek`：实时 seek（画面跟随），覆盖合并由解码线程保证只执行最后。
+    /// - 否则只更新进度条视觉，不发给解码线程（松开时才跳）。
+    fn seek_drag(&mut self, x: gpui::Pixels, window: &mut Window) {
+        let Some(target) = self.x_to_time(x, window) else { return };
+        if LIVE_SEEK {
+            self.seek_to(target);
+        } else {
+            // 仅视觉跟随：更新本地 position（进度条动），但不同步音频/视频。
+            self.position = target.min(self.duration);
+            // 不发 seek 命令；`seek_to` 里会发，这里手动处理。
+        }
+    }
+
+    /// 拖动结束（鼠标松开）：非 live 模式才真正 seek 到最终位置。
+    fn seek_release(&mut self, x: gpui::Pixels, window: &mut Window) {
+        if !LIVE_SEEK
+            && let Some(target) = self.x_to_time(x, window)
+        {
+            self.seek_to(target);
+        }
     }
 
     /// 处理按键。返回 true 表示已消费。
@@ -392,10 +435,29 @@ impl Render for PlayerView {
             .gap(px(6.0))
             .bg(rgba(0x00000066))
             // 点击命中区 = 整个控制条（含时间文本行），比 4px 轨道粗得多，
-            // 不容易点到无效区域。seek_click 用同一 PROGRESS_INSET 换算，
+            // 不容易点到无效区域。x_to_time 用同一 PROGRESS_INSET 换算，
             // 横向映射仍精确对齐轨道（轨道左右各缩进 12px）。
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, _cx| {
+            // 按下：开始拖动；live 模式立即 seek 到点击位置。
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, cx| {
+                this.dragging = true;
                 this.seek_click(e.position.x, window);
+                cx.notify();
+            }))
+            // 拖动中：live 模式实时 seek（覆盖合并由解码线程保证只执行最后），
+            // 否则只移动进度条视觉。
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
+                if this.dragging {
+                    this.seek_drag(e.position.x, window);
+                    cx.notify();
+                }
+            }))
+            // 松开：结束拖动；非 live 模式才真正 seek 到最终位置。
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, e: &MouseUpEvent, window, cx| {
+                if this.dragging {
+                    this.dragging = false;
+                    this.seek_release(e.position.x, window);
+                    cx.notify();
+                }
             }))
             .child(
                 // 时间文本行：占满整行宽，右对齐，不参与进度条布局。

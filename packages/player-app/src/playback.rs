@@ -283,7 +283,13 @@ fn run_until_eof(
                         a.resume();
                     }
                 }
-                PlaybackCommand::Seek(ts) => {
+                PlaybackCommand::Seek(mut ts) => {
+                    // 覆盖合并（对齐 mpv queue_seek 绝对覆盖）：拖动/快速 seek 时
+                    // 命令通道会积压多个 Seek，逐个重建声卡流又慢又卡。这里把积压的
+                    // Seek 全消费掉，只保留最新的位置执行一次。
+                    while let Ok(PlaybackCommand::Seek(newer)) = cmd_rx.try_recv() {
+                        ts = newer;
+                    }
                     if let Err(e) = source.seek(ts) {
                         error!(error = %e, seek_ms = ts.as_millis(), "seek 失败");
                     } else {
