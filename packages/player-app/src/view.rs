@@ -9,9 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
-use gpui::{
-    Context, EventEmitter, IntoElement, Render, RenderImage, Styled, Task, Window, div,
-};
+use gpui::{Context, EventEmitter, IntoElement, Render, RenderImage, Styled, Task, Window, div};
 use tracing::{info, warn};
 
 use crate::playback::{self, PlaybackClock, Schedule};
@@ -99,11 +97,7 @@ impl PlayerView {
     }
 
     /// 周期性上报播放统计，并直接给出"流畅/卡顿"的结论。
-    fn spawn_stats_reporter(
-        stats: Arc<ProfileStats>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn spawn_stats_reporter(stats: Arc<ProfileStats>, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |_, cx| {
             loop {
                 cx.background_executor()

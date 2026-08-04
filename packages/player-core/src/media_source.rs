@@ -11,10 +11,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use ffmpeg_next::{
+    Error, Packet, Rational,
     format::Pixel,
     software::scaling::{context::Context as Scaler, flag::Flags},
     util::frame::Video,
-    Error, Packet, Rational,
 };
 
 use crate::error::Result;
@@ -68,57 +68,7 @@ impl MediaSource for FfmpegSource {
             return Err(anyhow::anyhow!("source not found: {}", path.display()));
         }
 
-        let input = ffmpeg_next::format::input(&path)?;
-
-        // 找最佳视频流。
-        let stream = input
-            .streams()
-            .best(ffmpeg_next::media::Type::Video)
-            .ok_or_else(|| anyhow::anyhow!("no video stream in source"))?;
-        let stream_index = stream.index();
-        let time_base = stream.time_base();
-
-        let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
-        let decoder = ctx.decoder().video()?;
-
-        let (width, height) = (decoder.width(), decoder.height());
-        let scaler = Scaler::get(
-            decoder.format(),
-            width,
-            height,
-            Pixel::BGRA,
-            width,
-            height,
-            Flags::BILINEAR,
-        )?;
-
-        // 时长：优先流时长，回退到容器时长（均基于 time_base，转秒）。
-        let duration = Duration::from_secs_f64(stream.duration().unsigned_abs() as f64
-            * f64::from(time_base.numerator())
-            / f64::from(time_base.denominator()));
-        let fps = {
-            let r = stream.avg_frame_rate();
-            if r.denominator() != 0 {
-                r.numerator() as f64 / r.denominator() as f64
-            } else {
-                0.0
-            }
-        };
-
-        Ok(Self {
-            input,
-            stream_index,
-            time_base,
-            decoder,
-            scaler,
-            raw_frame: Video::empty(),
-            rgba_frame: Video::empty(),
-            pending: None,
-            width,
-            height,
-            duration,
-            fps,
-        })
+        Self::from_input(ffmpeg_next::format::input(&path)?)
     }
 
     fn video_info(&self) -> VideoInfo {
@@ -140,34 +90,25 @@ impl MediaSource for FfmpegSource {
             // 1) 确保解码器有 packet 可吃，或已进入 draining 模式。
             if !eof_sent {
                 let packet = match self.pending.take() {
-                    Some(p) => p,
-                    None => match self.input.packets().next() {
-                        Some((stream, packet)) if stream.index() == self.stream_index => packet,
-                        Some(_) => continue, // 非视频流，跳过
-                        None => {
-                            // 文件读完：进入 draining。draining 重复调用会返回 Eof，
-                            // 这是正常终止信号，忽略错误。
-                            let _ = self.decoder.send_eof();
-                            eof_sent = true;
-                            // 直接进入收帧阶段。
-                            match self.decoder.receive_frame(&mut self.raw_frame) {
-                                Ok(()) => return Ok(Some(self.frame_to_decoded()?)),
-                                Err(Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-                                    continue
-                                }
-                                Err(Error::Eof) => return Ok(None),
-                                Err(e) => return Err(e.into()),
-                            }
-                        }
-                    },
+                    Some(p) => Some(p),
+                    None => self.read_video_packet()?,
                 };
-                match self.decoder.send_packet(&packet) {
-                    Ok(()) => {}
-                    Err(Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
-                        // 解码器输入满：暂存，先去 receive 排空，下轮重试。
-                        self.pending = Some(packet);
+
+                match packet {
+                    Some(packet) => match self.decoder.send_packet(&packet) {
+                        Ok(()) => {}
+                        Err(Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {
+                            // 解码器输入满：暂存，先去 receive 排空，下轮重试。
+                            self.pending = Some(packet);
+                        }
+                        Err(e) => return Err(e.into()),
+                    },
+                    None => {
+                        // 文件读完：进入 draining。draining 重复调用会返回 Eof，
+                        // 这是正常终止信号，忽略错误。
+                        let _ = self.decoder.send_eof();
+                        eof_sent = true;
                     }
-                    Err(e) => return Err(e.into()),
                 }
             }
 
@@ -197,6 +138,96 @@ impl MediaSource for FfmpegSource {
 }
 
 impl FfmpegSource {
+    /// 从一个已打开的输入上下文构造。
+    ///
+    /// 与 [`MediaSource::open`] 的区别只在于「怎么拿到 `Input`」：
+    /// `open` 负责本地路径校验，这里则接受任何来源（含测试里构造的流），
+    /// 好处是解码逻辑可以脱离文件系统单独测试。
+    pub(crate) fn from_input(input: ffmpeg_next::format::context::Input) -> Result<Self> {
+        // 找最佳视频流。
+        let stream = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Video)
+            .ok_or_else(|| anyhow::anyhow!("no video stream in source"))?;
+        let stream_index = stream.index();
+        let time_base = stream.time_base();
+
+        let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
+        let decoder = ctx.decoder().video()?;
+
+        let (width, height) = (decoder.width(), decoder.height());
+        let scaler = Scaler::get(
+            decoder.format(),
+            width,
+            height,
+            Pixel::BGRA,
+            width,
+            height,
+            Flags::BILINEAR,
+        )?;
+
+        // 时长：优先流时长，回退到容器时长（均基于 time_base，转秒）。
+        let duration = Duration::from_secs_f64(
+            stream.duration().unsigned_abs() as f64 * f64::from(time_base.numerator())
+                / f64::from(time_base.denominator()),
+        );
+        let fps = {
+            let r = stream.avg_frame_rate();
+            if r.denominator() != 0 {
+                r.numerator() as f64 / r.denominator() as f64
+            } else {
+                0.0
+            }
+        };
+
+        Ok(Self {
+            input,
+            stream_index,
+            time_base,
+            decoder,
+            scaler,
+            raw_frame: Video::empty(),
+            rgba_frame: Video::empty(),
+            pending: None,
+            width,
+            height,
+            duration,
+            fps,
+        })
+    }
+
+    /// 读出下一个**视频流**的 packet；返回 `Ok(None)` 表示文件真正读完。
+    ///
+    /// 这里刻意不用 `input.packets()` 迭代器：它把「真 EOF」和「I/O 错误」
+    /// 都折叠成 `None`（见 rust-ffmpeg `PacketIter::next`），调用方无从区分，
+    /// 于是读盘出错会被静默当成「正常播完」。直接驱动 [`Packet::read`]
+    /// 才能拿到原始错误码，从而分三类处理：
+    ///   - `Eof`         → 真正结束
+    ///   - `InvalidData` → 单个坏包，解复用器可以重新同步，跳过继续
+    ///   - 其它          → 终止性错误（I/O 失败、读取被取消），向上报错
+    ///
+    /// 注意终止性错误**不能重试**：它会被记录进 `AVIOContext->pb->error`，
+    /// 之后每次 `av_read_frame` 都返回同一个错误。实测旧写法遇到连接中断时
+    /// 会 98% CPU 空转且永不退出——回归测试见
+    /// `tests/decode.rs::read_error_surfaces_instead_of_looking_like_eof`。
+    fn read_video_packet(&mut self) -> Result<Option<Packet>> {
+        loop {
+            let mut packet = Packet::empty();
+            match packet.read(&mut self.input) {
+                Ok(()) => {
+                    // 只要视频流的包；其余（音频/字幕）当前直接丢弃。
+                    if packet.stream() == self.stream_index {
+                        return Ok(Some(packet));
+                    }
+                }
+                Err(Error::Eof) => return Ok(None),
+                // 坏包：解复用器能越过 AVERROR_INVALIDDATA 重新同步，跳过即可。
+                Err(Error::InvalidData) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     /// 把当前 raw_frame 转 BGRA 后拷成 [`DecodedFrame`]，并换算 PTS 为 Duration。
     fn frame_to_decoded(&mut self) -> Result<DecodedFrame> {
         // 原始帧 → BGRA（scaler 在 rgba_frame 为空时自动 alloc）。
@@ -225,5 +256,123 @@ impl FfmpegSource {
             height,
             pts,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 把测试素材重封装成 MPEG-TS 字节流（`-c copy`，不重新编码）。
+    ///
+    /// 为什么必须是 TS：mp4 的 `moov` 在文件尾，数据截断后**打开阶段**就失败，
+    /// 根本走不到解码循环，也就测不到 `next_frame` 的错误处理。
+    /// TS 是流式容器，头部信息在最前面，残缺数据照样能开。
+    ///
+    /// 不把 .ts 存进仓库：它只服务于这一条测试，且能从 sample.mp4 无损推导。
+    /// ffmpeg 命令不可用时返回 None，让测试跳过而不是误报失败。
+    fn sample_as_mpegts() -> Option<Vec<u8>> {
+        let sample =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/assets/sample.mp4");
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(sample)
+            .args(["-c", "copy", "-f", "mpegts", "pipe:1"])
+            .output()
+            .ok()?;
+        (out.status.success() && !out.stdout.is_empty()).then_some(out.stdout)
+    }
+
+    /// 读取中断必须报错，不能伪装成「正常播完」。
+    ///
+    /// 背景：旧实现用 `input.packets()` 迭代器，而 rust-ffmpeg 的
+    /// `PacketIter::next` 把**所有**错误都折叠成 `None`，于是网络中断/读盘失败
+    /// 和真 EOF 长得一模一样。后果不止是误报播完：`next_frame` 收到 `None` 会
+    /// 去 `send_eof` 进入 draining，而终止性错误已被记进 `AVIOContext->pb->error`
+    /// 且是**粘性**的，之后每次 `av_read_frame` 都返回它，外层循环便一直空转
+    /// ——实测跑满 98% CPU 且永不退出。
+    ///
+    /// 怎么造出这个错误：本地文件造不出来。截断文件、FIFO 关闭写端、concat 分片
+    /// 被截短，在操作系统看来**都是干净的 EOF**——OS 无法表达「本该还有数据」。
+    /// 只有声明了预期长度的协议才能发现缺斤少两，故这里起一个假 HTTP 服务：
+    /// 响应头写完整的 `Content-Length`，实际只发 1/4 就断开。
+    ///
+    /// 注意这里走 [`FfmpegSource::from_input`] 而非 `open`：`open` 只接受存在的
+    /// 本地路径，这是有意的约束，不该为了测试去放宽它。
+    #[test]
+    fn read_error_surfaces_instead_of_looking_like_eof() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let Some(data) = sample_as_mpegts() else {
+            eprintln!("跳过：ffmpeg 命令不可用，无法生成 TS");
+            return;
+        };
+        let total = data.len();
+        // 只发一小部分就断开，确保失败发生在「读到一半」而非一开始。
+        let cut = total / 4;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = std::thread::spawn(move || {
+            // 只服务一个连接就退出。用 incoming() 的第一个即可。
+            if let Some(Ok(mut stream)) = listener.incoming().next() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\
+                     Content-Type: video/mp2t\r\nAccept-Ranges: none\r\n\r\n"
+                );
+                if stream.write_all(hdr.as_bytes()).is_ok() {
+                    let _ = stream.write_all(&data[..cut]);
+                    // 承诺了 total 字节却只发 cut 就关闭：http 协议层会发现
+                    // 「还差一大截」，报连接中断而非当成干净 EOF。
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+            }
+        });
+
+        let url = format!("http://{addr}/sample.ts");
+
+        // 解码放子线程 + 超时：错误被吞掉时的症状是**死循环空转**，
+        // 直接在测试线程跑会把 CI 挂死。看门狗把「卡死」转成明确的失败信息。
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let verdict = (|| {
+                ffmpeg_next::init().map_err(|e| format!("ffmpeg init 失败: {e}"))?;
+                let input = ffmpeg_next::format::input(&url)
+                    .map_err(|e| format!("截断的 TS 应该能正常打开，却失败了: {e}"))?;
+                let mut src =
+                    FfmpegSource::from_input(input).map_err(|e| format!("构造失败: {e}"))?;
+
+                let mut count = 0u32;
+                loop {
+                    match src.next_frame() {
+                        Ok(Some(_)) => count += 1,
+                        Ok(None) => {
+                            return Err(format!(
+                                "读取被中断却报告成正常 EOF（{count} 帧后），错误被吞了"
+                            ));
+                        }
+                        Err(_) => return Ok(count), // 期望路径：错误如实上报
+                    }
+                    if count > 1_000 {
+                        return Err("解出的帧数远超样本总量，疑似死循环".into());
+                    }
+                }
+            })();
+            let _ = tx.send(verdict);
+        });
+
+        let verdict = rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| Err("解码线程 30s 未返回：错误很可能被吞掉后陷入空转".into()));
+        let _ = server.join();
+
+        match verdict {
+            Ok(count) => assert!(count < 300, "连接中途就断了，不该解出完整的 {count} 帧"),
+            Err(msg) => panic!("{msg}"),
+        }
     }
 }

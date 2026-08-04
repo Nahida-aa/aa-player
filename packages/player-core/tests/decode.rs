@@ -17,7 +17,9 @@ const SAMPLE_DURATION_SECS: u64 = 10;
 
 fn sample_path(name: &str) -> PathBuf {
     // cargo 集成测试运行时，crate 根目录即当前工作目录。
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/assets")
+        .join(name)
 }
 
 #[test]
@@ -53,7 +55,10 @@ fn sample_has_audio_stream() {
         let has_audio = input
             .streams()
             .any(|s| s.parameters().medium() == ffmpeg_next::media::Type::Audio);
-        assert!(has_audio, "[{name}] 样本缺少音轨，请用带 -c:a aac 的命令重新生成");
+        assert!(
+            has_audio,
+            "[{name}] 样本缺少音轨，请用带 -c:a aac 的命令重新生成"
+        );
     }
 }
 
@@ -71,11 +76,21 @@ fn next_frame_decodes_bgra_with_correct_dimensions() {
         assert_eq!(frame.width, *w, "[{name}] width");
         assert_eq!(frame.height, *h, "[{name}] height");
         // BGRA: 每行至少 width*4 字节。
-        assert!(frame.stride >= frame.width as usize * 4, "[{name}] stride too small");
+        assert!(
+            frame.stride >= frame.width as usize * 4,
+            "[{name}] stride too small"
+        );
         // 含 stride 填充的总长度。
-        assert_eq!(frame.data.len(), frame.stride * frame.height as usize, "[{name}] data len");
+        assert_eq!(
+            frame.data.len(),
+            frame.stride * frame.height as usize,
+            "[{name}] data len"
+        );
         // 首帧不应是全零（否则解码/转换有问题）。
-        assert!(frame.data.iter().any(|&b| b != 0), "[{name}] frame is all zeros");
+        assert!(
+            frame.data.iter().any(|&b| b != 0),
+            "[{name}] frame is all zeros"
+        );
     }
 }
 
@@ -128,7 +143,6 @@ fn seek_then_decode_returns_frames_near_target() {
         );
     }
 }
-
 #[test]
 fn decode_to_end_returns_none_without_panic() {
     for (name, _, _, _) in SAMPLES {
@@ -140,7 +154,7 @@ fn decode_to_end_returns_none_without_panic() {
         loop {
             match src.next_frame() {
                 Ok(Some(_)) => count += 1,
-                Ok(None) => break,                       // 正常结束
+                Ok(None) => break, // 正常结束
                 Err(e) => panic!("[{name}] decode error at frame {count}: {e}"),
             }
             if count > 1_000 {
