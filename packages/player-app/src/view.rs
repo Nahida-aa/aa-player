@@ -369,10 +369,11 @@ impl Render for PlayerView {
                 this.seek_click(e.position.x, window);
             }))
             .child(
+                // 轨道占满整行宽（**无水平内边距**）：这样 fill 的 relative(比例)
+                // 相对整行宽计算，100% 时恰好填满轨道，不会出现"轨道比进度长"。
                 div()
                     .id("bar")
                     .w_full()
-                    .px(px(12.0))
                     .h(px(4.0))
                     .bg(rgba(0xffffff33))
                     .rounded_full()
