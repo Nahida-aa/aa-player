@@ -16,11 +16,11 @@ default:
 run *video:
     cargo run -- {{video}}
 
-dev:
-    cargo watch -x run
+dev *video:
+    cargo watch -x run -- {{video}}
 
-debug:
-    RUST_LOG=player_app=debug cargo run
+debug *video:
+    RUST_LOG=player_app=debug cargo run -- {{video}}
 
 # 用环境变量 VIDEO 指定要播放的视频（绝对或相对路径）：
 #   VIDEO=/path/to/video.mp4 just video

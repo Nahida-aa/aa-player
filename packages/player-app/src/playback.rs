@@ -71,8 +71,20 @@ pub enum PlaybackCommand {
     Pause,
     /// 恢复。
     Resume,
-    /// 跳转到指定时刻。解码线程 seek + 重建声卡流重锚时钟。
-    Seek(Duration),
+    /// 跳转到指定时刻。
+    Seek(Duration, SeekKind),
+}
+
+/// seek 的种类。
+///
+/// 区分「拖动中预览」和「松开后正式」：拖动中只 seek 视频出预览帧、**不重建
+/// 音频流**（快、跟手、不爆音）；松开才做完整 seek（重建音频 + 重锚）进入正常播放。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekKind {
+    /// 拖动中：只 seek 视频出预览帧，不重建音频流，画面跟手。
+    Preview,
+    /// 松开/点击/键盘：完整 seek，重建音频 + 重锚，进入正常播放。
+    Commit,
 }
 
 pub type CommandSender = mpsc::UnboundedSender<PlaybackCommand>;
@@ -290,36 +302,46 @@ fn run_until_eof(
                         a.resume();
                     }
                 }
-                PlaybackCommand::Seek(mut ts) => {
-                    // 覆盖合并（对齐 mpv queue_seek 绝对覆盖）：拖动/快速 seek 时
-                    // 命令通道会积压多个 Seek，逐个重建声卡流又慢又卡。这里把积压的
-                    // Seek 全消费掉，只保留最新的位置执行一次。
-                    while let Ok(PlaybackCommand::Seek(newer)) = cmd_rx.try_recv() {
+                PlaybackCommand::Seek(mut ts, mut kind) => {
+                    // 覆盖合并：拖动会积压多个 Seek。Preview 只保留最新（画面预览
+                    // 跟手，中间位置可跳过）；Commit 是最终位置，总是优先执行。
+                    while let Ok(PlaybackCommand::Seek(newer, newer_kind)) = cmd_rx.try_recv() {
                         ts = newer;
+                        kind = newer_kind; // 后到的覆盖；若是 Commit 则保持 Commit
                     }
                     // 不要 seek 到文件绝对末尾：ffmpeg seek 到末尾后 `next_event`
-                    // 会长时间阻塞（解码线程卡死，无法响应后续 seek——"拖动到末尾
-                    // 后再 seek 失效"）。留一个安全余量，用户仍能看到结尾内容。
+                    // 会长时间阻塞（解码线程卡死，无法响应后续 seek）。留安全余量。
                     let max_seek = duration_us.saturating_sub(SEEK_END_MARGIN_US);
                     if ts.as_micros() as u64 > max_seek {
                         ts = Duration::from_micros(max_seek);
                     }
                     if let Err(e) = source.seek(ts) {
                         error!(error = %e, seek_ms = ts.as_millis(), "seek 失败");
-                    } else {
-                        info!(seek_ms = ts.as_millis(), "seek");
-                        // 播完后 seek：seek 会撤销 draining，重新可读，即可继续播放。
-                        finished = false;
-                        // 重建声卡流（音频从 0 起算）；偏移由下一个视频帧的实际 pts
-                        // 设定（见 Video 分支），而不是请求值 ts——否则 keyframe gap
-                        // 会造成永久偏差、behind 不断增大。
-                        pending_anchor = true;
-                        start_audio = true;
-                        video_seek_target = Some(ts);
-                        audio_seek_target = Some(ts);
-                        seek_rebuild_audio(audio, clock_source);
+                        continue;
                     }
-                    next_frame = None; // 丢弃 seek 前暂存的帧
+                    info!(seek_ms = ts.as_millis(), kind = ?kind, "seek");
+                    // seek 会撤销 draining，重新可读，即可继续播放。
+                    finished = false;
+                    // 丢弃 seek 前暂存的帧。
+                    next_frame = None;
+                    match kind {
+                        SeekKind::Preview => {
+                            // 拖动中预览：只 seek 视频出预览帧，**不重建音频流**、
+                            // 不重锚 offset（不进入正常播放态）。丢弃目标前帧，
+                            // 解出目标附近帧送渲染；渲染循环在 dragging 时直接显示。
+                            video_seek_target = Some(ts);
+                        }
+                        SeekKind::Commit => {
+                            // 完整 seek：重建声卡流 + 重锚，进入正常播放。
+                            // 偏移由下一个视频帧的实际 pts 设定（见 Video 分支），
+                            // 而非请求值 ts——否则 keyframe gap 会造成永久偏差。
+                            pending_anchor = true;
+                            start_audio = true;
+                            video_seek_target = Some(ts);
+                            audio_seek_target = Some(ts);
+                            seek_rebuild_audio(audio, clock_source);
+                        }
+                    }
                 }
             }
             continue;
@@ -1105,10 +1127,10 @@ mod tests {
         assert!(saw_eof, "应在 10s 内读到 EOF");
 
         // 模拟"拖动到末尾"：seek 到近末尾（9930）。
-        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(9930))).unwrap();
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(9930), SeekKind::Commit)).unwrap();
         // 等 1s 让它处理（不论是否 EOF），然后立即再 seek 回 2s。
         std::thread::sleep(Duration::from_millis(1000));
-        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_secs(2))).unwrap();
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_secs(2), SeekKind::Commit)).unwrap();
 
         // 关键断言：末尾拖动后再 seek 回 2s，解码线程必须仍能响应、重新出帧。
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -1157,7 +1179,7 @@ mod tests {
         // 先播到 ~8s（把音频时钟推到 8s），再**向后** seek 到 2.5s——复现用户
         // "向后 seek 卡顿" 与 seek 后音频/视频内容错位（音频从旧位置解码）的场景。
         std::thread::sleep(Duration::from_millis(8000));
-        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(2500))).unwrap();
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(2500), SeekKind::Commit)).unwrap();
         info!("已发向后 seek 到 2.5s");
 
         // 收集 seek 后 3s 内的帧，统计"真正 post-seek"帧的 behind。
@@ -1241,7 +1263,7 @@ mod tests {
         // 播 ~2s 后 seek 到 0.95s（近开头，用户最新日志 seek=951 的场景）。
         std::thread::sleep(Duration::from_millis(2000));
         let seek_t = std::time::Instant::now();
-        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(951))).unwrap();
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(951), SeekKind::Commit)).unwrap();
 
         // 等首个 post-seek 帧（pts >= 0.9s，seek 后内容）到达，测耗时。
         let mut latency_ms = None;

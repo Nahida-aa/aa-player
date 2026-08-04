@@ -51,9 +51,9 @@ pub struct PlayerView {
     position: Duration,
     /// 是否暂停（仅 UI 侧镜像，真正的暂停在解码线程）。
     paused: bool,
-    /// 是否正在拖动进度条。拖动中（非 live 模式）渲染循环不更新 position，
-    /// 让进度条视觉跟随鼠标。
-    dragging: bool,
+    /// 是否正在拖动进度条。用 `Arc<AtomicBool>` 以便渲染循环（独立 async task）
+    /// 读取——拖动中直接显示预览帧，不走音频时钟调度。
+    dragging: Arc<AtomicBool>,
     /// 键盘焦点句柄：让本视图能收到按键。
     focus_handle: FocusHandle,
 }
@@ -95,8 +95,12 @@ impl PlayerView {
 
         let focus_handle = cx.focus_handle();
 
+        // 拖动标志：渲染循环（独立 async task）要读它来决定是否直接显示预览帧。
+        let dragging = Arc::new(AtomicBool::new(false));
+
         // 渲染 task：异步收帧，按 PTS 精确节流显示，绝不阻塞 executor。
         let stats_render = stats.clone();
+        let dragging_render = dragging.clone();
         let _render_task = cx.spawn_in(window, async move |this, cx| {
             // 时钟初始为墙钟；解码线程把音频主时钟交上来后再切换。
             let mut clock = PlaybackClock::new();
@@ -139,42 +143,46 @@ impl PlayerView {
                 // 文件时长用于封顶音频主时钟（seek 到近末尾时音频下溢会虚高）。
                 clock.set_duration(duration_us);
 
-                match clock.schedule(pts) {
-                    // 用 GPUI timer 精确等待。但**封顶等待时长**：若某帧被判 1 秒后
-                    // 才显示，几乎必然是 seek 后残留的旧帧（pts 远大于新 offset）——
-                    // 真等会卡住画面数秒、音频趁机超前（用户实测卡 7s）。直接丢弃。
-                    Schedule::Wait(d) => {
-                        if d.as_millis() > 1000 {
-                            continue; // 旧帧/时钟错位，丢弃
+                // 拖动中：直接显示预览帧，不走音频时钟调度（音频位置和预览位置
+                // 不匹配会被 Drop）。松开后恢复正常同步。
+                if !dragging_render.load(Ordering::Relaxed) {
+                    match clock.schedule(pts) {
+                        // 用 GPUI timer 精确等待。但**封顶等待时长**：若某帧被判 1 秒后
+                        // 才显示，几乎必然是 seek 后残留的旧帧（pts 远大于新 offset）——
+                        // 真等会卡住画面数秒、音频趁机超前（用户实测卡 7s）。直接丢弃。
+                        Schedule::Wait(d) => {
+                            if d.as_millis() > 1000 {
+                                continue; // 旧帧/时钟错位，丢弃
+                            }
+                            cx.background_executor().timer(d).await;
                         }
-                        cx.background_executor().timer(d).await;
-                    }
-                    Schedule::Now => {}
-                    // 音频主时钟下落后太多：跳过这一帧，让画面追上声音，
-                    // 不能反过来把已经播出去的音频拽慢。
-                    Schedule::Drop { behind } => {
-                        // 只有较大落后才打日志：小 behind 是音频主时钟下视频追赶的
-                        // 正常行为，逐帧 warn 会刷屏。
-                        if behind.as_millis() >= 500 {
-                            warn!(
-                                behind_ms = behind.as_millis(),
-                                pts_ms = pts_us / 1000,
-                                offset_ms = offset_us / 1000,
-                                audio_ms = audio.as_ref().map(|c| c.position().as_millis()).unwrap_or_default(),
-                                "画面落后音频，丢帧追赶"
-                            );
+                        Schedule::Now => {}
+                        // 音频主时钟下落后太多：跳过这一帧，让画面追上声音，
+                        // 不能反过来把已经播出去的音频拽慢。
+                        Schedule::Drop { behind } => {
+                            // 只有较大落后才打日志：小 behind 是音频主时钟下视频追赶的
+                            // 正常行为，逐帧 warn 会刷屏。
+                            if behind.as_millis() >= 500 {
+                                warn!(
+                                    behind_ms = behind.as_millis(),
+                                    pts_ms = pts_us / 1000,
+                                    offset_ms = offset_us / 1000,
+                                    audio_ms = audio.as_ref().map(|c| c.position().as_millis()).unwrap_or_default(),
+                                    "画面落后音频，丢帧追赶"
+                                );
+                            }
+                            continue;
                         }
-                        continue;
+                        Schedule::Resynced { behind } => playback::log_resync(behind, pts),
                     }
-                    Schedule::Resynced { behind } => playback::log_resync(behind, pts),
                 }
 
                 this.update(cx, |this, cx| {
                     this.latest_frame = Some(render);
                     // 进度：首帧也确认总时长。
                     this.duration = Duration::from_micros(duration_us);
-                    // 拖动中（非 live）不覆盖 position，让进度条跟随鼠标。
-                    if !this.dragging {
+                    // 拖动中不覆盖 position，让进度条跟随鼠标。
+                    if !this.dragging.load(Ordering::Relaxed) {
                         this.position = pts;
                     }
                     cx.notify();
@@ -209,7 +217,7 @@ impl PlayerView {
             duration: Duration::ZERO,
             position: Duration::ZERO,
             paused: false,
-            dragging: false,
+            dragging,
             focus_handle,
         }
     }
@@ -302,11 +310,25 @@ impl PlayerView {
         self.seek_to(self.position.saturating_add(delta));
     }
 
-    /// 跳到指定时间点（夹到 [0, duration]）。
+    /// 跳到指定时间点（夹到 [0, duration]）。**正式 seek**（Commit）：
+    /// 重建音频 + 重锚，进入正常播放。用于点击/键盘/松开。
     fn seek_to(&mut self, target: Duration) {
         let target = target.min(self.duration);
         self.position = target;
-        let _ = self.cmd.unbounded_send(playback::PlaybackCommand::Seek(target));
+        let _ = self.cmd.unbounded_send(playback::PlaybackCommand::Seek(
+            target,
+            playback::SeekKind::Commit,
+        ));
+    }
+
+    /// 拖动中的**预览 seek**（Preview）：只 seek 视频出预览帧，画面跟手，
+    /// 不重建音频流。松开时才发 Commit 正式 seek。
+    fn seek_preview(&mut self, target: Duration) {
+        let target = target.min(self.duration);
+        let _ = self.cmd.unbounded_send(playback::PlaybackCommand::Seek(
+            target,
+            playback::SeekKind::Preview,
+        ));
     }
 
     /// 把窗口内 x 坐标映射到播放时间。
@@ -325,7 +347,7 @@ impl PlayerView {
         Some(self.duration.mul_f32(frac))
     }
 
-    /// 点击进度条：立即 seek 到点击位置（也作为拖动开始）。
+    /// 点击进度条：立即精确 seek 到点击位置（也作为拖动开始）。
     fn seek_click(&mut self, x: gpui::Pixels, window: &mut Window) {
         if let Some(target) = self.x_to_time(x, window) {
             self.seek_to(target);
@@ -334,12 +356,12 @@ impl PlayerView {
 
     /// 拖动进度条移动（按下后移动 / 拖动中）。
     ///
-    /// - `live_seek`：实时 seek（画面跟随），覆盖合并由解码线程保证只执行最后。
+    /// - `live_seek`：发 Preview（画面跟手，不重建音频），覆盖合并只执行最后。
     /// - 否则只更新进度条视觉，不发给解码线程（松开时才跳）。
     fn seek_drag(&mut self, x: gpui::Pixels, window: &mut Window) {
         let Some(target) = self.x_to_time(x, window) else { return };
         if LIVE_SEEK {
-            self.seek_to(target);
+            self.seek_preview(target);
         } else {
             // 仅视觉跟随：更新本地 position（进度条动），但不同步音频/视频。
             self.position = target.min(self.duration);
@@ -347,11 +369,10 @@ impl PlayerView {
         }
     }
 
-    /// 拖动结束（鼠标松开）：非 live 模式才真正 seek 到最终位置。
+    /// 拖动结束（鼠标松开）：**总是**发 Commit 正式 seek（重建音频 + 重锚，
+    /// 进入正常播放）。live 模式拖动中发的是 Preview，松开这里补最终 Commit。
     fn seek_release(&mut self, x: gpui::Pixels, window: &mut Window) {
-        if !LIVE_SEEK
-            && let Some(target) = self.x_to_time(x, window)
-        {
+        if let Some(target) = self.x_to_time(x, window) {
             self.seek_to(target);
         }
     }
@@ -437,24 +458,24 @@ impl Render for PlayerView {
             // 点击命中区 = 整个控制条（含时间文本行），比 4px 轨道粗得多，
             // 不容易点到无效区域。x_to_time 用同一 PROGRESS_INSET 换算，
             // 横向映射仍精确对齐轨道（轨道左右各缩进 12px）。
-            // 按下：开始拖动；live 模式立即 seek 到点击位置。
+            // 按下：开始拖动；立即 seek 到点击位置（点击 = 精确 seek，Commit）。
             .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, cx| {
-                this.dragging = true;
+                this.dragging.store(true, Ordering::Relaxed);
                 this.seek_click(e.position.x, window);
                 cx.notify();
             }))
-            // 拖动中：live 模式实时 seek（覆盖合并由解码线程保证只执行最后），
-            // 否则只移动进度条视觉。
+            // 拖动中：live 模式发 Preview（只 seek 视频出预览帧，画面跟手，不重建
+            // 音频）；非 live 只移动进度条视觉。
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
-                if this.dragging {
+                if this.dragging.load(Ordering::Relaxed) {
                     this.seek_drag(e.position.x, window);
                     cx.notify();
                 }
             }))
-            // 松开：结束拖动；非 live 模式才真正 seek 到最终位置。
+            // 松开：结束拖动；发 Commit（正式 seek，重建音频 + 重锚进入正常播放）。
             .on_mouse_up(MouseButton::Left, cx.listener(|this, e: &MouseUpEvent, window, cx| {
-                if this.dragging {
-                    this.dragging = false;
+                if this.dragging.load(Ordering::Relaxed) {
+                    this.dragging.store(false, Ordering::Relaxed);
                     this.seek_release(e.position.x, window);
                     cx.notify();
                 }
