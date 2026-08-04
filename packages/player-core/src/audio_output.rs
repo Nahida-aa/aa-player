@@ -90,6 +90,19 @@ fn f32_to_u16(v: f32) -> u16 {
 impl AudioOutput {
     /// 打开默认输出设备并开始播放（初始为静音，因为队列是空的）。
     pub fn new() -> Result<Self> {
+        Self::create(true)
+    }
+
+    /// 打开默认输出设备，但**不启动播放**（样本推入队列后堆积，静音）。
+    ///
+    /// seek 重建声卡流时用：先建好、喂样本，等首个视频帧就绪再 [`start`](Self::start)
+    /// 同步开播，避免音频在视频准备好之前就提前跑出去（这正是向后 seek 卡顿的
+    /// 根源之一——音频冲在前，画面迟迟追不上）。
+    pub fn new_paused() -> Result<Self> {
+        Self::create(false)
+    }
+
+    fn create(play: bool) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -118,7 +131,9 @@ impl AudioOutput {
             started.clone(),
             format.channels,
         )?;
-        stream.play()?;
+        if play {
+            stream.play()?;
+        }
 
         Ok(Self {
             _stream: stream,
@@ -129,6 +144,12 @@ impl AudioOutput {
             started,
             paused,
         })
+    }
+
+    /// 开始播放。用于 [`new_paused`](Self::new_paused) 建好后、时机到了再开播。
+    pub fn start(&self) {
+        self._stream.play().ok();
+        self.paused.store(false, Ordering::Relaxed);
     }
 
     /// 按设备的采样格式建流。

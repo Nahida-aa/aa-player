@@ -239,6 +239,9 @@ fn run_until_eof(
     // ts 之前的最近关键帧上（keyframe gap），用请求值 ts 当偏移会留下
     // 一个永久偏差，behind 随播放不断增大 → 持续丢帧。故用实际首帧 pts。
     let mut pending_anchor = false;
+    // seek 重建了声卡流且是"暂停态"：等首个 post-seek 视频帧送出后再 `start`，
+    // 让音频和视频同步开播，避免音频在视频就绪前提前冲出去（向后 seek 卡顿根源）。
+    let mut start_audio = false;
     loop {
         if !running.load(Ordering::Relaxed) {
             return;
@@ -276,6 +279,7 @@ fn run_until_eof(
                         // 设定（见 Video 分支），而不是请求值 ts——否则 keyframe gap
                         // 会造成永久偏差、behind 不断增大。
                         pending_anchor = true;
+                        start_audio = true;
                         seek_rebuild_audio(audio, clock_source);
                     }
                     next_frame = None; // 丢弃 seek 前暂存的帧
@@ -300,6 +304,15 @@ fn run_until_eof(
         if let Some((render, pts_us)) = next_frame.take() {
             if !send_blocking(tx, (render, pts_us, duration_us), running) {
                 return;
+            }
+            // seek 重建的音频是暂停态：首个 post-seek 视频帧刚送出，
+            // 此刻开播，音频和视频同步起跑，避免音频提前冲出去。
+            if start_audio {
+                start_audio = false;
+                if let Some(a) = audio.as_ref() {
+                    a.start();
+                    debug!("seek 后音频已启动（首个视频帧已送出）");
+                }
             }
             continue;
         }
@@ -373,10 +386,11 @@ fn run_until_eof(
 /// seek 后重建声卡流，让音频时钟归零。
 ///
 /// 声卡硬件时钟不能倒带：seek 到新位置后，旧 `frames_played` 还在原处，
-/// 画面相对旧音频位置会被判定"大幅落后"→ 丢帧风暴。重建流（`AudioOutput::new`）
-/// 让计数器归零，再把新时钟句柄交回渲染侧。会有一瞬静音/爆音（可接受）。
+/// 画面相对旧音频位置会被判定"大幅落后"→ 丢帧风暴。重建流（`AudioOutput::new_paused`）
+/// 让计数器归零、且**先不启动**（等首个视频帧就绪再 start），再把新时钟句柄交回渲染侧。
+/// 会有一瞬静音/爆音（可接受）。
 fn seek_rebuild_audio(audio: &mut Option<AudioOutput>, clock_source: &Arc<AudioClockSource>) {
-    *audio = match AudioOutput::new() {
+    *audio = match AudioOutput::new_paused() {
         Ok(o) => Some(o),
         Err(e) => {
             warn!(error = %e, "seek 后重开音频设备失败，将以无声模式播放");
@@ -392,7 +406,11 @@ fn seek_rebuild_audio(audio: &mut Option<AudioOutput>, clock_source: &Arc<AudioC
 ///
 /// 解码线程一返回，`AudioOutput` 就被 drop、流随之停止。
 /// 不等的话结尾几百毫秒会被直接掐掉。
+/// 若流处于暂停态（seek 重建后还没 start），先 start 才能让队列播放完。
 fn drain_audio(audio: &AudioOutput, running: &AtomicBool) {
+    if audio.is_paused() {
+        audio.start();
+    }
     while running.load(Ordering::Relaxed) && audio.queued_frames() > 0 {
         std::thread::sleep(AUDIO_BACKOFF);
     }
@@ -887,6 +905,8 @@ mod tests {
         let mut n = 0;
         let mut anchored_count = 0u32;
         let mut max_behind_us = 0u64;
+        // 首个 post-seek 帧到达时音频已走到的位置（应 ≈0，若音频提前起播则很大）。
+        let mut first_anchor_pos_us: Option<u64> = None;
         while std::time::Instant::now() < deadline {
             if let Ok(Some((_, pts_us, _))) = rx.try_recv() {
                 n += 1;
@@ -898,13 +918,21 @@ mod tests {
                 // 旧帧 pts < 偏移，会被渲染侧正确 Drop，不算同步问题。
                 if offset_us != 0 && pts_us as i64 >= offset_us {
                     anchored_count += 1;
+                    if first_anchor_pos_us.is_none() {
+                        first_anchor_pos_us = Some(pos_us.max(0) as u64);
+                    }
                     max_behind_us = max_behind_us.max(behind_us);
                 }
             } else {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-        println!("seek 后共 {n} 帧，post-seek {anchored_count} 帧，最大 behind {}ms", max_behind_us / 1000);
+        let first_anchor_pos_ms = first_anchor_pos_us.map(|u| u / 1000).unwrap_or(u64::MAX);
+        println!(
+            "seek 后共 {n} 帧，post-seek {anchored_count} 帧，最大 behind {}ms，首帧时音频位置 {}ms",
+            max_behind_us / 1000,
+            first_anchor_pos_ms
+        );
 
         // seek 后应持续出帧，且 post-seek 帧的 behind 保持 <100ms（不持续丢帧）。
         assert!(n > 5, "seek 后应持续出帧（收到 {n} 帧）");
@@ -913,6 +941,12 @@ mod tests {
             max_behind_us < 100_000,
             "seek 锚定后最大落后 {}ms，应 <100ms（偏移不对齐会持续 Drop）",
             max_behind_us / 1000
+        );
+        // 首个 post-seek 帧到达时音频不应已跑出去很远（否则画面会先冻结等音频）。
+        // 修复后音频在首帧送出时才 start，此时位置应 ≈0。
+        assert!(
+            first_anchor_pos_ms < 500,
+            "首个 post-seek 帧到达时音频已走到 {first_anchor_pos_ms}ms，应 <500ms（音频提前起播会卡画面）"
         );
 
         running.store(false, Ordering::Relaxed);
