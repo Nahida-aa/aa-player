@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+
+# 注意：Cargo.lock **要**提交。
+# 本仓库产出的是可执行程序（且计划发布 AUR），锁定依赖版本才能保证
+# 构建可复现。"不提交 Cargo.lock" 是纯库(library)的惯例，不适用于此。
+
+.agents/*.local.md
+tmp

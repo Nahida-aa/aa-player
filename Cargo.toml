@@ -1,0 +1,53 @@
+# aa-player —— 一个 Rust (GPUI) 实现的视频播放器 monorepo
+#
+# 工作区根清单，只负责：
+#   1. 声明成员 package；
+#   2. 集中共享依赖与配置。
+#
+# 成员说明：
+#   - packages/player-core : 库包，无 GUI 的播放/解码逻辑，未来可被 ocr-lab 等复用
+#   - packages/player-app  : GPUI GUI 应用包，依赖 player-core，计划发布到 AUR
+
+[workspace]
+resolver = "3"
+
+members = [
+    "packages/*",
+]
+
+# 默认只构建 app（二进制），库本身没有 main，`cargo run` 才有意义。
+default-members = [
+    "packages/player-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+# 库包将来可发布到 crates.io（单独设 true），app 包不发布（设 false）。
+# 这里先统一 false，待 player-core 稳定后再单独放开。
+publish = false
+
+[workspace.dependencies]
+# 与 gpui_learn 保持相同的 GPUI 来源，方便经验复用与 AUR 打包复现。
+gpui = { version = "0.2.2", default-features = false }
+gpui_macros = { version = "0.1.0" }
+gpui_platform = { version = "0.1.0" }
+gpui_util = { version = "0.1.0" }
+
+anyhow = "1.0"
+
+# 日志/可观测性。版本与 gpui 依赖树中已有的保持一致（0.1.44 / 0.3.23），
+# 避免多编译一份。库包只依赖 tracing（门面），由 app 包决定如何订阅输出。
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "d88f68217b370f7a66d0c4b4971db31c0dff6df7", version = "=0.2.2" }
+gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "d88f68217b370f7a66d0c4b4971db31c0dff6df7", version = "=0.1.0" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d88f68217b370f7a66d0c4b4971db31c0dff6df7", version = "=0.1.0" }
+gpui_wgpu = { git = "https://github.com/zed-industries/zed", rev = "d88f68217b370f7a66d0c4b4971db31c0dff6df7", version = "=0.1.0" }
+gpui_util = { git = "https://github.com/zed-industries/zed", rev = "d88f68217b370f7a66d0c4b4971db31c0dff6df7", version = "=0.1.0" }
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "allow" }

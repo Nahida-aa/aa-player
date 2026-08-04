@@ -1,0 +1,37 @@
+[package]
+name = "player-app"
+description = "aa-player 的 GPUI 图形界面应用"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+player-core = { path = "../player-core" }
+
+gpui.workspace = true
+gpui_util.workspace = true
+anyhow.workspace = true
+
+# 与 zed(gpui) 使用的 image / smallvec 同大版本，确保 RenderImage 内部的
+# `image::Frame` 类型一致（否则构造 RenderImage 时类型不匹配无法编译）。
+image = "0.25"
+smallvec = "1"
+
+# 异步 channel：解码线程（OS 线程）用 Sender，GPUI 渲染 task 用 async recv，
+# 避免阻塞 GPUI executor（否则 UI 会因同步 recv 卡死）。
+futures = "0.3"
+
+# app 是二进制入口，负责初始化订阅者（决定日志去哪、什么级别）。
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "freebsd", target_family = "wasm")))'.dependencies]
+gpui_platform = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+gpui_platform = { workspace = true }
+wasm-bindgen = "0.2.120"
