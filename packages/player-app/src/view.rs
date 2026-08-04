@@ -365,6 +365,12 @@ impl Render for PlayerView {
             .flex_col()
             .gap(px(6.0))
             .bg(rgba(0x00000066))
+            // 点击命中区 = 整个控制条（含时间文本行），比 4px 轨道粗得多，
+            // 不容易点到无效区域。seek_click 用同一 PROGRESS_INSET 换算，
+            // 横向映射仍精确对齐轨道（轨道左右各缩进 12px）。
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, _cx| {
+                this.seek_click(e.position.x, window);
+            }))
             .child(
                 // 时间文本行：占满整行宽，右对齐，不参与进度条布局。
                 div()
@@ -383,17 +389,13 @@ impl Render for PlayerView {
                     .px(px(PROGRESS_INSET))
                     .child(
                         // 轨道：宽度 = 整行宽 − 2×内边距。fill 的 relative(比例)
-                        // 相对轨道宽计算，100% 恰好填满，三者（轨道/填充/点击）对齐。
-                        // 点击绑定在轨道上，seek_click 用同一内边距换算，保证精确。
+                        // 相对轨道宽计算，100% 恰好填满，轨道/填充对齐。
                         div()
                             .id("bar")
                             .w_full()
                             .h(px(4.0))
                             .bg(rgba(0xffffff33))
                             .rounded_full()
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, _cx| {
-                                this.seek_click(e.position.x, window);
-                            }))
                             .child(
                                 div()
                                     .id("fill")
