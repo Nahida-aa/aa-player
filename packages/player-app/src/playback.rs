@@ -143,6 +143,13 @@ impl AudioClockSource {
 /// 而多缓冲一点音频的代价只是 seek 响应慢那么一档。
 const AUDIO_BUFFER: Duration = Duration::from_millis(400);
 
+/// seek 重建声卡流后，至少缓冲这么多音频才允许 `start()`。
+///
+/// 参考 mpv：seek 后先把音频缓冲填到 READY 再开播，避免音频在队列几乎为空时
+/// 起跑导致立即欠载/爆音。过早 start 且缓冲很浅，音频会瞬间播空然后卡住，
+/// 而视频继续 → 音画拉开 → 丢帧追赶（正是 seek 后 behind 飙升的根因之一）。
+const AUDIO_START_MIN: Duration = Duration::from_millis(80);
+
 /// 音频缓冲满时的退避间隔。
 const AUDIO_BACKOFF: Duration = Duration::from_millis(5);
 
@@ -305,15 +312,8 @@ fn run_until_eof(
             if !send_blocking(tx, (render, pts_us, duration_us), running) {
                 return;
             }
-            // seek 重建的音频是暂停态：首个 post-seek 视频帧刚送出，
-            // 此刻开播，音频和视频同步起跑，避免音频提前冲出去。
-            if start_audio {
-                start_audio = false;
-                if let Some(a) = audio.as_ref() {
-                    a.start();
-                    debug!("seek 后音频已启动（首个视频帧已送出）");
-                }
-            }
+            // 首个 post-seek 视频帧已送出；若音频缓冲也够，就开播。
+            try_start_audio(audio, &mut start_audio);
             continue;
         }
 
@@ -350,15 +350,21 @@ fn run_until_eof(
             Ok(Some(MediaEvent::Audio(chunk))) => {
                 if let Some(a) = audio.as_ref() {
                     // 背压：缓冲够深就等一等，别把整轨解进内存。
-                    while running.load(Ordering::Relaxed)
-                        && a.queued_duration() > AUDIO_BUFFER
-                    {
-                        std::thread::sleep(AUDIO_BACKOFF);
+                    // 注意：seek 后音频是暂停态（start_audio 未清），队列不会被消费，
+                    // 此时若还按 AUDIO_BUFFER 背压会永久卡死。故仅在音频已开播后背压。
+                    if !start_audio {
+                        while running.load(Ordering::Relaxed)
+                            && a.queued_duration() > AUDIO_BUFFER
+                        {
+                            std::thread::sleep(AUDIO_BACKOFF);
+                        }
                     }
                     a.push_samples(&chunk.samples);
                     if a.take_underrun() {
                         warn!("音频欠载：解码跟不上声卡消费");
                     }
+                    // 缓冲够就开播（seek 后）。
+                    try_start_audio(audio, &mut start_audio);
                 }
             }
             Ok(None) => {
@@ -385,9 +391,24 @@ fn run_until_eof(
 
 /// seek 后重建声卡流，让音频时钟归零。
 ///
+/// seek 重建的音频是暂停态：等首个 post-seek 视频帧送出**且**音频缓冲填到
+/// `AUDIO_START_MIN` 才 `start()`，让音视频同步起跑，避免音频提前冲出去
+/// 或几乎空缓冲起播导致欠载爆音。
+fn try_start_audio(audio: &Option<AudioOutput>, start_audio: &mut bool) {
+    if !*start_audio {
+        return;
+    }
+    let Some(a) = audio.as_ref() else { return };
+    if a.queued_duration() >= AUDIO_START_MIN {
+        *start_audio = false;
+        a.start();
+        debug!("seek 后音频已启动（缓冲 {:#?}）", a.queued_duration());
+    }
+}
+
 /// 声卡硬件时钟不能倒带：seek 到新位置后，旧 `frames_played` 还在原处，
 /// 画面相对旧音频位置会被判定"大幅落后"→ 丢帧风暴。重建流（`AudioOutput::new_paused`）
-/// 让计数器归零、且**先不启动**（等首个视频帧就绪再 start），再把新时钟句柄交回渲染侧。
+/// 让计数器归零、且**先不启动**（等缓冲填够再 start），再把新时钟句柄交回渲染侧。
 /// 会有一瞬静音/爆音（可接受）。
 fn seek_rebuild_audio(audio: &mut Option<AudioOutput>, clock_source: &Arc<AudioClockSource>) {
     *audio = match AudioOutput::new_paused() {
@@ -894,11 +915,11 @@ mod tests {
             cmd_rx,
         );
 
-        // 先播到 ~8s（把音频时钟推到 8s），再向后 seek 到 2.5s（非关键帧，
-        // 首帧 pts≈2s）。向后 seek 会重建声卡流，音频从 0 重新起算。
-        std::thread::sleep(Duration::from_millis(8000));
-        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(2500))).unwrap();
-        info!("已发向后 seek 到 2.5s");
+        // 先播 ~5s，再向前 seek 到 8.4s（接近 10s 末尾）——复现用户日志里
+        // seek=8426 后 behind 高达 5.7s 的场景。
+        std::thread::sleep(Duration::from_millis(5000));
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(8426))).unwrap();
+        info!("已发向前 seek 到 8.4s");
 
         // 收集 seek 后 3s 内的帧，统计"真正 post-seek"帧的 behind。
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
