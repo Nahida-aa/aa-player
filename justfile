@@ -10,6 +10,9 @@ default: dev
 dev:
     cargo run
 
+debug:
+    RUST_LOG=player_app=debug cargo run
+
 # 只做类型/编译检查，不产出二进制
 check:
     cargo check --workspace

@@ -235,13 +235,23 @@ impl Snapshot {
     }
 }
 
-/// 准时率：帧间隔落在 28~38ms（标称 33.3ms 上下各约 5ms）的占比。
-/// 对应桶下标 2..=4。
+/// 准时率：帧间隔落在「标称值上下约 25%」区间的占比。
+///
+/// 30fps 标称 33.3ms，加上合成器节拍与 timer 精度的正常抖动，
+/// 真实间隔稳定在 20~42ms 都算准（1.26× 标称以内仍不可感）。
+/// 对应桶下标 1..=5（桶边界见 [`INTERVAL_BUCKETS_MS`]：20~28 / 28~32 /
+/// 32~35 / 35~38 / 38~42）。
+///
+/// 为什么不是更窄的 ±5ms：实测窗口显示正常播放的 `max_interval_ms`
+/// 也常到 41ms，那是一次无害的调度抖动，不该被算成失准——否则会
+/// 把健康播放天天报成卡顿，真掉帧时反而被淹没（见
+/// `docs/debugging-playback-jank.md` 的"度量本身在骗人"）。真正的卡顿
+/// 靠 `max > 66`（掉整帧）兜底，不靠准时率。
 fn on_time_pct(hist: &[u64; HIST_LEN], total: u64) -> u64 {
     if total == 0 {
         return 0;
     }
-    (hist[2] + hist[3] + hist[4]) * 100 / total
+    (hist[1] + hist[2] + hist[3] + hist[4] + hist[5]) * 100 / total
 }
 
 /// 从直方图估算分位数上界（毫秒）。返回该分位落入的桶上界，
@@ -298,9 +308,34 @@ mod tests {
 
     #[test]
     fn on_time_counts_nominal_buckets() {
-        // 下标 2/3/4 是准时区间。
-        let h = hist_of(&[(2, 10), (3, 70), (4, 10), (7, 10)]);
-        assert_eq!(on_time_pct(&h, 100), 90);
+        // 准时窗口 = 桶 1..=5（20~42ms）。用一次真实稳态播放的分布：
+        // 帧间隔集中在 28~42ms，外加 1 帧落在 42~50ms（桶6）作为轻微抖动。
+        // 下标 1/2/3/4/5 共 58 帧，总 59 帧 → 准时率 98%。
+        let h = hist_of(&[(1, 6), (2, 15), (3, 14), (4, 16), (5, 7), (6, 1)]);
+        assert_eq!(on_time_pct(&h, 59), 98, "正常抖动应判为 98% 准时");
+    }
+
+    /// 回归测试：早先的准时窗口只覆盖 28~38ms，把正常 30fps 抖动
+    /// （常到 41ms）算成失准，于是健康播放被天天报成卡顿。
+    /// 这里确认该稳态分布**不**触发 `is_janky`。
+    #[test]
+    fn steady_state_playback_is_not_janky() {
+        let s = Snapshot {
+            decoded_fps: 30,
+            displayed_fps: 30,
+            avg_decode_us: 600,
+            avg_interval_ms: 32,
+            p99_interval_ms: 42,
+            max_interval_ms: 41,
+            on_time_pct: 98,
+            hist: hist_of(&[(1, 6), (2, 15), (3, 14), (4, 16), (5, 7)]),
+            av_sync_mean_ms: 3,
+            av_sync_rms_ms: 4,
+            av_sync_max_lag_ms: 9,
+            av_sync_max_lead_ms: 8,
+            av_sync_bad_pct: 0,
+        };
+        assert!(!s.is_janky(), "稳态播放（max=41ms）不该判为卡顿");
     }
 
     #[test]
