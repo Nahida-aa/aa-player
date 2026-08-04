@@ -14,7 +14,7 @@ pub mod frame;
 pub mod media_source;
 
 pub use audio_decoder::{AudioDecoder, AudioInfo};
-pub use audio_output::{AudioFormat, AudioOutput};
+pub use audio_output::{AudioClock, AudioFormat, AudioOutput};
 pub use error::Result;
 pub use frame::{AudioChunk, DecodedFrame, VideoInfo};
 pub use media_source::{FfmpegSource, MediaEvent, MediaSource};

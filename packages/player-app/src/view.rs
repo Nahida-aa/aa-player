@@ -44,6 +44,9 @@ impl PlayerView {
         let stats = Arc::new(ProfileStats::default());
         let profiling = tracing::enabled!(tracing::Level::DEBUG);
 
+        // 音频主时钟的交接点：解码线程确认有音轨后填入，渲染侧异步切过去。
+        let clock_source = Arc::new(playback::AudioClockSource::default());
+
         // 关窗时停止解码线程。
         let running_on_release = running.clone();
         cx.on_release(move |_, _cx| {
@@ -51,11 +54,19 @@ impl PlayerView {
         })
         .detach();
 
-        playback::spawn_decode_thread(path, tx, running.clone(), stats.clone());
+        playback::spawn_decode_thread(
+            path,
+            tx,
+            running.clone(),
+            stats.clone(),
+            clock_source.clone(),
+        );
 
         // 渲染 task：异步收帧，按 PTS 精确节流显示，绝不阻塞 executor。
         let stats_render = stats.clone();
         let _render_task = cx.spawn_in(window, async move |this, cx| {
+            // 时钟初始为墙钟；解码线程把音频主时钟交上来后再切换。
+            // 文件无音轨时它会一直是墙钟，那也是正确的行为。
             let mut clock = PlaybackClock::new();
             while let Some(item) = rx.next().await {
                 let Some((render, pts_us)) = item else {
@@ -63,11 +74,22 @@ impl PlayerView {
                 };
                 let pts = Duration::from_micros(pts_us);
 
+                // 时钟可能在本轮等待期间就位，每帧重新探测一次。
+                if clock_source.get().is_some() {
+                    clock = PlaybackClock::with_audio(clock_source.get().unwrap().clone());
+                }
+
                 match clock.schedule(pts) {
                     // 用 GPUI timer 精确等待（对齐事件循环，
                     // 比 worker 线程的 thread::sleep 更平滑）。
                     Schedule::Wait(d) => cx.background_executor().timer(d).await,
                     Schedule::Now => {}
+                    // 音频主时钟下落后太多：跳过这一帧，让画面追上声音，
+                    // 不能反过来把已经播出去的音频拽慢。
+                    Schedule::Drop { behind } => {
+                        warn!(behind_ms = behind.as_millis(), "画面落后音频，丢帧追赶");
+                        continue;
+                    }
                     Schedule::Resynced { behind } => playback::log_resync(behind, pts),
                 }
 

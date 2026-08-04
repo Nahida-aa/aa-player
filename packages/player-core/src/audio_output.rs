@@ -209,6 +209,25 @@ impl AudioOutput {
         q.len() / self.format.channels.max(1) as usize
     }
 
+    /// 队列中尚未播放的时长。比帧数更适合写背压阈值——
+    /// 阈值用「毫秒」表达，换了采样率也不用重算。
+    pub fn queued_duration(&self) -> Duration {
+        Duration::from_secs_f64(self.queued_frames() as f64 / self.format.sample_rate as f64)
+    }
+
+    /// 取一个可跨线程共享的时钟句柄。
+    ///
+    /// [`AudioOutput`] 本身不是 `Send`（cpal 的 `Stream` 不是），
+    /// 但读时钟只需要那个原子计数器。渲染线程要做音视频同步，
+    /// 就得能读到它，于是把这一小块单独递出去。
+    pub fn clock(&self) -> AudioClock {
+        AudioClock {
+            frames_played: self.frames_played.clone(),
+            started: self.started.clone(),
+            sample_rate: self.format.sample_rate,
+        }
+    }
+
     /// 设备累计已消费的播放时长 —— **音频主时钟的读数**。
     ///
     /// 从第一个采样真正被播出时开始计时；在那之前恒为 0，
@@ -230,6 +249,47 @@ impl AudioOutput {
     /// 取出并清除「发生过欠载」的标记。
     pub fn take_underrun(&self) -> bool {
         self.underrun.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// 音频主时钟的只读句柄，可跨线程共享。
+///
+/// 只借走原子计数器，因此和 [`AudioOutput`] 不同，它是 `Send + Sync`。
+#[derive(Clone)]
+pub struct AudioClock {
+    frames_played: Arc<AtomicU64>,
+    started: StartedFlag,
+    sample_rate: u32,
+}
+
+impl AudioClock {
+    /// 当前播放进度。见 [`AudioOutput::position`]。
+    pub fn position(&self) -> Duration {
+        let frames = self.frames_played.load(Ordering::Relaxed);
+        Duration::from_secs_f64(frames as f64 / self.sample_rate as f64)
+    }
+
+    /// 是否已经开始出声。没开始时 [`position`](Self::position) 恒为 0，
+    /// 此时不能拿它当时钟用——否则画面会一直停在第一帧等音频。
+    pub fn started(&self) -> bool {
+        self.started.load(Ordering::Relaxed)
+    }
+
+    /// 仅供测试：用给定的「已播放时长」和「是否开播」造一个假时钟。
+    ///
+    /// 真实时钟要从声卡的原子计数器读数，脱离设备没法造；
+    /// 而 `PlaybackClock` 的音频主时钟路径只依赖 `position()` / `started()`，
+    /// 这两个量用假值就能把调度逻辑测全。`player-app` 的测试也需要它，
+    /// 故不限定 `cfg(test)`。
+    #[doc(hidden)]
+    pub fn for_test(position: Duration, started: bool) -> Self {
+        let sample_rate = 48_000;
+        let frames = (position.as_secs_f64() * sample_rate as f64).round() as u64;
+        Self {
+            frames_played: Arc::new(AtomicU64::new(frames)),
+            started: Arc::new(AtomicBool::new(started)),
+            sample_rate,
+        }
     }
 }
 
