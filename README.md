@@ -22,15 +22,18 @@ packages/
 
 ## 依赖
 
-需要系统的 ffmpeg 开发库（≥ 7.x）：
+需要系统的 ffmpeg 开发库（≥ 7.x）与 ALSA 开发库（音频输出，cpal 依赖）：
 
 ```bash
 # Arch
-sudo pacman -S ffmpeg
+sudo pacman -S ffmpeg alsa-lib
 
 # Debian/Ubuntu
-sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev libavdevice-dev
+sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev libavdevice-dev libasound2-dev
 ```
+
+> ALSA 只是**接口层**：实际跑在 PipeWire/PulseAudio 上时，
+> 由它们提供的 ALSA 兼容层接管，无需额外配置。
 
 ## 开发
 

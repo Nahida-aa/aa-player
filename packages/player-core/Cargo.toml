@@ -15,6 +15,11 @@ anyhow.workspace = true
 # 是播放器所需的粒度（ez-ffmpeg 偏转码框架，不适合做播放底座）。
 ffmpeg-next = "8"
 
+cpal.workspace = true
+
+# 只依赖门面：库不决定日志怎么输出，由 app 包订阅。
+tracing.workspace = true
+
 [dev-dependencies]
 # 集成测试是独立 crate，要直接探查样本的流信息（如是否含音轨）需自己引入。
 ffmpeg-next = "8"
