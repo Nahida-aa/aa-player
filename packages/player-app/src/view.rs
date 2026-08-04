@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::StreamExt;
 use gpui::{
@@ -34,14 +34,6 @@ const PROGRESS_INSET: f32 = 12.0;
 /// 默认 `true`（对齐主流播放器的实时跟随手感）。将来可接配置文件。
 const LIVE_SEEK: bool = true;
 
-/// 拖动中预览 seek 的节流间隔。拖动会高频触发 mouse_move，每个都 `source.seek`
-/// （ffmpeg 定位关键帧 + 解码）开销大，会卡。节流限频，进度条仍跟随鼠标，
-/// 松开时 Commit 精确跳到最终位置。
-///
-/// 调低到 ~16ms（一帧）让画面更快跟随鼠标位置；配合解码线程覆盖合并（只执行
-/// 最后 Preview），解码线程聚焦最新目标，画面更连续。
-const PREVIEW_THROTTLE: Duration = Duration::from_millis(16);
-
 /// 播放器视图：持有一帧最新的解码画面，并接收键盘/鼠标控制。
 pub struct PlayerView {
     /// 解码线程推来、待渲染的最新帧。
@@ -62,8 +54,6 @@ pub struct PlayerView {
     /// 是否正在拖动进度条。用 `Arc<AtomicBool>` 以便渲染循环（独立 async task）
     /// 读取——拖动中直接显示预览帧，不走音频时钟调度。
     dragging: Arc<AtomicBool>,
-    /// 上一次发 Preview seek 的时刻，用于拖动中节流（避免高频 `source.seek` 卡顿）。
-    last_preview: Instant,
     /// 键盘焦点句柄：让本视图能收到按键。
     focus_handle: FocusHandle,
 }
@@ -229,7 +219,6 @@ impl PlayerView {
             position: Duration::ZERO,
             paused: false,
             dragging,
-            last_preview: Instant::now(),
             focus_handle,
         }
     }
@@ -370,21 +359,15 @@ impl PlayerView {
 
     /// 拖动进度条移动（按下后移动 / 拖动中）。
     ///
-    /// - `live_seek`：发 Preview（画面跟手，不重建音频），但**节流**（避免高频
-    ///   `source.seek` 卡顿）；进度条始终跟随鼠标，松开时 Commit 精确跳最终位置。
+    /// - `live_seek`：每次移动都发 Preview（seek 实测 ~10ms，够快），画面跟随
+    ///   鼠标扫过的位置；覆盖合并保证解码线程只执行最新 Preview。
     /// - 否则只更新进度条视觉，不发给解码线程（松开时才跳）。
     fn seek_drag(&mut self, x: gpui::Pixels, window: &mut Window) {
         let Some(target) = self.x_to_time(x, window) else { return };
-        // 进度条始终跟随鼠标（不管是否发 Preview）。
+        // 进度条始终跟随鼠标。
         self.position = target.min(self.duration);
         if LIVE_SEEK {
-            // 节流：距上次 Preview 足够久才发，避免高频 seek。
-            if self.last_preview.elapsed() >= PREVIEW_THROTTLE {
-                self.last_preview = Instant::now();
-                self.seek_preview(target);
-            }
-            // 否则：只更新了 position（进度条跟手），Preview 被节流跳过，
-            // 松开时 Commit 会跳到最终位置。
+            self.seek_preview(target);
         }
         // 非 live：position 已更新（进度条跟手），不发命令，松开才 seek。
     }

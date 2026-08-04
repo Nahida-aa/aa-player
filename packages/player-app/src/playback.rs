@@ -1394,4 +1394,65 @@ mod tests {
         running.store(false, Ordering::Relaxed);
         drop(tx);
     }
+
+    /// 测量"连续 Preview seek 的首帧延迟"：播放中每隔固定间隔发一个 Preview，
+    /// 测每个 Preview 从发出到收到目标附近帧的耗时。量化拖动跟手的瓶颈——
+    /// 若单次 seek 几十 ms 且连续 Preview 积压，说明 seek 是主瓶颈。
+    #[test]
+    #[ignore = "需要真实音频设备"]
+    fn measure_preview_seek_latency() {
+        let (tx, mut rx) = frame_channel();
+        let (cmd, cmd_rx) = command_channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let stats = Arc::new(ProfileStats::default());
+        let clock_source = Arc::new(AudioClockSource::default());
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../player-core/tests/assets/sample.mp4");
+        spawn_decode_thread(
+            path,
+            tx.clone(),
+            running.clone(),
+            stats.clone(),
+            clock_source.clone(),
+            cmd_rx,
+        );
+
+        // 播 ~0.5s 后开始连续 Preview（每 50ms 一个，模拟拖动），目标递增。
+        std::thread::sleep(Duration::from_millis(500));
+        let mut latencies = Vec::new();
+        for (i, ms) in [2000u64, 2500, 3000, 3500, 4000, 4500, 5000, 5500].iter().enumerate() {
+            let t = std::time::Instant::now();
+            cmd.unbounded_send(PlaybackCommand::Seek(
+                Duration::from_millis(*ms),
+                SeekKind::Preview,
+            ))
+            .unwrap();
+            // 等该目标附近（±300ms）的帧到达，测延迟。
+            let target_us = *ms * 1000;
+            let mut got = false;
+            let wait = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < wait {
+                if let Ok(Some((_, pts_us, _, _))) = rx.try_recv() {
+                    if (pts_us as i64 - target_us as i64).abs() < 300_000 {
+                        got = true;
+                        break;
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            latencies.push((*ms, got, t.elapsed().as_millis()));
+            // 模拟拖动间隔。
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for (ms, got, lat) in &latencies {
+            println!("Preview 到 {ms}ms：{lat}ms 命中={got}");
+        }
+        let max_lat = latencies.iter().map(|x| x.2).max().unwrap_or(0);
+        println!("最大 Preview 首帧延迟 {max_lat}ms");
+
+        running.store(false, Ordering::Relaxed);
+        drop(tx);
+    }
 }
