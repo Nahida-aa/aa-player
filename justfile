@@ -3,6 +3,10 @@
 # 用法：just <recipe>   例如：just dev / just check / just test / just build
 # 不带参数时默认执行 `default`。
 
+# 加载项目根目录的 .env（可写 VIDEO=path/to/video.mp4，供 `just video` 用）。
+# 见 .gitignore：.env 被忽略，不会把本地视频路径提交到仓库。
+set dotenv-load
+
 # 默认 recipe：启动 GUI 应用
 default:
     @just --list
