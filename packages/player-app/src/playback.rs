@@ -153,6 +153,13 @@ const AUDIO_START_MIN: Duration = Duration::from_millis(80);
 /// 音频缓冲满时的退避间隔。
 const AUDIO_BACKOFF: Duration = Duration::from_millis(5);
 
+/// seek 时离文件末尾保留的安全余量（微秒）。
+///
+/// ffmpeg seek 到文件**绝对末尾**后，`next_event` 会长时间阻塞，解码线程卡死、
+/// 无法响应后续 seek 命令（表现为"拖动到末尾后再 seek 失效"）。seek 目标夹到
+/// `duration - 此余量`，用户仍能看到结尾内容，但避开 ffmpeg 的末尾阻塞。
+const SEEK_END_MARGIN_US: u64 = 250_000; // 250ms
+
 /// 在独立 OS 线程里解码 `path`，把帧投递到 `tx`，把音频直接推给声卡。
 ///
 /// `running` 置 false 时线程退出（窗口关闭）。
@@ -289,6 +296,13 @@ fn run_until_eof(
                     // Seek 全消费掉，只保留最新的位置执行一次。
                     while let Ok(PlaybackCommand::Seek(newer)) = cmd_rx.try_recv() {
                         ts = newer;
+                    }
+                    // 不要 seek 到文件绝对末尾：ffmpeg seek 到末尾后 `next_event`
+                    // 会长时间阻塞（解码线程卡死，无法响应后续 seek——"拖动到末尾
+                    // 后再 seek 失效"）。留一个安全余量，用户仍能看到结尾内容。
+                    let max_seek = duration_us.saturating_sub(SEEK_END_MARGIN_US);
+                    if ts.as_micros() as u64 > max_seek {
+                        ts = Duration::from_micros(max_seek);
                     }
                     if let Err(e) = source.seek(ts) {
                         error!(error = %e, seek_ms = ts.as_millis(), "seek 失败");
@@ -1090,10 +1104,13 @@ mod tests {
         }
         assert!(saw_eof, "应在 10s 内读到 EOF");
 
-        // 播完后再 seek 回 2s。
+        // 模拟"拖动到末尾"：seek 到近末尾（9930）。
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(9930))).unwrap();
+        // 等 1s 让它处理（不论是否 EOF），然后立即再 seek 回 2s。
+        std::thread::sleep(Duration::from_millis(1000));
         cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_secs(2))).unwrap();
 
-        // 应重新出帧，且首帧 pts 接近 2s。
+        // 关键断言：末尾拖动后再 seek 回 2s，解码线程必须仍能响应、重新出帧。
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let mut got_target = false;
         while std::time::Instant::now() < deadline {
