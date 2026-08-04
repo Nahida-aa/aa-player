@@ -105,6 +105,11 @@ pub fn command_channel() -> (CommandSender, CommandReceiver) {
 pub struct AudioClockSource {
     clock: std::sync::Mutex<Option<AudioClock>>,
     generation: std::sync::atomic::AtomicU64,
+    /// 最近一次 seek 的目标（微秒）。seek 重建声卡流后音频时钟从 0 重新起算，
+    /// 但视频 PTS 是绝对时间（如 5s），两者相差一个目标偏移。渲染侧取
+    /// `audio.position() + seek_offset` 作为音频主时钟读数，才能让 seek 后的
+    /// 首帧立即显示而不被误判"落后 5 秒"。
+    seek_offset_us: std::sync::atomic::AtomicU64,
 }
 
 impl AudioClockSource {
@@ -114,14 +119,20 @@ impl AudioClockSource {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 取当前的音频时钟与代次；尚未就位（或无音轨）时为 `None`。
+    /// 记录最近一次 seek 的目标时间（微秒）。seek 重建声卡流前调用。
+    pub fn set_seek_offset(&self, us: u64) {
+        self.seek_offset_us.store(us, Ordering::Relaxed);
+    }
+
+    /// 取当前音频时钟、代次与 seek 偏移；尚未就位（或无音轨）时时钟为 `None`。
     ///
     /// `generation` 用来自检换柄：渲染侧记住上次用的 `generation`，
     /// 变了才重建时钟，没变则沿用（墙钟 origin 得以保持）。
-    pub fn get_with_generation(&self) -> (u64, Option<AudioClock>) {
+    pub fn get_with_generation(&self) -> (u64, u64, Option<AudioClock>) {
         let generation = self.generation.load(Ordering::Relaxed);
+        let offset = self.seek_offset_us.load(Ordering::Relaxed);
         let clock = self.clock.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        (generation, clock)
+        (generation, offset, clock)
     }
 }
 
@@ -256,6 +267,9 @@ fn run_until_eof(
                         info!(seek_ms = ts.as_millis(), "seek");
                         // 播完后 seek：seek 会撤销 draining，重新可读，即可继续播放。
                         finished = false;
+                        // 告诉渲染侧 seek 目标：重建声卡流后音频从 0 起算，
+                        // 需加回这个偏移，否则首帧会被误判"落后 5 秒"而卡住。
+                        clock_source.set_seek_offset(ts.as_micros() as u64);
                         seek_rebuild_audio(audio, clock_source);
                     }
                     next_frame = None; // 丢弃 seek 前暂存的帧
@@ -406,6 +420,10 @@ const DROP_THRESHOLD: Duration = Duration::from_millis(100);
 pub struct PlaybackClock {
     /// 音频主时钟；`None` 或尚未出声时退回墙钟。
     audio: Option<AudioClock>,
+    /// seek 后音频时钟的偏移：重建声卡流后音频从 0 起算，但视频 PTS 是
+    /// 绝对时间，需加回 seek 目标才能对齐（否则首帧被判"落后"而卡住）。
+    /// 有效读数为 `audio.position() + audio_offset`。
+    audio_offset: Duration,
     /// 墙钟模式的时间轴原点。首帧到达时校准（首帧 PTS 未必为 0，故要减去它）。
     origin: Option<Instant>,
 }
@@ -428,6 +446,7 @@ impl PlaybackClock {
     pub fn new() -> Self {
         Self {
             audio: None,
+            audio_offset: Duration::ZERO,
             origin: None,
         }
     }
@@ -442,6 +461,11 @@ impl PlaybackClock {
         self.audio = Some(audio);
     }
 
+    /// 设置音频时钟偏移（seek 目标）。见 [`Self::audio_offset`]。
+    pub fn set_audio_offset(&mut self, offset: Duration) {
+        self.audio_offset = offset;
+    }
+
     /// 为 PTS 为 `target` 的帧决定何时显示。
     pub fn schedule(&mut self, target: Duration) -> Schedule {
         // 音频时钟在第一个采样播出前恒为 0。这段时间内用它做基准，
@@ -450,7 +474,11 @@ impl PlaybackClock {
         if let Some(audio) = self.audio.as_ref()
             && audio.started()
         {
-            return Self::schedule_against(target, audio.position(), DROP_THRESHOLD, |behind| {
+            // 音频主时钟读数 = 硬件进度 + seek 偏移。不加偏移的话，
+            // seek 后音频从 0 起算、视频 PTS 却还是 5s，首帧会被判
+            // "落后 5 秒"→ Wait(5s)，画面卡住直到音频追上 seek 点。
+            let now = audio.position() + self.audio_offset;
+            return Self::schedule_against(target, now, DROP_THRESHOLD, |behind| {
                 Schedule::Drop { behind }
             });
         }
@@ -665,23 +693,48 @@ mod tests {
     fn clock_source_returns_latest_attached_clock() {
         let src = AudioClockSource::default();
         // 尚未 attach → None。
-        let (gen0, c0) = src.get_with_generation();
+        let (gen0, offset0, c0) = src.get_with_generation();
         assert!(c0.is_none());
         assert_eq!(gen0, 0);
+        assert_eq!(offset0, 0);
 
         // 第一次 attach：位置 1s，代次 +1。
         src.attach(fake_clock(1000));
-        let (gen1, c1) = src.get_with_generation();
+        let (gen1, _, c1) = src.get_with_generation();
         let c1 = c1.expect("attach 后应可取到");
         assert_eq!(c1.position(), Duration::from_millis(1000));
         assert_eq!(gen1, 1);
 
-        // 模拟 seek 重建：换成一个位置 0 的新时钟，代次再 +1。
+        // 模拟 seek：先记偏移，再重建换时钟，代次再 +1。
+        src.set_seek_offset(5_000_000);
         src.attach(fake_clock(0));
-        let (gen2, c2) = src.get_with_generation();
+        let (gen2, offset2, c2) = src.get_with_generation();
         let c2 = c2.expect("换柄后应可取到新时钟");
         assert_eq!(c2.position(), Duration::ZERO, "应拿到重建后的新时钟");
         assert_eq!(gen2, 2, "每次 attach 代次都要递增，渲染侧据此换柄");
+        assert_eq!(offset2, 5_000_000, "seek 偏移应随 seek 更新");
+    }
+
+    /// seek 重建声卡流后音频从 0 起算、视频 PTS 仍是绝对时间（如 5s），
+    /// 若不加偏移，首帧会被判"落后 5s"→ Wait(5s)，画面卡住。
+    /// 加了 `audio_offset` 后，首帧（pts≈5s）应对齐立即显示。
+    #[test]
+    fn audio_offset_aligns_post_seek_frame() {
+        let mut clock = audio_clock(fake_clock(0)); // 音频从 0 起算（重建后）
+        // seek 到 5s，设偏移 5s。
+        clock.set_audio_offset(Duration::from_secs(5));
+        // 首帧 pts=5s，音频位置=0：加了偏移后 now=5s，target=5s → Now。
+        assert!(matches!(
+            clock.schedule(Duration::from_secs(5)),
+            Schedule::Now
+        ));
+        // 若不加偏移（now=0 < target=5s），会被误判 Wait(5s)——
+        // 这里用不设偏移的时钟验证基线行为，确保上面确实靠偏移对齐。
+        let mut no_offset = audio_clock(fake_clock(0));
+        assert!(matches!(
+            no_offset.schedule(Duration::from_secs(5)),
+            Schedule::Wait(_)
+        ));
     }
 
     // ---- 端到端：播放到末尾后再 seek 能重新播放 ----

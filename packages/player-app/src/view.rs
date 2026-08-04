@@ -110,10 +110,11 @@ impl PlayerView {
                 };
                 let pts = Duration::from_micros(pts_us);
 
-                // 音频时钟换代时更新句柄；没换代则沿用，墙钟 origin 得以保持。
-                let (clock_gen, audio) = clock_source.get_with_generation();
+                // 音频时钟换代时更新句柄与 seek 偏移；没换代则沿用，墙钟 origin 得以保持。
+                let (clock_gen, offset_us, audio) = clock_source.get_with_generation();
                 if clock_gen != audio_gen {
                     audio_gen = clock_gen;
+                    clock.set_audio_offset(Duration::from_micros(offset_us));
                     if let Some(c) = audio.as_ref() {
                         clock.set_audio(c.clone());
                     }
