@@ -865,6 +865,81 @@ mod tests {
         ));
     }
 
+    /// **完整模拟一次 seek 的确定性测试**（无真实设备、跑 `cargo test` 即可）：
+    ///
+    /// 模拟渲染循环在「正常播放 → 发 seek → seek 重建 → 首个 post-seek 帧 →
+    /// 后续帧」整个生命周期里对每个帧调用 `schedule`。用一个可控假音频时钟，
+    /// 逐帧更新音频位置，验证：
+    ///   - seek 前：帧按音频节奏 `Now`/小 `Wait`，无 Drop；
+    ///   - seek 重建后首帧（锚定）：立即 `Now`；
+    ///   - seek 后后续帧：`behind` 保持小（不丢帧风暴）——这是用户"seek 后卡顿"
+    ///     的回归核心。
+    #[test]
+    fn simulated_seek_sequence_stays_synced() {
+        let mut clock = audio_clock(fake_clock(0)); // 音频从 0 起（seek 重建后）
+
+        // --- seek 前：音频播到 2s，帧 pts 跟到 2s（无 seek 时 offset=0，直接同步）---
+        clock.set_audio_offset(0);
+        let mut audio_pos_ms = 2000u64;
+        let mut pts_ms = 2000u64;
+        let mut drops_before_seek = 0u32;
+        for _ in 0..10 {
+            // 每帧音频推进 33ms、pts 也推进 33ms（正常同步播放）。
+            audio_pos_ms += 33;
+            pts_ms += 33;
+            clock.set_audio(fake_clock(audio_pos_ms));
+            match clock.schedule(Duration::from_millis(pts_ms)) {
+                Schedule::Drop { .. } => drops_before_seek += 1,
+                Schedule::Wait(d) => assert!(d.as_millis() <= 40, "seek 前帧不应长等"),
+                Schedule::Now => {}
+                Schedule::Resynced { .. } => {}
+            }
+        }
+        assert_eq!(drops_before_seek, 0, "seek 前正常播放不应丢帧");
+
+        // --- seek 到 6s：重建音频（从 0 起），偏移 = 首帧pts − 当时音频位置 ---
+        // 假设首个 post-seek 帧 pts=6s、音频刚重建位置≈0 → 偏移 = 6000ms。
+        clock.set_audio(fake_clock(0)); // 重建后音频从 0
+        clock.set_audio_offset(6_000_000); // 锚定偏移 = 首帧 pts
+        // 首个 post-seek 帧（pts=6000）：应立即显示。
+        assert!(matches!(
+            clock.schedule(Duration::from_millis(6000)),
+            Schedule::Now
+        ));
+
+        // --- seek 后：音频从 0 推进，帧 pts 从 6000 推进，两者同步 → 不丢帧 ---
+        let mut drops_after_seek = 0u32;
+        let mut long_waits_after_seek = 0u32;
+        audio_pos_ms = 0;
+        pts_ms = 6000;
+        for _ in 0..30 {
+            audio_pos_ms += 33;
+            pts_ms += 33;
+            clock.set_audio(fake_clock(audio_pos_ms));
+            match clock.schedule(Duration::from_millis(pts_ms)) {
+                Schedule::Drop { behind } => {
+                    drops_after_seek += 1;
+                    eprintln!("seek 后丢帧 behind={behind:?}");
+                }
+                Schedule::Wait(d) => {
+                    if d.as_millis() > 100 {
+                        long_waits_after_seek += 1;
+                    }
+                }
+                Schedule::Now => {}
+                Schedule::Resynced { .. } => {}
+            }
+        }
+        assert_eq!(
+            drops_after_seek, 0,
+            "seek 锚定后不应持续丢帧（这是 seek 后卡顿的回归）"
+        );
+        assert_eq!(
+            long_waits_after_seek, 0,
+            "seek 锚定后不应出现长等待"
+        );
+    }
+
     // ---- 端到端：播放到末尾后再 seek 能重新播放 ----
 
     /// 回归测试：放完后（EOF）点进度条 seek 回去要能重新出帧。
