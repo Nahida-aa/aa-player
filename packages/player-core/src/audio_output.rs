@@ -229,6 +229,13 @@ impl AudioOutput {
         q.extend(samples.iter().copied());
     }
 
+    /// 清空待播放队列（并丢弃）。用于拖动静音时把已推入但未播出的采样丢掉，
+    /// 否则声卡 pause 前队列里已有的音频会继续播完（拖动中听到旧声音）。
+    pub fn clear(&self) {
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.clear();
+    }
+
     /// 队列中尚未播放的帧数。用于背压：太多就别再解了。
     pub fn queued_frames(&self) -> usize {
         let q = self.queue.lock().unwrap_or_else(|e| e.into_inner());

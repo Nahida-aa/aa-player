@@ -312,9 +312,11 @@ fn run_until_eof(
                     }
                 }
                 PlaybackCommand::MuteAudio => {
-                    // 拖动中静音：只停声卡，**不设 paused**（解码线程继续解预览帧）。
+                    // 拖动中静音：停声卡并清空待播队列，**不设 paused**（解码线程
+                    // 继续解预览帧）。清队列避免 pause 前已推入的旧音频播完出声。
                     if let Some(a) = audio.as_ref() {
                         a.pause();
+                        a.clear();
                     }
                 }
                 PlaybackCommand::Seek(mut ts, mut kind) => {
