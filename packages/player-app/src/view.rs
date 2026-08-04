@@ -93,7 +93,16 @@ impl PlayerView {
             let mut audio_gen: u64 = 0;
             while let Some(item) = rx.next().await {
                 let Some((render, pts_us, duration_us)) = item else {
-                    break; // EOF
+                    // EOF：进度条拉满，但**不退出循环**——解码线程在 EOF 后仍活着
+                    // 等 seek 命令，播完再点进度条能回到中间重播，这里要继续消费帧。
+                    this.update(cx, |this, cx| {
+                        if this.duration != Duration::ZERO {
+                            this.position = this.duration;
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                    continue;
                 };
                 let pts = Duration::from_micros(pts_us);
 
@@ -330,26 +339,40 @@ impl Render for PlayerView {
         self.current_rendered = Some(frame.clone());
         let image = gpui::img(frame).size_full();
 
-        // 底部控制条：进度条 + 时间。
+        // 底部控制条：时间文本 + 进度条，两行都占满整窗宽度。
+        // 进度条占满整行宽 → 点击映射到 `window.bounds()` 宽度即精确对齐进度条，
+        // 不会因为右侧时间文本占据横向空间而把"满进度"错位到窗口最右。
         let bar = div()
             .id("progress")
             .absolute()
             .bottom_0()
             .left_0()
             .right_0()
-            .h(px(28.0))
+            .pt(px(6.0))
+            .pb(px(8.0))
             .flex()
-            .items_center()
-            .px(px(12.0))
-            .gap(px(8.0))
+            .flex_col()
+            .gap(px(6.0))
             .bg(rgba(0x00000066))
+            .child(
+                // 时间文本行：占满整行宽，右对齐，不参与进度条布局。
+                div()
+                    .id("time")
+                    .w_full()
+                    .px(px(12.0))
+                    .flex()
+                    .justify_end()
+                    .child(div().text_color(white()).child(time_text)),
+            )
+            // 进度条行：满幅（无内边距），点击按窗口宽度映射即精确对应进度条。
             .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, _cx| {
                 this.seek_click(e.position.x, window);
             }))
             .child(
                 div()
                     .id("bar")
-                    .flex_1()
+                    .w_full()
+                    .px(px(12.0))
                     .h(px(4.0))
                     .bg(rgba(0xffffff33))
                     .rounded_full()
@@ -361,8 +384,7 @@ impl Render for PlayerView {
                             .bg(green())
                             .rounded_full(),
                     ),
-            )
-            .child(div().text_color(white()).child(time_text));
+            );
 
         let mut content = root.child(image).child(bar);
 

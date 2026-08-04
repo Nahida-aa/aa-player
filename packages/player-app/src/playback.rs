@@ -220,6 +220,9 @@ fn run_until_eof(
     duration_us: u64,
 ) {
     let mut next_frame: Option<(Arc<RenderImage>, u64)> = None;
+    // 是否已放完（EOF）。之后线程不退出，继续轮询命令，好让"播完后点进度条"
+    // 还能 seek 回中间重新播（见 Err/EOF 分支）。
+    let mut finished = false;
     loop {
         if !running.load(Ordering::Relaxed) {
             return;
@@ -229,12 +232,18 @@ fn run_until_eof(
         if let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 PlaybackCommand::Pause => {
+                    if finished {
+                        continue; // 已播完，暂停无意义
+                    }
                     if let Some(a) = audio.as_ref() {
                         a.pause();
                     }
                     *paused = true;
                 }
                 PlaybackCommand::Resume => {
+                    if finished {
+                        continue;
+                    }
                     *paused = false;
                     if let Some(a) = audio.as_ref() {
                         a.resume();
@@ -245,6 +254,8 @@ fn run_until_eof(
                         error!(error = %e, seek_ms = ts.as_millis(), "seek 失败");
                     } else {
                         info!(seek_ms = ts.as_millis(), "seek");
+                        // 播完后 seek：seek 会撤销 draining，重新可读，即可继续播放。
+                        finished = false;
                         seek_rebuild_audio(audio, clock_source);
                     }
                     next_frame = None; // 丢弃 seek 前暂存的帧
@@ -255,6 +266,12 @@ fn run_until_eof(
 
         if *paused {
             // 暂停态：不推音频、不发帧、不前进。睡一下等命令。
+            std::thread::sleep(Duration::from_millis(8));
+            continue;
+        }
+
+        if finished {
+            // 已放完，只等 seek 命令。睡一下免得空转烧 CPU。
             std::thread::sleep(Duration::from_millis(8));
             continue;
         }
@@ -300,12 +317,15 @@ fn run_until_eof(
             Ok(None) => {
                 info!(frames = *frame_no, "解码到达文件末尾");
                 // 别急着退：声卡缓冲里还有几百毫秒没播完，
-                // 此刻返回会把 AudioOutput drop 掉，声音戛然而止。
+                // 此刻 drop AudioOutput 会把声音戛然掐掉。
                 if let Some(a) = audio.as_ref() {
                     drain_audio(a, running);
                 }
+                // 通知渲染侧"放完了"，但**不退出线程**：继续轮询命令，
+                // 让播完后还能点进度条 seek 回去重播。seek 会清 draining，
+                // 并在这里把 finished 置回 false。
                 let _ = tx.try_send(None);
-                return;
+                finished = true;
             }
             Err(e) => {
                 error!(error = %e, frames = *frame_no, "解码失败，停止");
@@ -662,5 +682,73 @@ mod tests {
         let c2 = c2.expect("换柄后应可取到新时钟");
         assert_eq!(c2.position(), Duration::ZERO, "应拿到重建后的新时钟");
         assert_eq!(gen2, 2, "每次 attach 代次都要递增，渲染侧据此换柄");
+    }
+
+    // ---- 端到端：播放到末尾后再 seek 能重新播放 ----
+
+    /// 回归测试：放完后（EOF）点进度条 seek 回去要能重新出帧。
+    /// 之前 EOF 时解码线程直接返回、source 被 drop，seek 命令石沉大海，
+    /// 画面停在最后一帧不动。现在 EOF 后线程继续轮询命令，seek 清 draining
+    /// 重新可读。这个测试需要真实音频设备（本机有），用真实素材驱动整条线程。
+    #[test]
+    #[ignore = "需要真实音频设备"]
+    fn seek_after_eof_resumes_playback() {
+        let (tx, mut rx) = frame_channel();
+        let (cmd, cmd_rx) = command_channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let stats = Arc::new(ProfileStats::default());
+        let clock_source = Arc::new(AudioClockSource::default());
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../player-core/tests/assets/sample.mp4");
+        spawn_decode_thread(
+            path,
+            tx.clone(),
+            running.clone(),
+            stats.clone(),
+            clock_source.clone(),
+            cmd_rx,
+        );
+
+        // 等 EOF（None 信号）。解码线程把 10s 音频按真实速度播完才到 EOF，
+        // 加上尾部 drain，给足 15s 余量。
+        let mut saw_eof = false;
+        let mut waited = Duration::ZERO;
+        while waited < Duration::from_secs(15) {
+            match rx.try_recv() {
+                Ok(Some(_)) => continue, // 正常帧
+                Ok(None) => {
+                    saw_eof = true; // EOF 信号
+                    break;
+                }
+                _ => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    waited += Duration::from_millis(20);
+                }
+            }
+        }
+        assert!(saw_eof, "应在 10s 内读到 EOF");
+
+        // 播完后再 seek 回 2s。
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_secs(2))).unwrap();
+
+        // 应重新出帧，且首帧 pts 接近 2s。
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut got_target = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some((_, pts_us, _))) = rx.try_recv() {
+                let pts = Duration::from_micros(pts_us);
+                if (pts.as_secs_f64() - 2.0).abs() < 1.0 {
+                    got_target = true;
+                    break;
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert!(got_target, "seek 后应在 3s 内收到 pts≈2s 的帧");
+
+        running.store(false, Ordering::Relaxed);
+        drop(tx); // 释放 sender，让线程干净退出
     }
 }
