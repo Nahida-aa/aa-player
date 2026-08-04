@@ -62,6 +62,11 @@ INFO 播放流畅 decoded_fps=30 displayed_fps=30 avg_interval_ms=32
 `max_interval_ms > 66`（掉了整帧）或 `on_time_pct < 90` 时会升级为
 `WARN 检测到卡顿`，并附上帧间隔直方图便于定位。
 
+## 文档
+
+- [排查播放「无响应」与「卡顿」的经历](docs/debugging-playback-jank.md)
+  —— 四个真实 bug 的症状/真因对照，以及三次「度量本身在骗人」的教训。
+
 ## 测试素材
 
 `packages/player-core/tests/assets/sample.mp4` 是刻意做小的样本
