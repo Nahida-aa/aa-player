@@ -118,10 +118,11 @@ impl PlayerView {
                         clock.set_audio(c.clone());
                     }
                     // seek 发生了：重置墙钟 origin（避免 seek 到中间首帧被判"落后 N 秒"
-                    // 触发 Resynced），并**丢弃通道里 seek 前残留的旧帧**——它们已用新
-                    // 偏移调度，会得到巨大 behind 被 Drop（一次性抖动）。
+                    // 触发 Resynced）。**不要清空帧队列**——那会与解码线程竞态，
+                    // 把 seek 后刚发的新帧也误清掉，导致画面停在旧帧等待（用户实测
+                    // seek 到近末尾后卡 7 秒）。seek 前旧帧由 seek_target 丢弃 + 渲染
+                    // Drop 自然处理。
                     clock.reset_origin();
-                    while rx.try_recv().is_ok() {}
                 }
                 // seek 偏移由解码线程用"首个 post-seek 视频帧的实际 pts − 当时
                 // 音频位置"设定（可为负），每帧都读（原子读，廉价）并应用。

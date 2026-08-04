@@ -1235,30 +1235,35 @@ mod tests {
             }
         }
         let latency_ms = latency_ms.expect("应在 8s 内收到 seek 后的帧");
-        println!("seek 到近末尾延迟 {latency_ms}ms");
+        println!("seek 到近末尾首帧延迟 {latency_ms}ms");
 
-        // 监控 seek 后 3s 内音频位置峰值：若音频从错误位置（seek 前）解码，
-        // 音频位置会一路涨（用户实测到 ~7s）而视频早已到 EOF。
-        let mut max_audio_ms = 0u64;
-        let mon_deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while std::time::Instant::now() < mon_deadline {
-            if let Ok(Some((_, _, _))) = rx.try_recv() {
-                // 继续收帧（避免 channel 满阻塞解码线程）
+        // 测 **time-to-EOF**：从发 seek 到收到 `None`（文件末尾）的总时间。
+        // 用户实测 seek 到近末尾后 7 秒才到 EOF——如果这里也 ~7s，说明解码管线
+        // 慢；如果这里很快（<1s），说明 7s 在渲染循环。
+        let mut eof_seen = false;
+        let mut total_frames = 0u32;
+        let eof_deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while std::time::Instant::now() < eof_deadline {
+            match rx.try_recv() {
+                Ok(Some(_)) => total_frames += 1,
+                Ok(None) => {
+                    eof_seen = true;
+                    break;
+                }
+                _ => std::thread::sleep(Duration::from_millis(20)),
             }
-            if let (_, _, Some(c)) = clock_source.get_with_generation() {
-                max_audio_ms = max_audio_ms.max(c.position().as_millis() as u64);
-            }
-            std::thread::sleep(Duration::from_millis(50));
         }
-        println!("seek 后 3s 内音频位置峰值 {max_audio_ms}ms");
-        // 注：此峰值反映的是音频下溢补静音（content 播完后 frames_played 继续涨），
-        // 不是"音频从错误位置解码"。渲染侧已用 duration 封顶 now 并直接显示尾部帧
-        // （见 duration_cap 相关单测），这里不再据此断言。
+        let time_to_eof_ms = seek_t.elapsed().as_millis();
+        println!(
+            "seek 到近末尾 time-to-EOF {time_to_eof_ms}ms（{total_frames} 帧，EOF={eof_seen}）"
+        );
 
-        // 用户实测 7 秒冻结。此处容忍 2s：若远超说明仍卡。
+        // 用户实测 7 秒。解码管线应在 <2s 内到 EOF；若远超说明解码慢（需查
+        // seek_target 丢弃是否卡住解码循环）。
+        assert!(eof_seen, "应在 8s 内到 EOF");
         assert!(
-            latency_ms < 2000,
-            "seek 到近末尾首个帧延迟 {latency_ms}ms，应 <2000ms（用户实测卡 7s）"
+            time_to_eof_ms < 2000,
+            "seek 到近末尾到 EOF 耗时 {time_to_eof_ms}ms，应 <2000ms（用户实测 7s）"
         );
 
         running.store(false, Ordering::Relaxed);
