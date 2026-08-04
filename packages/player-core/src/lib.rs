@@ -7,12 +7,14 @@
 //! 当前范围：单视频流解码 + 逐帧拉取（BGRA）+ 运行时 seek。
 //! 待做（下一轮）：播放时钟、音视频同步、音频解码、线程管线。
 
+pub mod audio_decoder;
 pub mod audio_output;
 pub mod error;
 pub mod frame;
 pub mod media_source;
 
+pub use audio_decoder::{AudioDecoder, AudioInfo};
 pub use audio_output::{AudioFormat, AudioOutput};
 pub use error::Result;
-pub use frame::{DecodedFrame, VideoInfo};
+pub use frame::{AudioChunk, DecodedFrame, VideoInfo};
 pub use media_source::{FfmpegSource, MediaSource};

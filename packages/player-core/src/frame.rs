@@ -58,3 +58,36 @@ pub struct VideoInfo {
     /// 平均帧率（fps）；可能为 0（如变帧率视频）。
     pub fps: f64,
 }
+
+/// 解码并重采样后的一段音频。
+///
+/// 与视频「一次一帧」不同，音频天然是连续流：一个 AAC packet 解出 1024 个采样，
+/// 重采样后数量还会变，所以这里按「一块」而不是「一帧」交付。
+///
+/// [`samples`](Self::samples) 是**交错**排列的 f32：`[L, R, L, R, ...]`。
+/// 交错而非平面，是因为 cpal 的输出缓冲就是交错的，少一次转换。
+#[derive(Debug, Clone)]
+pub struct AudioChunk {
+    /// 交错排列的采样，长度 = `frames * channels`。
+    pub samples: Vec<f32>,
+    /// 声道数。
+    pub channels: u16,
+    /// 采样率（已重采样到输出设备的值）。
+    pub sample_rate: u32,
+    /// 这块音频的起始展示时间戳。
+    pub pts: Duration,
+}
+
+impl AudioChunk {
+    /// 帧数（1 帧 = 每声道各 1 个采样）。
+    #[inline]
+    pub fn frames(&self) -> usize {
+        self.samples.len() / self.channels.max(1) as usize
+    }
+
+    /// 这块音频的播放时长。
+    #[inline]
+    pub fn duration(&self) -> Duration {
+        Duration::from_secs_f64(self.frames() as f64 / self.sample_rate.max(1) as f64)
+    }
+}

@@ -44,11 +44,32 @@ pub struct AudioOutput {
     frames_played: Arc<AtomicU64>,
     /// 缓冲空了却仍在被索取（欠载）。说明解码跟不上。
     underrun: Arc<AtomicBool>,
+    /// 是否已经播出过第一个采样。见 [`AudioOutput::started`]。
+    started: StartedFlag,
 }
 
 /// 播放是否真正开始过（收到过非空采样）。
 /// 用于把「启动时队列还没填上」与「播着播着断供」区分开。
 type StartedFlag = Arc<AtomicBool>;
+
+/// 一次回调之后，时钟该前进多少帧、要不要报欠载。
+///
+/// 单独抽出来是为了能脱离声卡测：这段逻辑决定了主时钟准不准，
+/// 而它的错误（时钟偷跑、欠载误报）在真实设备上极难复现和观察。
+///
+/// - `requested` / `filled`：本次回调索取的、以及队列真正供上的采样数。
+/// - `started`：此前是否已经播出过采样。
+///
+/// 返回 `(时钟前进的采样数, 是否已开播, 是否欠载)`。
+#[inline]
+fn account(requested: usize, filled: usize, started: bool) -> (usize, bool, bool) {
+    let started = started || filled > 0;
+    // 开播前的空转不计时（否则 position 变成"流创建至今的墙钟"）；
+    // 开播后按 requested 计（补的静音也占用了真实播放时间）。
+    let advance = if started { requested } else { 0 };
+    let underrun = started && filled < requested;
+    (advance, started, underrun)
+}
 
 /// f32(-1.0..=1.0) → i16。超范围先钳位，否则回绕会变成刺耳爆音。
 #[inline]
@@ -82,13 +103,15 @@ impl AudioOutput {
         let frames_played = Arc::new(AtomicU64::new(0));
         let underrun = Arc::new(AtomicBool::new(false));
 
+        let started: StartedFlag = Arc::new(AtomicBool::new(false));
+
         let stream = Self::build_stream(
             &device,
             &config,
             queue.clone(),
             frames_played.clone(),
             underrun.clone(),
-            Arc::new(AtomicBool::new(false)),
+            started.clone(),
             format.channels,
         )?;
         stream.play()?;
@@ -99,6 +122,7 @@ impl AudioOutput {
             queue,
             frames_played,
             underrun,
+            started,
         })
     }
 
@@ -141,20 +165,16 @@ impl AudioOutput {
                         }
                         drop(q);
 
-                        // 只有「曾经出过声、之后又断供」才算欠载。
-                        // 启动瞬间队列必然是空的（流先跑起来、采样后到），
-                        // 那不是故障；把它算进去会让每次启动都误报一次，
-                        // 于是这个信号就再也没人信了。
-                        if filled > 0 {
-                            started.store(true, Ordering::Relaxed);
-                        }
-                        if filled < out.len() && started.load(Ordering::Relaxed) {
+                        let (advance, now_started, starved) =
+                            account(out.len(), filled, started.load(Ordering::Relaxed));
+                        started.store(now_started, Ordering::Relaxed);
+                        if starved {
                             underrun.store(true, Ordering::Relaxed);
                         }
-                        // 记账用**请求量**而非实际填充量：设备的时间照走，
-                        // 补的静音也占用了真实播放时间。用 filled 会让时钟变慢。
-                        frames_played
-                            .fetch_add((out.len() / channels as usize) as u64, Ordering::Relaxed);
+                        frames_played.fetch_add(
+                            (advance / channels as usize) as u64,
+                            Ordering::Relaxed,
+                        );
                     },
                     err_fn,
                     None,
@@ -191,12 +211,20 @@ impl AudioOutput {
 
     /// 设备累计已消费的播放时长 —— **音频主时钟的读数**。
     ///
+    /// 从第一个采样真正被播出时开始计时；在那之前恒为 0，
+    /// 这样调用方推数据前的任意长等待都不会污染时钟。
+    ///
     /// 注意这是「已交给设备」的量，和真正从扬声器出声之间还差一个
     /// 硬件缓冲延迟。做精确同步时需要减去 `output_latency`，
     /// 这一步留到接入同步时再处理。
     pub fn position(&self) -> Duration {
         let frames = self.frames_played.load(Ordering::Relaxed);
         Duration::from_secs_f64(frames as f64 / self.format.sample_rate as f64)
+    }
+
+    /// 第一个采样是否已经播出。`position()` 在此之前恒为 0。
+    pub fn started(&self) -> bool {
+        self.started.load(Ordering::Relaxed)
     }
 
     /// 取出并清除「发生过欠载」的标记。
@@ -237,6 +265,39 @@ mod tests {
         );
         assert_eq!(f32_to_u16(1.0), u16::MAX);
         assert_eq!(f32_to_u16(-1.0), 0);
+    }
+
+    /// 开播前的空转不该计入时钟。
+    ///
+    /// 这条守的是「position() 是播放进度，而不是流创建至今的墙钟」。
+    /// 早先的实现把开播前的空回调也记进去，于是调用方晚 1 秒推数据，
+    /// 时钟就凭空多出 1 秒。实测正是它让播完时时钟显示 10.34s
+    /// 而实际只送入了 10.01s——用这种时钟做同步，画面永远追不上。
+    #[test]
+    fn clock_does_not_run_before_playback_starts() {
+        let (advance, started, underrun) = account(512, 0, false);
+        assert_eq!(advance, 0, "还没出声，时钟不该走");
+        assert!(!started);
+        assert!(!underrun, "启动时队列本来就是空的，不算故障");
+    }
+
+    #[test]
+    fn clock_counts_requested_not_filled_once_running() {
+        // 断供时补的静音同样占用了真实播放时间。若只记 filled，
+        // 时钟会走慢，视频便会跟着一起卡住，而不是丢帧追上去。
+        let (advance, started, underrun) = account(512, 128, true);
+        assert_eq!(advance, 512, "应按索取量计时，而非实际填充量");
+        assert!(started);
+        assert!(underrun, "播着播着供不上，这才是真欠载");
+    }
+
+    #[test]
+    fn first_nonempty_callback_starts_the_clock() {
+        // 第一次拿到数据的这次回调，本身就该计入。
+        let (advance, started, underrun) = account(512, 512, false);
+        assert_eq!(advance, 512);
+        assert!(started);
+        assert!(!underrun);
     }
 
     #[test]
