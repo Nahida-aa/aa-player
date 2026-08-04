@@ -110,15 +110,17 @@ impl PlayerView {
                 };
                 let pts = Duration::from_micros(pts_us);
 
-                // 音频时钟换代时更新句柄与 seek 偏移；没换代则沿用，墙钟 origin 得以保持。
+                // 音频时钟换代时更新句柄；没换代则沿用，墙钟 origin 得以保持。
                 let (clock_gen, offset_us, audio) = clock_source.get_with_generation();
                 if clock_gen != audio_gen {
                     audio_gen = clock_gen;
-                    clock.set_audio_offset(Duration::from_micros(offset_us));
                     if let Some(c) = audio.as_ref() {
                         clock.set_audio(c.clone());
                     }
                 }
+                // seek 偏移由解码线程用"首个 post-seek 视频帧的实际 pts"设定，
+                // 每帧都读（原子读，廉价）并应用，保证能及时反映锚定。
+                clock.set_audio_offset(Duration::from_micros(offset_us));
 
                 match clock.schedule(pts) {
                     Schedule::Wait(d) => cx.background_executor().timer(d).await,

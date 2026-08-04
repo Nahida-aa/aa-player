@@ -234,6 +234,10 @@ fn run_until_eof(
     // 是否已放完（EOF）。之后线程不退出，继续轮询命令，好让"播完后点进度条"
     // 还能 seek 回中间重新播（见 Err/EOF 分支）。
     let mut finished = false;
+    // seek 后首个解码出的视频帧 pts 才是锚点：`source.seek(ts)` 会落在
+    // ts 之前的最近关键帧上（keyframe gap），用请求值 ts 当偏移会留下
+    // 一个永久偏差，behind 随播放不断增大 → 持续丢帧。故用实际首帧 pts。
+    let mut pending_anchor = false;
     loop {
         if !running.load(Ordering::Relaxed) {
             return;
@@ -267,9 +271,10 @@ fn run_until_eof(
                         info!(seek_ms = ts.as_millis(), "seek");
                         // 播完后 seek：seek 会撤销 draining，重新可读，即可继续播放。
                         finished = false;
-                        // 告诉渲染侧 seek 目标：重建声卡流后音频从 0 起算，
-                        // 需加回这个偏移，否则首帧会被误判"落后 5 秒"而卡住。
-                        clock_source.set_seek_offset(ts.as_micros() as u64);
+                        // 重建声卡流（音频从 0 起算）；偏移由下一个视频帧的实际 pts
+                        // 设定（见 Video 分支），而不是请求值 ts——否则 keyframe gap
+                        // 会造成永久偏差、behind 不断增大。
+                        pending_anchor = true;
                         seek_rebuild_audio(audio, clock_source);
                     }
                     next_frame = None; // 丢弃 seek 前暂存的帧
@@ -304,6 +309,13 @@ fn run_until_eof(
                 *frame_no += 1;
                 if frame_no.is_multiple_of(DECODE_LOG_EVERY) {
                     debug!(frame = *frame_no, pts_ms = f.pts.as_millis(), "解码进度");
+                }
+                // seek 后的首个视频帧：用它的实际 pts 设音频偏移。
+                // 必须在 send_blocking 之前设好，渲染侧收到该帧时偏移已就绪。
+                if pending_anchor {
+                    pending_anchor = false;
+                    clock_source.set_seek_offset(f.pts.as_micros() as u64);
+                    debug!(anchor_ms = f.pts.as_millis(), "seek 锚定首帧 pts");
                 }
                 let decode_us = t0.elapsed().as_micros() as u64;
                 let render = decoded_to_render_image(&f);
@@ -803,5 +815,82 @@ mod tests {
 
         running.store(false, Ordering::Relaxed);
         drop(tx); // 释放 sender，让线程干净退出
+    }
+
+    /// 复现"seek 后画面落后音频"：seek 到中间，观察后续每帧的
+    /// `音频主时钟读数(now) - 帧pts`（即 would-be `behind`）是否持续过大。
+    /// 若音频重建后偏移没有正确对齐，`behind` 会随播放时间不断增大（而非
+    /// 稳定在 ~0），画面会被连续判 `Drop`。
+    #[test]
+    #[ignore = "需要真实音频设备"]
+    fn seek_midplayback_no_lag() {
+        let (tx, mut rx) = frame_channel();
+        let (cmd, cmd_rx) = command_channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let stats = Arc::new(ProfileStats::default());
+        let clock_source = Arc::new(AudioClockSource::default());
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../player-core/tests/assets/sample.mp4");
+        spawn_decode_thread(
+            path,
+            tx.clone(),
+            running.clone(),
+            stats.clone(),
+            clock_source.clone(),
+            cmd_rx,
+        );
+
+        // 播 ~1.5s 后 seek 到 6.5s（非关键帧位置，落在 6s 关键帧之后）——
+        // 这样首个 post-seek 视频帧 pts≈6s < 请求的 6.5s，正好压住 keyframe gap。
+        std::thread::sleep(Duration::from_millis(1500));
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(6500))).unwrap();
+        info!("已发 seek 到 6.5s");
+
+        // 收集 seek 后 2s 内的帧，打印每帧的 pts、now（音频position+offset）、behind。
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut n = 0;
+        let mut max_behind = 0u64;
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some((_, pts_us, _))) = rx.try_recv() {
+                n += 1;
+                let (_, offset_us, clock) = clock_source.get_with_generation();
+                let pos_us = clock.map(|c| c.position().as_micros() as u64).unwrap_or(0);
+                let now_us = pos_us + offset_us;
+                let behind = now_us.saturating_sub(pts_us);
+                // 只统计"已锚定"的帧（pts 接近 seek 偏移）：seek 前遗留的旧帧
+                // 会被渲染侧正确 Drop，不算同步问题。
+                let anchored = offset_us > 0 && (pts_us as i64 - offset_us as i64).abs() < 500_000;
+                if anchored {
+                    max_behind = max_behind.max(behind);
+                }
+                if n <= 12 {
+                    println!(
+                        "frame={n} pts={}ms pos={}ms offset={}ms now={}ms behind={}ms anchored={anchored}",
+                        pts_us / 1000,
+                        pos_us / 1000,
+                        offset_us / 1000,
+                        now_us / 1000,
+                        behind / 1000,
+                    );
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        info!("seek 后共 {n} 帧，最大 behind {max_behind}ms");
+
+        info!("seek 后共 {n} 帧，最大锚定后 behind {max_behind}ms");
+
+        // seek 后应持续出帧，且"锚定后"的帧 behind 保持 <100ms（不持续丢帧）。
+        // seek 前遗留的旧帧会被正确 Drop，不计入同步质量。
+        assert!(n > 5, "seek 后应持续出帧（收到 {n} 帧）");
+        assert!(
+            max_behind < 100,
+            "seek 锚定后最大落后 {max_behind}ms，应 <100ms（偏移不对齐会持续 Drop）"
+        );
+
+        running.store(false, Ordering::Relaxed);
+        drop(tx);
     }
 }
