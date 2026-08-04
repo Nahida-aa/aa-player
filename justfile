@@ -8,14 +8,21 @@ default:
     @just --list
 
 # 启动播放器 GUI（首次会从 zed git 源编译 GPUI，较慢）
-run:
-    cargo run
+# 可选传视频路径：`just run path/to/video.mp4`；不传则播放内置样本。
+run *video:
+    cargo run -- {{video}}
 
 dev:
     cargo watch -x run
 
 debug:
     RUST_LOG=player_app=debug cargo run
+
+# 用环境变量 VIDEO 指定要播放的视频（绝对或相对路径）：
+#   VIDEO=/path/to/video.mp4 just video
+# 便于 shell 脚本/自动化传大视频测试。
+video:
+    cargo run -- ${VIDEO}
 
 # 只做类型/编译检查，不产出二进制
 check:

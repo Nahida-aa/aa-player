@@ -13,10 +13,22 @@ mod view;
 
 use std::path::PathBuf;
 
+use clap::Parser;
 use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, size};
 use gpui_platform::application;
+use tracing::info;
 
 use crate::view::PlayerView;
+
+/// 播放器的命令行参数。
+#[derive(Parser)]
+#[command(name = "aa-player", about = "用 Rust + GPUI 写的视频播放器")]
+struct Cli {
+    /// 要播放的视频路径（绝对或相对路径）。
+    /// 不传时播放内置样本 `player-core/tests/assets/sample.mp4`。
+    #[arg(value_name = "VIDEO")]
+    video: Option<PathBuf>,
+}
 
 /// 初始化日志订阅者。
 ///
@@ -38,9 +50,22 @@ fn init_tracing() {
 fn main() {
     init_tracing();
 
-    // 样本视频：packages/player-core/tests/assets/sample.mp4
-    let path: PathBuf =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../player-core/tests/assets/sample.mp4");
+    let cli = Cli::parse();
+    // 解析视频路径：优先命令行参数；未传时用内置样本。
+    let path: PathBuf = match cli.video {
+        Some(v) => v,
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../player-core/tests/assets/sample.mp4"),
+    };
+    // 绝对路径直接用；相对路径相对当前工作目录解析（clap 已按字面保留）。
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&path))
+            .unwrap_or(path)
+    };
+    info!(path = %path.display(), "播放");
 
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(1280.0.into(), 720.0.into()), cx);
