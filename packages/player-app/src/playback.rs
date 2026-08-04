@@ -1461,4 +1461,65 @@ mod tests {
         running.store(false, Ordering::Relaxed);
         drop(tx);
     }
+
+    /// 测量解码线程在单次 Preview seek 后**持续产帧的吞吐**（每秒解出多少视频帧，
+    /// 无渲染消费只 try_recv）。判断"画面更新慢"是解码慢还是渲染慢：
+    /// 若解码吞吐高（>30fps）说明解码/seek 快，瓶颈在渲染；若低说明解码慢。
+    #[test]
+    #[ignore = "需要真实音频设备"]
+    fn preview_decode_throughput() {
+        let (tx, mut rx) = frame_channel();
+        let (cmd, cmd_rx) = command_channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let stats = Arc::new(ProfileStats::default());
+        let clock_source = Arc::new(AudioClockSource::default());
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../player-core/tests/assets/sample.mp4");
+        spawn_decode_thread(
+            path,
+            tx.clone(),
+            running.clone(),
+            stats.clone(),
+            clock_source.clone(),
+            cmd_rx,
+        );
+
+        // 播 ~0.5s 后发一个 Preview（拖到 3s），然后测 1s 内解出多少帧。
+        std::thread::sleep(Duration::from_millis(500));
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(3000), SeekKind::Preview)).unwrap();
+        // 先清掉 Preview 前积压的旧帧。
+        std::thread::sleep(Duration::from_millis(200));
+        while rx.try_recv().is_ok() {}
+
+        // 测 1s 内解出的帧数（仅 Preview seek 之后的持续解码）。
+        let start = std::time::Instant::now();
+        let mut frames = 0u32;
+        let mut last_pts = 0u64;
+        let mut seen_3000 = false;
+        while start.elapsed() < Duration::from_secs(1) {
+            if let Ok(Some((_, pts_us, _, _))) = rx.try_recv() {
+                frames += 1;
+                last_pts = pts_us;
+                if pts_us >= 2_900_000 {
+                    seen_3000 = true;
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        println!(
+            "Preview seek 后 1s 解出 {frames} 帧（{:.0}fps），最后 pts={}ms，到 3s={seen_3000}",
+            frames as f64,
+            last_pts / 1000
+        );
+        assert!(seen_3000, "Preview 后应能解出目标附近帧");
+        assert!(
+            frames >= 20,
+            "Preview 后解码吞吐仅 {frames} 帧/s，偏低（应 >30fps）——解码/seek 慢"
+        );
+
+        running.store(false, Ordering::Relaxed);
+        drop(tx);
+    }
 }
