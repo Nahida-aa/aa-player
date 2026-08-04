@@ -118,9 +118,9 @@ impl PlayerView {
                         clock.set_audio(c.clone());
                     }
                 }
-                // seek 偏移由解码线程用"首个 post-seek 视频帧的实际 pts"设定，
-                // 每帧都读（原子读，廉价）并应用，保证能及时反映锚定。
-                clock.set_audio_offset(Duration::from_micros(offset_us));
+                // seek 偏移由解码线程用"首个 post-seek 视频帧的实际 pts − 当时
+                // 音频位置"设定（可为负），每帧都读（原子读，廉价）并应用。
+                clock.set_audio_offset(offset_us);
 
                 match clock.schedule(pts) {
                     Schedule::Wait(d) => cx.background_executor().timer(d).await,

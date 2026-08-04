@@ -105,11 +105,12 @@ pub fn command_channel() -> (CommandSender, CommandReceiver) {
 pub struct AudioClockSource {
     clock: std::sync::Mutex<Option<AudioClock>>,
     generation: std::sync::atomic::AtomicU64,
-    /// 最近一次 seek 的目标（微秒）。seek 重建声卡流后音频时钟从 0 重新起算，
-    /// 但视频 PTS 是绝对时间（如 5s），两者相差一个目标偏移。渲染侧取
-    /// `audio.position() + seek_offset` 作为音频主时钟读数，才能让 seek 后的
-    /// 首帧立即显示而不被误判"落后 5 秒"。
-    seek_offset_us: std::sync::atomic::AtomicU64,
+    /// seek 锚定偏移（有符号微秒）= 首帧实际 pts − 当时音频位置。
+    ///
+    /// 重建声卡流后音频从 0 起算，但解码首个 post-seek 视频帧时音频可能已
+    /// 提前走了一段（`a`），故偏移 = `首帧pts - a`（可为负）。渲染侧取
+    /// `audio.position() + seek_offset` 作音频主时钟读数，首帧才不会被误判落后。
+    seek_offset_us: std::sync::atomic::AtomicI64,
 }
 
 impl AudioClockSource {
@@ -119,8 +120,8 @@ impl AudioClockSource {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 记录最近一次 seek 的目标时间（微秒）。seek 重建声卡流前调用。
-    pub fn set_seek_offset(&self, us: u64) {
+    /// 记录 seek 锚定偏移（有符号微秒）。见 [`Self::seek_offset_us`]。
+    pub fn set_seek_offset(&self, us: i64) {
         self.seek_offset_us.store(us, Ordering::Relaxed);
     }
 
@@ -128,7 +129,7 @@ impl AudioClockSource {
     ///
     /// `generation` 用来自检换柄：渲染侧记住上次用的 `generation`，
     /// 变了才重建时钟，没变则沿用（墙钟 origin 得以保持）。
-    pub fn get_with_generation(&self) -> (u64, u64, Option<AudioClock>) {
+    pub fn get_with_generation(&self) -> (u64, i64, Option<AudioClock>) {
         let generation = self.generation.load(Ordering::Relaxed);
         let offset = self.seek_offset_us.load(Ordering::Relaxed);
         let clock = self.clock.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -310,12 +311,19 @@ fn run_until_eof(
                 if frame_no.is_multiple_of(DECODE_LOG_EVERY) {
                     debug!(frame = *frame_no, pts_ms = f.pts.as_millis(), "解码进度");
                 }
-                // seek 后的首个视频帧：用它的实际 pts 设音频偏移。
-                // 必须在 send_blocking 之前设好，渲染侧收到该帧时偏移已就绪。
+                // seek 后的首个视频帧：用它的实际 pts 减去**当时音频位置**作锚定
+                // 偏移。若音频在首个视频帧解码前已提前走了一段 a，偏移 = 首帧pts - a，
+                // 首帧才能立即对齐；只锚到首帧 pts 会把这段 a 当永久偏差（向后 seek
+                // 更易触发，因为音频重建后立即起播、而视频首帧可能解码较慢）。
                 if pending_anchor {
                     pending_anchor = false;
-                    clock_source.set_seek_offset(f.pts.as_micros() as u64);
-                    debug!(anchor_ms = f.pts.as_millis(), "seek 锚定首帧 pts");
+                    let audio_pos_us = audio
+                        .as_ref()
+                        .map(|a| a.position().as_micros() as i64)
+                        .unwrap_or(0);
+                    let anchor = f.pts.as_micros() as i64 - audio_pos_us;
+                    clock_source.set_seek_offset(anchor);
+                    debug!(anchor_ms = anchor / 1000, audio_ms = audio_pos_us / 1000, "seek 锚定");
                 }
                 let decode_us = t0.elapsed().as_micros() as u64;
                 let render = decoded_to_render_image(&f);
@@ -432,10 +440,10 @@ const DROP_THRESHOLD: Duration = Duration::from_millis(100);
 pub struct PlaybackClock {
     /// 音频主时钟；`None` 或尚未出声时退回墙钟。
     audio: Option<AudioClock>,
-    /// seek 后音频时钟的偏移：重建声卡流后音频从 0 起算，但视频 PTS 是
-    /// 绝对时间，需加回 seek 目标才能对齐（否则首帧被判"落后"而卡住）。
-    /// 有效读数为 `audio.position() + audio_offset`。
-    audio_offset: Duration,
+    /// seek 锚定偏移（有符号微秒）= 首帧实际 pts − 当时音频位置。有效读数
+    /// `now = audio.position() + audio_offset`。有符号：音频可能在首个视频帧
+    /// 解码前已提前走了一段，偏移可为负。
+    audio_offset: i64,
     /// 墙钟模式的时间轴原点。首帧到达时校准（首帧 PTS 未必为 0，故要减去它）。
     origin: Option<Instant>,
 }
@@ -458,7 +466,7 @@ impl PlaybackClock {
     pub fn new() -> Self {
         Self {
             audio: None,
-            audio_offset: Duration::ZERO,
+            audio_offset: 0,
             origin: None,
         }
     }
@@ -473,9 +481,9 @@ impl PlaybackClock {
         self.audio = Some(audio);
     }
 
-    /// 设置音频时钟偏移（seek 目标）。见 [`Self::audio_offset`]。
-    pub fn set_audio_offset(&mut self, offset: Duration) {
-        self.audio_offset = offset;
+    /// 设置音频时钟偏移（有符号微秒）。见 [`Self::audio_offset`]。
+    pub fn set_audio_offset(&mut self, offset_us: i64) {
+        self.audio_offset = offset_us;
     }
 
     /// 为 PTS 为 `target` 的帧决定何时显示。
@@ -486,10 +494,11 @@ impl PlaybackClock {
         if let Some(audio) = self.audio.as_ref()
             && audio.started()
         {
-            // 音频主时钟读数 = 硬件进度 + seek 偏移。不加偏移的话，
-            // seek 后音频从 0 起算、视频 PTS 却还是 5s，首帧会被判
-            // "落后 5 秒"→ Wait(5s)，画面卡住直到音频追上 seek 点。
-            let now = audio.position() + self.audio_offset;
+            // 音频主时钟读数（微秒）= 硬件进度 + seek 锚定偏移（可为负）。
+            // 偏移 = 首帧实际 pts − 当时音频位置，首帧 now≈首帧pts → Now，
+            // 后续 now 随音频推进同步，behind 恒 ~0。
+            let now_us = audio.position().as_micros() as i64 + self.audio_offset;
+            let now = Duration::from_micros(now_us.max(0) as u64);
             return Self::schedule_against(target, now, DROP_THRESHOLD, |behind| {
                 Schedule::Drop { behind }
             });
@@ -733,8 +742,8 @@ mod tests {
     #[test]
     fn audio_offset_aligns_post_seek_frame() {
         let mut clock = audio_clock(fake_clock(0)); // 音频从 0 起算（重建后）
-        // seek 到 5s，设偏移 5s。
-        clock.set_audio_offset(Duration::from_secs(5));
+        // 偏移 = 首帧实际 pts − 当时音频位置 = 5s − 0。
+        clock.set_audio_offset(5_000_000);
         // 首帧 pts=5s，音频位置=0：加了偏移后 now=5s，target=5s → Now。
         assert!(matches!(
             clock.schedule(Duration::from_secs(5)),
@@ -746,6 +755,32 @@ mod tests {
         assert!(matches!(
             no_offset.schedule(Duration::from_secs(5)),
             Schedule::Wait(_)
+        ));
+    }
+
+    /// **向后 seek 的 bug**：重建声卡流后音频立即起播，首个视频帧解码较慢，
+    /// 解码到它时音频已走到 `a`（如 3s）。偏移必须 = `首帧pts − a`（可为负），
+    /// 否则首帧被判"落后 a"而丢帧。这里验证：音频已到 3s、首帧 pts=5s 时，
+    /// 偏移=2s 让首帧对齐 Now。
+    #[test]
+    fn audio_offset_accounts_for_audio_ahead_of_first_frame() {
+        // 音频已走到 3s（首个视频帧解码前提前起播）。
+        let mut clock = audio_clock(fake_clock(3000));
+        // 首帧 pts=5s，偏移 = 5s − 3s = 2s。
+        clock.set_audio_offset(2_000_000);
+        // now = 3s + 2s = 5s = target → Now（首帧立即显示）。
+        assert!(matches!(
+            clock.schedule(Duration::from_secs(5)),
+            Schedule::Now
+        ));
+
+        // 若用旧的"偏移=首帧pts"（5s，不含当时音频位置），now = 3s+5s=8s，
+        // 相对首帧 pts=5s → behind=3s → Drop。这就是向后 seek 卡顿的机制。
+        let mut wrong = audio_clock(fake_clock(3000));
+        wrong.set_audio_offset(5_000_000);
+        assert!(matches!(
+            wrong.schedule(Duration::from_secs(5)),
+            Schedule::Drop { .. }
         ));
     }
 
@@ -841,53 +876,43 @@ mod tests {
             cmd_rx,
         );
 
-        // 播 ~1.5s 后 seek 到 6.5s（非关键帧位置，落在 6s 关键帧之后）——
-        // 这样首个 post-seek 视频帧 pts≈6s < 请求的 6.5s，正好压住 keyframe gap。
-        std::thread::sleep(Duration::from_millis(1500));
-        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(6500))).unwrap();
-        info!("已发 seek 到 6.5s");
+        // 先播到 ~8s（把音频时钟推到 8s），再向后 seek 到 2.5s（非关键帧，
+        // 首帧 pts≈2s）。向后 seek 会重建声卡流，音频从 0 重新起算。
+        std::thread::sleep(Duration::from_millis(8000));
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(2500))).unwrap();
+        info!("已发向后 seek 到 2.5s");
 
-        // 收集 seek 后 2s 内的帧，打印每帧的 pts、now（音频position+offset）、behind。
+        // 收集 seek 后 3s 内的帧，统计"真正 post-seek"帧的 behind。
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let mut n = 0;
-        let mut max_behind = 0u64;
+        let mut anchored_count = 0u32;
+        let mut max_behind_us = 0u64;
         while std::time::Instant::now() < deadline {
             if let Ok(Some((_, pts_us, _))) = rx.try_recv() {
                 n += 1;
                 let (_, offset_us, clock) = clock_source.get_with_generation();
-                let pos_us = clock.map(|c| c.position().as_micros() as u64).unwrap_or(0);
+                let pos_us = clock.map(|c| c.position().as_micros() as i64).unwrap_or(0);
                 let now_us = pos_us + offset_us;
-                let behind = now_us.saturating_sub(pts_us);
-                // 只统计"已锚定"的帧（pts 接近 seek 偏移）：seek 前遗留的旧帧
-                // 会被渲染侧正确 Drop，不算同步问题。
-                let anchored = offset_us > 0 && (pts_us as i64 - offset_us as i64).abs() < 500_000;
-                if anchored {
-                    max_behind = max_behind.max(behind);
-                }
-                if n <= 12 {
-                    println!(
-                        "frame={n} pts={}ms pos={}ms offset={}ms now={}ms behind={}ms anchored={anchored}",
-                        pts_us / 1000,
-                        pos_us / 1000,
-                        offset_us / 1000,
-                        now_us / 1000,
-                        behind / 1000,
-                    );
+                let behind_us = now_us.saturating_sub(pts_us as i64).max(0) as u64;
+                // 只统计"真正 post-seek"的帧（pts ≥ 锚定偏移）：seek 前遗留的
+                // 旧帧 pts < 偏移，会被渲染侧正确 Drop，不算同步问题。
+                if offset_us != 0 && pts_us as i64 >= offset_us {
+                    anchored_count += 1;
+                    max_behind_us = max_behind_us.max(behind_us);
                 }
             } else {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-        info!("seek 后共 {n} 帧，最大 behind {max_behind}ms");
+        println!("seek 后共 {n} 帧，post-seek {anchored_count} 帧，最大 behind {}ms", max_behind_us / 1000);
 
-        info!("seek 后共 {n} 帧，最大锚定后 behind {max_behind}ms");
-
-        // seek 后应持续出帧，且"锚定后"的帧 behind 保持 <100ms（不持续丢帧）。
-        // seek 前遗留的旧帧会被正确 Drop，不计入同步质量。
+        // seek 后应持续出帧，且 post-seek 帧的 behind 保持 <100ms（不持续丢帧）。
         assert!(n > 5, "seek 后应持续出帧（收到 {n} 帧）");
+        assert!(anchored_count > 5, "应收到足够多的 post-seek 帧（{anchored_count}）");
         assert!(
-            max_behind < 100,
-            "seek 锚定后最大落后 {max_behind}ms，应 <100ms（偏移不对齐会持续 Drop）"
+            max_behind_us < 100_000,
+            "seek 锚定后最大落后 {}ms，应 <100ms（偏移不对齐会持续 Drop）",
+            max_behind_us / 1000
         );
 
         running.store(false, Ordering::Relaxed);
