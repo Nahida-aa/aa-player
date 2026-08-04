@@ -173,9 +173,10 @@ const AUDIO_BACKOFF: Duration = Duration::from_millis(5);
 /// seek 时离文件末尾保留的安全余量（微秒）。
 ///
 /// ffmpeg seek 到文件**绝对末尾**后，`next_event` 会长时间阻塞，解码线程卡死、
-/// 无法响应后续 seek 命令（表现为"拖动到末尾后再 seek 失效"）。seek 目标夹到
+/// 无法响应后续 seek 命令（表现为"拖动到末尾后再 seek 失效/卡住"）。seek 目标夹到
 /// `duration - 此余量`，用户仍能看到结尾内容，但避开 ffmpeg 的末尾阻塞。
-const SEEK_END_MARGIN_US: u64 = 250_000; // 250ms
+/// 用 1s 而非 250ms：长视频末尾关键帧结构可能让 250ms 余量仍触发阻塞。
+const SEEK_END_MARGIN_US: u64 = 1_000_000; // 1s
 
 /// 在独立 OS 线程里解码 `path`，把帧投递到 `tx`，把音频直接推给声卡。
 ///
