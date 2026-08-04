@@ -100,6 +100,7 @@ impl PlayerView {
 
         // 渲染 task：异步收帧，按 PTS 精确节流显示，绝不阻塞 executor。
         let stats_render = stats.clone();
+        let dragging_render = dragging.clone();
         let _render_task = cx.spawn_in(window, async move |this, cx| {
             // 时钟初始为墙钟；解码线程把音频主时钟交上来后再切换。
             let mut clock = PlaybackClock::new();
@@ -142,11 +143,11 @@ impl PlayerView {
                 // 文件时长用于封顶音频主时钟（seek 到近末尾时音频下溢会虚高）。
                 clock.set_duration(duration_us);
 
-                // 预览帧（拖动中 Preview seek 解出）：直接显示，不走音频时钟调度
-                // （音频位置和预览位置不匹配会被 Drop）。这是拖动画面跟手的核心。
-                // 用帧自带的 `is_preview` 标记而非 `dragging` 标志，避免 UI 线程
-                // 设 dragging 与渲染循环收帧的时序竞态。
-                if !is_preview {
+                // 预览帧（Preview seek 解出）或拖动中：直接显示，不走音频时钟调度
+                // （拖动时 MuteAudio 停声卡，音频时钟冻结，正常帧会被 Wait/Drop
+                // 卡住；预览帧位置与音频不匹配也会被 Drop）。拖动中所有帧直接显示，
+                // 避免残留的正常帧用冻结的音频时钟 Wait 卡住画面。
+                if !is_preview && !dragging_render.load(Ordering::Relaxed) {
                     match clock.schedule(pts) {
                         // 用 GPUI timer 精确等待。但**封顶等待时长**：若某帧被判 1 秒后
                         // 才显示，几乎必然是 seek 后残留的旧帧（pts 远大于新 offset）——

@@ -1367,13 +1367,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(30)); // 拖动节流间隔
         }
 
-        // 收集拖动结束后 1s 内的帧，看是否有 Preview 位置的帧送出。
+        // 收集拖动结束后 1s 内的帧，看是否有 Preview 位置的帧送出且带 preview 标记。
         let mut got_preview_frame = false;
         let mut got_pts = 0u64;
+        let mut got_marked = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while std::time::Instant::now() < deadline {
-            if let Ok(Some((_, pts_us, _, _))) = rx.try_recv() {
+            if let Ok(Some((_, pts_us, _, marked))) = rx.try_recv() {
                 got_pts = pts_us;
+                got_marked = marked;
                 // 拖动最后一个 Preview 是 4500ms，覆盖合并应只执行它附近。
                 if pts_us >= 4_000_000 {
                     got_preview_frame = true;
@@ -1384,11 +1386,15 @@ mod tests {
             }
         }
         println!(
-            "拖动后收到帧 pts={got_pts}us，命中目标={got_preview_frame}"
+            "拖动后收到帧 pts={got_pts}us 命中目标={got_preview_frame} preview标记={got_marked}"
         );
         assert!(
             got_preview_frame,
             "拖动中 Preview 应解出目标附近帧（收到 pts={got_pts}us），否则画面完全不动"
+        );
+        assert!(
+            got_marked,
+            "Preview seek 解出的帧应带 preview 标记，否则渲染循环不走直接显示路径"
         );
 
         running.store(false, Ordering::Relaxed);
