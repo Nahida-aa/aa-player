@@ -363,6 +363,17 @@ fn run_until_eof(
                 next_frame = Some((render, pts_us));
             }
             Ok(Some(MediaEvent::Audio(chunk))) => {
+                // seek 后音频也会先从 seek 落点前的包开始解码（音频 seek 落点
+                // 不精确），丢弃 `pts < seek_target` 的 chunk，让音频和视频从
+                // 同一位置起播，否则两者内容错位、音频位置远超视频（日志里
+                // audio 到 4s 而视频帧还卡在 8.5s 正是此因）。
+                if let Some(target) = seek_target
+                    && chunk.pts < target
+                {
+                    debug!(drop_audio_pts_ms = chunk.pts.as_millis(), "seek 丢弃目标前音频");
+                    continue;
+                    // 注意：不在这里清 seek_target——要等首个视频帧也 >= 目标才清。
+                }
                 if let Some(a) = audio.as_ref() {
                     // 背压：缓冲够深就等一等，别把整轨解进内存。
                     // 注意：seek 后音频是暂停态（start_audio 未清），队列不会被消费，
@@ -378,10 +389,6 @@ fn run_until_eof(
                     if a.take_underrun() {
                         warn!("音频欠载：解码跟不上声卡消费");
                     }
-                    // 注意：**不要**在这里 try_start_audio——seek 后若音频事件先到、
-                    // 缓冲填满就起播，而首个 post-seek 视频帧还没就绪，音频会提前跑出去，
-                    // 等视频追上时 behind 已巨大（seek 后卡顿的根源）。音频必须在
-                    // 首个 post-seek 视频帧送出后才起播（见 Video 送出分支）。
                 }
             }
             Ok(None) => {
@@ -1047,11 +1054,11 @@ mod tests {
             cmd_rx,
         );
 
-        // 先播 ~5s，再向前 seek 到 8.4s（接近 10s 末尾）——复现用户日志里
-        // seek=8426 后 behind 高达 5.7s 的场景。
-        std::thread::sleep(Duration::from_millis(5000));
-        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(8426))).unwrap();
-        info!("已发向前 seek 到 8.4s");
+        // 先播到 ~8s（把音频时钟推到 8s），再**向后** seek 到 2.5s——复现用户
+        // "向后 seek 卡顿" 与 seek 后音频/视频内容错位（音频从旧位置解码）的场景。
+        std::thread::sleep(Duration::from_millis(8000));
+        cmd.unbounded_send(PlaybackCommand::Seek(Duration::from_millis(2500))).unwrap();
+        info!("已发向后 seek 到 2.5s");
 
         // 收集 seek 后 3s 内的帧，统计"真正 post-seek"帧的 behind。
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
