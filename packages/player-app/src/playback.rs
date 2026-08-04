@@ -523,6 +523,10 @@ pub struct PlaybackClock {
     /// `now = audio.position() + audio_offset`。有符号：音频可能在首个视频帧
     /// 解码前已提前走了一段，偏移可为负。
     audio_offset: i64,
+    /// 文件总时长（微秒）。音频主时钟读数封顶于此：seek 到接近末尾时音频内容
+    /// 播完会下溢补静音，`audio.position()` 虚高超过时长，`now` 失去意义、视频
+    /// 帧全被 Drop。封顶后 `now` 不超过时长，视频帧能正常播完。
+    duration_us: u64,
     /// 墙钟模式的时间轴原点。首帧到达时校准（首帧 PTS 未必为 0，故要减去它）。
     origin: Option<Instant>,
 }
@@ -546,8 +550,14 @@ impl PlaybackClock {
         Self {
             audio: None,
             audio_offset: 0,
+            duration_us: 0,
             origin: None,
         }
+    }
+
+    /// 设置文件总时长（微秒），用于封顶音频主时钟读数。见 [`Self::duration_us`]。
+    pub fn set_duration(&mut self, duration_us: u64) {
+        self.duration_us = duration_us;
     }
 
     /// 更换音频主时钟句柄，但**保留墙钟 origin**。
@@ -585,7 +595,13 @@ impl PlaybackClock {
             // 音频主时钟读数（微秒）= 硬件进度 + seek 锚定偏移（可为负）。
             // 偏移 = 首帧实际 pts − 当时音频位置，首帧 now≈首帧pts → Now，
             // 后续 now 随音频推进同步，behind 恒 ~0。
-            let now_us = audio.position().as_micros() as i64 + self.audio_offset;
+            let mut now_us = audio.position().as_micros() as i64 + self.audio_offset;
+            // 封顶到文件时长：seek 到近末尾时音频内容播完会下溢补静音，
+            // `audio.position()` 虚高超过时长（如 7s > 10s 文件），now 失去意义、
+            // 视频帧全被 Drop。封顶后视频帧能正常播完。
+            if self.duration_us > 0 {
+                now_us = now_us.min(self.duration_us as i64);
+            }
             let now = Duration::from_micros(now_us.max(0) as u64);
             return Self::schedule_against(target, now, DROP_THRESHOLD, |behind| {
                 Schedule::Drop { behind }
@@ -801,6 +817,31 @@ mod tests {
             clock.schedule(Duration::from_millis(8000)),
             Schedule::Now
         ));
+    }
+
+    /// seek 到近末尾时，音频内容播完会下溢补静音、`audio.position()` 虚高超过
+    /// 文件时长（如 7s > 10s 文件），`now` 失去意义、视频帧全被 Drop。
+    /// `set_duration` 把 now 封顶到时长，视频帧能正常播完。
+    #[test]
+    fn duration_cap_prevents_underrun_phantom_behind() {
+        // 音频位置虚高到 15s（> 10s 文件），offset=8s，帧 pts=9s。
+        let mut clock = audio_clock(fake_clock(15000));
+        clock.set_audio_offset(8_000_000);
+        // 不设 duration：now = 15+8 = 23s，pts=9s → behind 14s → Drop。
+        assert!(matches!(
+            clock.schedule(Duration::from_millis(9000)),
+            Schedule::Drop { .. }
+        ));
+        // 设 duration=10s：now 封顶到 10s，pts=9s → behind=1s，但比 14s 好；
+        // 关键：不会因下溢虚高把整段视频 Drop 掉。
+        clock.set_duration(10_000_000);
+        match clock.schedule(Duration::from_millis(9000)) {
+            Schedule::Drop { behind } => {
+                assert!(behind <= Duration::from_secs(1), "封顶后 behind 应 ≤1s");
+            }
+            Schedule::Now => {}
+            other => panic!("封顶后应 Now 或小 Drop，得到 {other:?}"),
+        }
     }
 
     /// 核心回归测试：seek 后**音频不能在首个 post-seek 视频帧送出前起播**。

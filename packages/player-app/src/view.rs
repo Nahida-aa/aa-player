@@ -126,6 +126,8 @@ impl PlayerView {
                 // seek 偏移由解码线程用"首个 post-seek 视频帧的实际 pts − 当时
                 // 音频位置"设定（可为负），每帧都读（原子读，廉价）并应用。
                 clock.set_audio_offset(offset_us);
+                // 文件时长用于封顶音频主时钟（seek 到近末尾时音频下溢会虚高）。
+                clock.set_duration(duration_us);
 
                 match clock.schedule(pts) {
                     Schedule::Wait(d) => cx.background_executor().timer(d).await,
