@@ -474,17 +474,24 @@ impl Render for PlayerView {
             // 点击命中区 = 整个控制条（含时间文本行），比 4px 轨道粗得多，
             // 不容易点到无效区域。x_to_time 用同一 PROGRESS_INSET 换算，
             // 横向映射仍精确对齐轨道（轨道左右各缩进 12px）。
-            // 按下：开始拖动；立即 seek 到点击位置（点击 = 精确 seek，Commit）。
+            // 按下：立即精确 seek 到点击位置（Commit，正常跳转走 schedule）。
+            // **不设 dragging**——点击不该算拖动，否则渲染循环会把 Commit 帧当
+            // 预览直接显示（无 PTS 节流、不更新 position），跳转反而卡。
             .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, cx| {
-                this.dragging.store(true, Ordering::Relaxed);
                 this.seek_click(e.position.x, window);
                 cx.notify();
             }))
-            // 拖动中：live 模式发 Preview（只 seek 视频出预览帧，画面跟手，不重建
-            // 音频）；非 live 只移动进度条视觉。
+            // 拖动中（左键按住移动才叫拖动）：设 dragging，发 Preview（画面预览
+            // 跟手，不重建音频）；进度条跟随鼠标。
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
-                if this.dragging.load(Ordering::Relaxed) {
-                    this.seek_drag(e.position.x, window);
+                if e.pressed_button == Some(MouseButton::Left) {
+                    if !this.dragging.load(Ordering::Relaxed) {
+                        this.dragging.store(true, Ordering::Relaxed);
+                        // 拖动刚开始：立即跳一次（Preview），否则画面停在按下位置。
+                        this.seek_drag(e.position.x, window);
+                    } else {
+                        this.seek_drag(e.position.x, window);
+                    }
                     cx.notify();
                 }
             }))
