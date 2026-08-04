@@ -160,6 +160,14 @@ impl AudioClockSource {
 /// 而多缓冲一点音频的代价只是 seek 响应慢那么一档。
 const AUDIO_BUFFER: Duration = Duration::from_millis(400);
 
+/// 拖动预览（Preview seek）的容差：seek 到目标后，解出 `target - 此容差`
+/// 之后的帧就放行送出，不必精确解到 target。
+///
+/// 原因：拖动中 Preview 命令密集，若每次都要从关键帧精确解到 target（丢弃
+/// 中间帧），解码线程跟不上、来不及送帧 → 画面不动。放宽容差让解码线程快速
+/// 解出目标附近帧送出，画面跟手。
+const PREVIEW_TOLERANCE: Duration = Duration::from_millis(500);
+
 /// seek 重建声卡流后，至少缓冲这么多音频才允许 `start()`。
 ///
 /// 参考 mpv：seek 后先把音频缓冲填到 READY 再开播，避免音频在队列几乎为空时
@@ -343,8 +351,11 @@ fn run_until_eof(
                             // 拖动中预览：只 seek 视频出预览帧，**不重建音频流**、
                             // 不重锚 offset（不进入正常播放态）。解出的帧标记
                             // preview，渲染循环直接显示。
+                            // **放宽容差**：不必精确解到 ts，解到 ts−容差 就送，
+                            // 让拖动中画面快速跟手（否则密集 Preview 时解码线程
+                            // 反复从关键帧解到精确目标，来不及送帧，画面不动）。
                             previewing = true;
-                            video_seek_target = Some(ts);
+                            video_seek_target = Some(ts.saturating_sub(PREVIEW_TOLERANCE));
                         }
                         SeekKind::Commit => {
                             // 完整 seek：重建声卡流 + 重锚，进入正常播放。

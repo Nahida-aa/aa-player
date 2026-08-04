@@ -179,6 +179,7 @@ impl PlayerView {
                     }
                 }
 
+                // 诊断：拖动中打印每个收到的帧，确认拖动时帧是否到渲染循环。
                 this.update(cx, |this, cx| {
                     this.latest_frame = Some(render);
                     // 进度：首帧也确认总时长。
