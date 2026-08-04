@@ -17,6 +17,13 @@ pub const INTERVAL_BUCKETS_MS: [u64; 9] = [20, 28, 32, 35, 38, 42, 50, 66, 100];
 /// 直方图桶数（含末尾的溢出桶）。
 pub const HIST_LEN: usize = INTERVAL_BUCKETS_MS.len() + 1;
 
+/// 音画同步可接受的最大漂移（毫秒）。
+///
+/// 人耳对声画错位的可感阈值约 ±40ms（口语对白约 45ms，乐句更严）。
+/// 超过这个量就该预警，但单次偶发（一次调度抖动）不必报警——
+/// 所以真正看的是**超出占比**而非单帧值。
+pub const AV_SYNC_TOLERANCE_MS: i64 = 40;
+
 /// 播放性能计数器。仅当 debug 级别开启时才记录，
 /// 关闭时完全不调用，无原子操作开销。
 #[derive(Default)]
@@ -38,6 +45,22 @@ pub struct ProfileStats {
     interval_total_ms: AtomicU64,
     /// 上次显示时刻，用于算间隔。
     last_display: Mutex<Option<Instant>>,
+
+    /// 音画同步漂移累计（微秒）。`drift = 音频主时钟读数 - 帧 PTS`：
+    /// 正值表示画面落后音频（lag），负值表示画面领先音频（lead）。
+    /// 仅在音频主时钟模式下、显示实际帧时累计；丢帧不计入。
+    av_sync_sum_us: AtomicU64,
+    /// 漂移平方累计（微秒²），用于算 RMS——比峰值更能反映整体稳定性，
+    /// 单次抖动不会像 max 那样把整体画像带偏。
+    av_sync_sum_sq_us: AtomicU64,
+    /// 样本数（已显示且带音频时钟的帧数）。
+    av_sync_count: AtomicU64,
+    /// 最大落后量（drift>0，微秒）。
+    av_sync_max_lag_us: AtomicU64,
+    /// 最大领先量（|drift|<0，微秒）。
+    av_sync_max_lead_us: AtomicU64,
+    /// 超出 [`AV_SYNC_TOLERANCE_MS`] 的帧数。
+    av_sync_out_of_range: AtomicU64,
 }
 
 impl ProfileStats {
@@ -74,6 +97,32 @@ impl ProfileStats {
         *lg = Some(now);
     }
 
+    /// 记录一次音画同步漂移（微秒）。
+    ///
+    /// `drift_us = 音频主时钟读数(us) - 帧 PTS(us)`。
+    /// 正值 = 画面落后音频（lag），负值 = 画面领先（lead）。
+    ///
+    /// 只统计**真正显示出来**的帧——丢帧(`Schedule::Drop`)不计入，
+    /// 否则"为了追赶而主动丢帧"会被算成漂移，反而掩盖同步质量。
+    pub fn record_av_sync(&self, drift_us: i64) {
+        self.av_sync_count.fetch_add(1, Ordering::Relaxed);
+        // 平方与绝对值用无符号累计；符号方向另由两个 max 字段区分。
+        let a = drift_us.unsigned_abs();
+        self.av_sync_sum_us
+            .fetch_add(a, Ordering::Relaxed);
+        // 平方：drift 量级几十 ms 内，u64 不会溢出。
+        self.av_sync_sum_sq_us
+            .fetch_add(a.wrapping_mul(a), Ordering::Relaxed);
+        if drift_us > 0 {
+            self.av_sync_max_lag_us.fetch_max(a, Ordering::Relaxed);
+        } else {
+            self.av_sync_max_lead_us.fetch_max(a, Ordering::Relaxed);
+        }
+        if (drift_us / 1000).abs() > AV_SYNC_TOLERANCE_MS {
+            self.av_sync_out_of_range.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// 取出并清零本区间的全部统计，得到一个可直接上报的快照。
     ///
     /// 所有计数器一次性 swap 为 0，从而天然形成"区间速率"语义。
@@ -92,6 +141,33 @@ impl ProfileStats {
         let max_interval_ms = self.max_interval_ms.swap(0, Ordering::Relaxed);
         let sum_ms = self.interval_total_ms.swap(0, Ordering::Relaxed);
 
+        let av_count = self.av_sync_count.swap(0, Ordering::Relaxed);
+        let av_sum = self.av_sync_sum_us.swap(0, Ordering::Relaxed);
+        let av_sum_sq = self.av_sync_sum_sq_us.swap(0, Ordering::Relaxed);
+        let av_max_lag = self.av_sync_max_lag_us.swap(0, Ordering::Relaxed);
+        let av_max_lead = self.av_sync_max_lead_us.swap(0, Ordering::Relaxed);
+        let av_bad = self.av_sync_out_of_range.swap(0, Ordering::Relaxed);
+
+        // RMS 漂移（毫秒）：sqrt(Σdrift² / n) / 1000。
+        let av_rms_ms = if av_count > 0 {
+            let mean_sq_us = av_sum_sq as f64 / av_count as f64;
+            (mean_sq_us.sqrt() / 1000.0) as u64
+        } else {
+            0
+        };
+        // 有符号均值漂移（毫秒）：正负揭示系统性偏移方向——
+        // 正值=画面持续落后音频，负值=持续领先。RMS 把符号抹掉了，看不到。
+        let av_mean_ms = if av_count > 0 {
+            av_sum as i64 / av_count as i64 / 1000
+        } else {
+            0
+        };
+        let av_bad_pct = if av_count > 0 {
+            av_bad * 100 / av_count
+        } else {
+            0
+        };
+
         let w = window_secs.max(1);
         Snapshot {
             decoded_fps: decoded / w,
@@ -102,6 +178,11 @@ impl ProfileStats {
             max_interval_ms,
             on_time_pct: on_time_pct(&hist, total),
             hist,
+            av_sync_mean_ms: av_mean_ms,
+            av_sync_rms_ms: av_rms_ms,
+            av_sync_max_lag_ms: av_max_lag / 1000,
+            av_sync_max_lead_ms: av_max_lead / 1000,
+            av_sync_bad_pct: av_bad_pct,
         }
     }
 }
@@ -117,6 +198,19 @@ pub struct Snapshot {
     /// 帧间隔落在标称值附近（28~38ms）的占比，越接近 100 越稳。
     pub on_time_pct: u64,
     pub hist: [u64; HIST_LEN],
+    /// 音画同步有符号均值漂移（毫秒）。> 0 画面持续落后音频，< 0 持续领先。
+    /// 反映系统性偏移；抖动（正负相抵）会让它接近 0 而 RMS 仍大。
+    pub av_sync_mean_ms: i64,
+    /// 音画同步 RMS 漂移（毫秒）。综合正负方向的稳定度度量，
+    /// 比单帧峰值更能反映"整体偏不偏"。
+    pub av_sync_rms_ms: u64,
+    /// 画面落后音频的最大量（毫秒，drift>0）。
+    pub av_sync_max_lag_ms: u64,
+    /// 画面领先音频的最大量（毫秒，drift<0）。
+    pub av_sync_max_lead_ms: u64,
+    /// 超出 [`AV_SYNC_TOLERANCE_MS`] 的帧占比（%）。偶发抖动不算问题，
+    /// 真正要看的是这个占比有没有系统性地高。
+    pub av_sync_bad_pct: u64,
 }
 
 impl Snapshot {
@@ -130,6 +224,14 @@ impl Snapshot {
     /// 肉眼不可感，不该报警——否则告警天天响，真出问题时反而被忽略。
     pub fn is_janky(&self) -> bool {
         self.max_interval_ms > 66 || self.on_time_pct < 90
+    }
+
+    /// 音画是否系统性失步。判据按**感知**定，不按理论完美定：
+    /// 单次偶尔超 ±40ms 不可感（一次调度抖动），但若超过一成的帧都超阈值，
+    /// 说明同步机制本身有漂移，应预警。同时极端单帧（>100ms）也直接判失步——
+    /// 那已经是肉眼可见的对嘴型错位。
+    pub fn is_av_out_of_sync(&self) -> bool {
+        self.av_sync_bad_pct > 10 || self.av_sync_max_lag_ms > 100 || self.av_sync_max_lead_ms > 100
     }
 }
 
@@ -212,6 +314,11 @@ mod tests {
             max_interval_ms: 36,
             on_time_pct: 100,
             hist: [0; HIST_LEN],
+            av_sync_mean_ms: 0,
+            av_sync_rms_ms: 0,
+            av_sync_max_lag_ms: 0,
+            av_sync_max_lead_ms: 0,
+            av_sync_bad_pct: 0,
         };
         assert!(!s.is_janky(), "健康数据不该判为卡顿");
 
@@ -231,6 +338,11 @@ mod tests {
             max_interval_ms: 50,
             on_time_pct: 80,
             hist: [0; HIST_LEN],
+            av_sync_mean_ms: 0,
+            av_sync_rms_ms: 0,
+            av_sync_max_lag_ms: 0,
+            av_sync_max_lead_ms: 0,
+            av_sync_bad_pct: 0,
         };
         assert!(s.is_janky(), "准时率低于 90% 应判为卡顿");
     }
@@ -247,8 +359,78 @@ mod tests {
             max_interval_ms: 39,
             on_time_pct: 98,
             hist: [0; HIST_LEN],
+            av_sync_mean_ms: 0,
+            av_sync_rms_ms: 0,
+            av_sync_max_lag_ms: 0,
+            av_sync_max_lead_ms: 0,
+            av_sync_bad_pct: 0,
         };
         assert!(!s.is_janky());
+    }
+
+    // ---- 音画同步度量 ----
+
+    /// 校准：零漂移应判为同步，各项指标为 0。
+    #[test]
+    fn av_sync_zero_when_no_drift() {
+        let stats = ProfileStats::default();
+        for _ in 0..100 {
+            stats.record_av_sync(0);
+        }
+        let snap = stats.take_snapshot(2);
+        assert_eq!(snap.av_sync_mean_ms, 0);
+        assert_eq!(snap.av_sync_rms_ms, 0);
+        assert_eq!(snap.av_sync_bad_pct, 0);
+        assert!(!snap.is_av_out_of_sync());
+    }
+
+    /// 偶发大抖动不报警：单帧超阈值但占比低，属正常调度抖动。
+    #[test]
+    fn av_sync_tolerates_occasional_spike() {
+        let stats = ProfileStats::default();
+        // 100 帧里只有 1 帧飘到 60ms（<10% 阈值），其余都贴着 0。
+        for _ in 0..99 {
+            stats.record_av_sync(1_000); // 1ms
+        }
+        stats.record_av_sync(60_000); // 60ms 单次尖峰
+        let snap = stats.take_snapshot(2);
+        assert_eq!(snap.av_sync_bad_pct, 1, "仅 1/100 超阈值");
+        assert!(!snap.is_av_out_of_sync(), "偶发尖峰不该判失步");
+    }
+
+    /// 系统性失步：超过一成的帧持续落后，应报警。
+    #[test]
+    fn av_sync_flags_systematic_lag() {
+        let stats = ProfileStats::default();
+        for _ in 0..50 {
+            stats.record_av_sync(50_000); // 50ms 落后，超 ±40ms
+        }
+        let snap = stats.take_snapshot(2);
+        assert!(snap.av_sync_bad_pct > 10);
+        assert!(snap.is_av_out_of_sync());
+    }
+
+    /// 符号方向：持续落后应体现在 mean > 0 且 max_lag 涨、max_lead 为 0。
+    #[test]
+    fn av_sync_reports_lag_direction() {
+        let stats = ProfileStats::default();
+        for _ in 0..10 {
+            stats.record_av_sync(20_000); // 画面落后音频 20ms
+        }
+        let snap = stats.take_snapshot(2);
+        assert!(snap.av_sync_mean_ms > 0, "均值应为正（落后）");
+        assert!(snap.av_sync_max_lag_ms >= 20);
+        assert_eq!(snap.av_sync_max_lead_ms, 0);
+    }
+
+    /// 单帧极端错位（>100ms）即使占比低也直接判失步——
+    /// 那是肉眼可见的对嘴型错位，不能容忍。
+    #[test]
+    fn av_sync_flags_extreme_single_frame() {
+        let stats = ProfileStats::default();
+        stats.record_av_sync(150_000); // 150ms
+        let snap = stats.take_snapshot(2);
+        assert!(snap.is_av_out_of_sync());
     }
 
     #[test]

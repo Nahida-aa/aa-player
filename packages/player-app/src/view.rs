@@ -68,6 +68,9 @@ impl PlayerView {
             // 时钟初始为墙钟；解码线程把音频主时钟交上来后再切换。
             // 文件无音轨时它会一直是墙钟，那也是正确的行为。
             let mut clock = PlaybackClock::new();
+            // 音频主时钟就位后保存句柄，用于算音画漂移。
+            // `Option` 而非每次 `get()`：避免每帧都重新探测且能稳定读数。
+            let mut audio_clock: Option<player_core::AudioClock> = None;
             while let Some(item) = rx.next().await {
                 let Some((render, pts_us)) = item else {
                     break; // EOF
@@ -75,8 +78,11 @@ impl PlayerView {
                 let pts = Duration::from_micros(pts_us);
 
                 // 时钟可能在本轮等待期间就位，每帧重新探测一次。
-                if clock_source.get().is_some() {
-                    clock = PlaybackClock::with_audio(clock_source.get().unwrap().clone());
+                if let Some(c) = clock_source.get()
+                    && audio_clock.is_none()
+                {
+                    audio_clock = Some(c.clone());
+                    clock = PlaybackClock::with_audio(c.clone());
                 }
 
                 match clock.schedule(pts) {
@@ -101,6 +107,12 @@ impl PlayerView {
 
                 if profiling {
                     stats_render.record_displayed();
+                    // 音画漂移：在真正显示的这一刻，用音频时钟读数减帧 PTS。
+                    // 丢帧（Drop）不计入——主动丢帧是追赶手段，不是同步误差。
+                    if let Some(c) = audio_clock.as_ref() {
+                        let drift_us = c.position().as_micros() as i64 - pts_us as i64;
+                        stats_render.record_av_sync(drift_us);
+                    }
                 }
             }
             this.update(cx, |_, cx| cx.emit(PlaybackEnded)).ok();
@@ -153,6 +165,29 @@ impl PlayerView {
                         on_time_pct = snap.on_time_pct,
                         avg_decode_us = snap.avg_decode_us,
                         "播放流畅"
+                    );
+                }
+
+                // 音画同步：与卡顿正交——画面可能很流畅但整体偏音。
+                // 无音轨时 av_sync_* 全为 0，这条日志依然打印但都是 0，无害；
+                // 想看真实同步质量需在带音频设备的环境跑（headless 测不到）。
+                if snap.is_av_out_of_sync() {
+                    warn!(
+                        mean_ms = snap.av_sync_mean_ms,
+                        rms_ms = snap.av_sync_rms_ms,
+                        max_lag_ms = snap.av_sync_max_lag_ms,
+                        max_lead_ms = snap.av_sync_max_lead_ms,
+                        bad_pct = snap.av_sync_bad_pct,
+                        "音画失步"
+                    );
+                } else {
+                    info!(
+                        mean_ms = snap.av_sync_mean_ms,
+                        rms_ms = snap.av_sync_rms_ms,
+                        max_lag_ms = snap.av_sync_max_lag_ms,
+                        max_lead_ms = snap.av_sync_max_lead_ms,
+                        bad_pct = snap.av_sync_bad_pct,
+                        "音画同步"
                     );
                 }
             }
