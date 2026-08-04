@@ -67,6 +67,7 @@ INFO 播放流畅 decoded_fps=30 displayed_fps=30 avg_interval_ms=32
 
 ## 文档
 
+- [路线图 / TODO](TODO.md) —— 开发进度与待办，协作者与未来的自己用来对齐状态。
 - [排查播放「无响应」与「卡顿」的经历](docs/debugging-playback-jank.md)
   —— 四个真实 bug 的症状/真因对照，以及三次「度量本身在骗人」的教训。
 
