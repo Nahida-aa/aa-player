@@ -24,6 +24,10 @@ const STATS_WINDOW_SECS: u64 = 2;
 /// 方向键 seek 的步进。
 const SEEK_STEP: Duration = Duration::from_secs(5);
 
+/// 进度条左右留白（像素）。轨道宽度 = 窗口宽 − 2×此值；
+/// 点击映射用同一常量换算，保证轨道/填充/点击三者对齐。
+const PROGRESS_INSET: f32 = 12.0;
+
 /// 播放器视图：持有一帧最新的解码画面，并接收键盘/鼠标控制。
 pub struct PlayerView {
     /// 解码线程推来、待渲染的最新帧。
@@ -264,14 +268,18 @@ impl PlayerView {
     }
 
     /// 点击进度条：把窗口内 x 坐标映射到播放时间。
+    ///
+    /// 轨道相对窗口左右各缩进 [`PROGRESS_INSET`] 像素，所以换算要减去缩进、
+    /// 再除以轨道宽（窗口宽 − 2×缩进），与 fill 的 `relative(比例)` 对齐。
     fn seek_click(&mut self, x: gpui::Pixels, window: &mut Window) {
         let bounds = window.bounds();
-        let width = bounds.size.width;
-        if width == px(0.0) {
+        let window_w = bounds.size.width;
+        let track_w = window_w - px(PROGRESS_INSET * 2.0);
+        if track_w == px(0.0) {
             return;
         }
         // Pixels/Pixels → f32 比例。
-        let frac = ((x - bounds.origin.x) / width).clamp(0.0, 1.0);
+        let frac = ((x - bounds.origin.x - px(PROGRESS_INSET)) / track_w).clamp(0.0, 1.0);
         let target = self.duration.mul_f32(frac);
         self.seek_to(target);
     }
@@ -364,26 +372,33 @@ impl Render for PlayerView {
                     .justify_end()
                     .child(div().text_color(white()).child(time_text)),
             )
-            // 进度条行：满幅（无内边距），点击按窗口宽度映射即精确对应进度条。
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, _cx| {
-                this.seek_click(e.position.x, window);
-            }))
+            // 进度条行：左右留内边距，让轨道不占满整窗宽。
             .child(
-                // 轨道占满整行宽（**无水平内边距**）：这样 fill 的 relative(比例)
-                // 相对整行宽计算，100% 时恰好填满轨道，不会出现"轨道比进度长"。
                 div()
-                    .id("bar")
+                    .id("bar_row")
                     .w_full()
-                    .h(px(4.0))
-                    .bg(rgba(0xffffff33))
-                    .rounded_full()
+                    .px(px(PROGRESS_INSET))
                     .child(
+                        // 轨道：宽度 = 整行宽 − 2×内边距。fill 的 relative(比例)
+                        // 相对轨道宽计算，100% 恰好填满，三者（轨道/填充/点击）对齐。
+                        // 点击绑定在轨道上，seek_click 用同一内边距换算，保证精确。
                         div()
-                            .id("fill")
-                            .h_full()
-                            .w(relative(fill_pct))
-                            .bg(green())
-                            .rounded_full(),
+                            .id("bar")
+                            .w_full()
+                            .h(px(4.0))
+                            .bg(rgba(0xffffff33))
+                            .rounded_full()
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, _cx| {
+                                this.seek_click(e.position.x, window);
+                            }))
+                            .child(
+                                div()
+                                    .id("fill")
+                                    .h_full()
+                                    .w(relative(fill_pct))
+                                    .bg(green())
+                                    .rounded_full(),
+                            ),
                     ),
             );
 
