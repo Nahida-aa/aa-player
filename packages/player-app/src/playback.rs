@@ -560,6 +560,15 @@ impl PlaybackClock {
         self.audio = Some(audio);
     }
 
+    /// 重置墙钟时间轴原点，下一帧立即显示。
+    ///
+    /// seek 后调用：seek 前墙钟 origin 已走了很久（比如 8s），seek 到中间时若不清
+    /// 会让首帧被判"落后 8s"→ 触发 Resynced（虽会自愈，但那一瞬 behind 巨大）。
+    /// 音频主时钟出声后 origin 无意义，此处只为音频未 start 的窗口保持正确。
+    pub fn reset_origin(&mut self) {
+        self.origin = None;
+    }
+
     /// 设置音频时钟偏移（有符号微秒）。见 [`Self::audio_offset`]。
     pub fn set_audio_offset(&mut self, offset_us: i64) {
         self.audio_offset = offset_us;
@@ -773,6 +782,25 @@ mod tests {
             }
             other => panic!("origin 被清掉了，首帧之后本应等待，得到 {other:?}"),
         }
+    }
+
+    /// seek 后必须重置墙钟 origin：seek 前 origin 已走了很久（如 8s），seek 到
+    /// 中间若不清，首帧会被判"落后 8s"→ 触发 Resynced（虽自愈但那一瞬 behind 巨大）。
+    #[test]
+    fn reset_origin_clears_wallclock_origin() {
+        let mut clock = PlaybackClock::new();
+        // 首帧定 origin，0.5s 后应等待。
+        assert!(matches!(clock.schedule(Duration::ZERO), Schedule::Now));
+        match clock.schedule(Duration::from_millis(500)) {
+            Schedule::Wait(d) => assert!(d > Duration::from_millis(400)),
+            _ => panic!("首帧后应等待"),
+        }
+        // reset_origin 后，任意 pts 的帧应立即显示（新时间轴）。
+        clock.reset_origin();
+        assert!(matches!(
+            clock.schedule(Duration::from_millis(8000)),
+            Schedule::Now
+        ));
     }
 
     /// 核心回归测试：seek 后**音频不能在首个 post-seek 视频帧送出前起播**。

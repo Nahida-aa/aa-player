@@ -95,7 +95,6 @@ impl PlayerView {
             // 避免每帧重建把墙钟 origin 清零（启动时音频未出声走墙钟，
             // origin 必须在首帧定一次，否则画面不受节流地提前刷出）。
             let mut audio_gen: u64 = 0;
-            let mut last_offset_us: i64 = 0;
             while let Some(item) = rx.next().await {
                 let Some((render, pts_us, duration_us)) = item else {
                     // EOF：进度条拉满，但**不退出循环**——解码线程在 EOF 后仍活着
@@ -118,23 +117,15 @@ impl PlayerView {
                     if let Some(c) = audio.as_ref() {
                         clock.set_audio(c.clone());
                     }
+                    // seek 发生了：重置墙钟 origin（避免 seek 到中间首帧被判"落后 N 秒"
+                    // 触发 Resynced），并**丢弃通道里 seek 前残留的旧帧**——它们已用新
+                    // 偏移调度，会得到巨大 behind 被 Drop（一次性抖动）。
+                    clock.reset_origin();
+                    while rx.try_recv().is_ok() {}
                 }
                 // seek 偏移由解码线程用"首个 post-seek 视频帧的实际 pts − 当时
                 // 音频位置"设定（可为负），每帧都读（原子读，廉价）并应用。
                 clock.set_audio_offset(offset_us);
-
-                // 诊断：seek 后偏移变化时打印一次，看 now=音频位置+偏移 是否对。
-                if offset_us != last_offset_us {
-                    last_offset_us = offset_us;
-                    let audio_pos = audio.as_ref().map(|c| c.position().as_micros() as i64).unwrap_or(0);
-                    warn!(
-                        pts_ms = pts_us / 1000,
-                        offset_ms = offset_us / 1000,
-                        audio_ms = audio_pos / 1000,
-                        now_ms = (audio_pos + offset_us) / 1000,
-                        "seek 偏移变化"
-                    );
-                }
 
                 match clock.schedule(pts) {
                     Schedule::Wait(d) => cx.background_executor().timer(d).await,
@@ -142,13 +133,17 @@ impl PlayerView {
                     // 音频主时钟下落后太多：跳过这一帧，让画面追上声音，
                     // 不能反过来把已经播出去的音频拽慢。
                     Schedule::Drop { behind } => {
-                        warn!(
-                            behind_ms = behind.as_millis(),
-                            pts_ms = pts_us / 1000,
-                            offset_ms = offset_us / 1000,
-                            audio_ms = audio.as_ref().map(|c| c.position().as_millis()).unwrap_or_default(),
-                            "画面落后音频，丢帧追赶"
-                        );
+                        // 只有较大落后才打日志：小 behind 是音频主时钟下视频追赶的
+                        // 正常行为，逐帧 warn 会刷屏。
+                        if behind.as_millis() >= 500 {
+                            warn!(
+                                behind_ms = behind.as_millis(),
+                                pts_ms = pts_us / 1000,
+                                offset_ms = offset_us / 1000,
+                                audio_ms = audio.as_ref().map(|c| c.position().as_millis()).unwrap_or_default(),
+                                "画面落后音频，丢帧追赶"
+                            );
+                        }
                         continue;
                     }
                     Schedule::Resynced { behind } => playback::log_resync(behind, pts),
