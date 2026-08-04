@@ -487,7 +487,9 @@ impl Render for PlayerView {
                 if e.pressed_button == Some(MouseButton::Left) {
                     if !this.dragging.load(Ordering::Relaxed) {
                         this.dragging.store(true, Ordering::Relaxed);
-                        // 拖动刚开始：立即跳一次（Preview），否则画面停在按下位置。
+                        // 拖动开始：静音（停声卡，避免声音卡顿/与画面抢资源），
+                        // 且立即跳一次（Preview），否则画面停在按下位置。
+                        let _ = this.cmd.unbounded_send(playback::PlaybackCommand::MuteAudio);
                         this.seek_drag(e.position.x, window);
                     } else {
                         this.seek_drag(e.position.x, window);

@@ -71,6 +71,10 @@ pub enum PlaybackCommand {
     Pause,
     /// 恢复。
     Resume,
+    /// 静音（拖动中）：只停声卡（`Stream::pause`），**不停止解码**——画面预览
+    /// 继续。拖动时音画本无法同步，静音避免声音卡顿/抢资源；松开由 Commit
+    /// 重建音频流替代旧流。
+    MuteAudio,
     /// 跳转到指定时刻。
     Seek(Duration, SeekKind),
 }
@@ -300,6 +304,12 @@ fn run_until_eof(
                     *paused = false;
                     if let Some(a) = audio.as_ref() {
                         a.resume();
+                    }
+                }
+                PlaybackCommand::MuteAudio => {
+                    // 拖动中静音：只停声卡，**不设 paused**（解码线程继续解预览帧）。
+                    if let Some(a) = audio.as_ref() {
+                        a.pause();
                     }
                 }
                 PlaybackCommand::Seek(mut ts, mut kind) => {
