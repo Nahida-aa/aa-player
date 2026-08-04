@@ -4,11 +4,14 @@
 # 不带参数时默认执行 `default`（即 dev）。
 
 # 默认 recipe：启动 GUI 应用
-default: dev
+default: run
 
 # 启动播放器 GUI（首次会从 zed git 源编译 GPUI，较慢）
-dev:
+run:
     cargo run
+
+dev:
+    cargo watch -x run
 
 debug:
     RUST_LOG=player_app=debug cargo run

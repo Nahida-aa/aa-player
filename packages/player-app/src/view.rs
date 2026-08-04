@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
-use gpui::{Context, EventEmitter, IntoElement, Render, RenderImage, Styled, Task, Window, div};
+use gpui::{
+    Context, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    Render, RenderImage, Task, Window, div, green, prelude::*, px, relative, rgba, white,
+};
 use tracing::{info, warn};
 
 use crate::playback::{self, PlaybackClock, Schedule};
@@ -18,7 +21,10 @@ use crate::stats::ProfileStats;
 /// 统计上报间隔（秒）。
 const STATS_WINDOW_SECS: u64 = 2;
 
-/// 播放器视图：持有一帧最新的解码画面。
+/// 方向键 seek 的步进。
+const SEEK_STEP: Duration = Duration::from_secs(5);
+
+/// 播放器视图：持有一帧最新的解码画面，并接收键盘/鼠标控制。
 pub struct PlayerView {
     /// 解码线程推来、待渲染的最新帧。
     latest_frame: Option<Arc<RenderImage>>,
@@ -27,6 +33,16 @@ pub struct PlayerView {
     previous_rendered: Option<Arc<RenderImage>>,
     /// 后台渲染任务句柄（持有以保活）。
     _render_task: Task<()>,
+    /// 控制命令通道：暂停/继续/seek 发给解码线程。
+    cmd: playback::CommandSender,
+    /// 文件总时长（首帧到达后确定）。
+    duration: Duration,
+    /// 当前播放位置（随显示帧更新）。
+    position: Duration,
+    /// 是否暂停（仅 UI 侧镜像，真正的暂停在解码线程）。
+    paused: bool,
+    /// 键盘焦点句柄：让本视图能收到按键。
+    focus_handle: FocusHandle,
 }
 
 /// 解码线程结束（EOF）时发出，便于 UI 提示。
@@ -38,6 +54,7 @@ impl EventEmitter<PlaybackEnded> for PlayerView {}
 impl PlayerView {
     pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (tx, mut rx) = playback::frame_channel();
+        let (cmd, cmd_rx) = playback::command_channel();
         let running = Arc::new(AtomicBool::new(true));
         // 仅当 debug 级别开启时才统计（`RUST_LOG=player_app=debug`），
         // 避免常态下为统计付出原子操作与定时任务开销。
@@ -60,34 +77,36 @@ impl PlayerView {
             running.clone(),
             stats.clone(),
             clock_source.clone(),
+            cmd_rx,
         );
+
+        let focus_handle = cx.focus_handle();
 
         // 渲染 task：异步收帧，按 PTS 精确节流显示，绝不阻塞 executor。
         let stats_render = stats.clone();
         let _render_task = cx.spawn_in(window, async move |this, cx| {
             // 时钟初始为墙钟；解码线程把音频主时钟交上来后再切换。
-            // 文件无音轨时它会一直是墙钟，那也是正确的行为。
             let mut clock = PlaybackClock::new();
-            // 音频主时钟就位后保存句柄，用于算音画漂移。
-            // `Option` 而非每次 `get()`：避免每帧都重新探测且能稳定读数。
-            let mut audio_clock: Option<player_core::AudioClock> = None;
+            // 记住当前音频时钟的代次；只有换代（attach / seek 重建）才换时钟柄，
+            // 避免每帧重建把墙钟 origin 清零（启动时音频未出声走墙钟，
+            // origin 必须在首帧定一次，否则画面不受节流地提前刷出）。
+            let mut audio_gen: u64 = 0;
             while let Some(item) = rx.next().await {
-                let Some((render, pts_us)) = item else {
+                let Some((render, pts_us, duration_us)) = item else {
                     break; // EOF
                 };
                 let pts = Duration::from_micros(pts_us);
 
-                // 时钟可能在本轮等待期间就位，每帧重新探测一次。
-                if let Some(c) = clock_source.get()
-                    && audio_clock.is_none()
-                {
-                    audio_clock = Some(c.clone());
-                    clock = PlaybackClock::with_audio(c.clone());
+                // 音频时钟换代时更新句柄；没换代则沿用，墙钟 origin 得以保持。
+                let (clock_gen, audio) = clock_source.get_with_generation();
+                if clock_gen != audio_gen {
+                    audio_gen = clock_gen;
+                    if let Some(c) = audio.as_ref() {
+                        clock.set_audio(c.clone());
+                    }
                 }
 
                 match clock.schedule(pts) {
-                    // 用 GPUI timer 精确等待（对齐事件循环，
-                    // 比 worker 线程的 thread::sleep 更平滑）。
                     Schedule::Wait(d) => cx.background_executor().timer(d).await,
                     Schedule::Now => {}
                     // 音频主时钟下落后太多：跳过这一帧，让画面追上声音，
@@ -101,6 +120,9 @@ impl PlayerView {
 
                 this.update(cx, |this, cx| {
                     this.latest_frame = Some(render);
+                    // 进度：首帧也确认总时长。
+                    this.duration = Duration::from_micros(duration_us);
+                    this.position = pts;
                     cx.notify();
                 })
                 .ok();
@@ -108,8 +130,7 @@ impl PlayerView {
                 if profiling {
                     stats_render.record_displayed();
                     // 音画漂移：在真正显示的这一刻，用音频时钟读数减帧 PTS。
-                    // 丢帧（Drop）不计入——主动丢帧是追赶手段，不是同步误差。
-                    if let Some(c) = audio_clock.as_ref() {
+                    if let Some(c) = audio.as_ref() {
                         let drift_us = c.position().as_micros() as i64 - pts_us as i64;
                         stats_render.record_av_sync(drift_us);
                     }
@@ -122,11 +143,19 @@ impl PlayerView {
             Self::spawn_stats_reporter(stats, window, cx);
         }
 
+        // 抢键盘焦点，让空格/方向键直接可用。
+        window.focus(&focus_handle, cx);
+
         Self {
             latest_frame: None,
             current_rendered: None,
             previous_rendered: None,
             _render_task,
+            cmd,
+            duration: Duration::ZERO,
+            position: Duration::ZERO,
+            paused: false,
+            focus_handle,
         }
     }
 
@@ -196,8 +225,70 @@ impl PlayerView {
     }
 }
 
+impl PlayerView {
+    /// 发送暂停/恢复命令并镜像本地 paused 状态。
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        let cmd = if self.paused {
+            playback::PlaybackCommand::Pause
+        } else {
+            playback::PlaybackCommand::Resume
+        };
+        let _ = self.cmd.unbounded_send(cmd);
+    }
+
+    /// 相对当前位置向后 seek（夹到 [0, duration]）。
+    fn seek_backward(&mut self, delta: Duration) {
+        self.seek_to(self.position.saturating_sub(delta));
+    }
+
+    /// 相对当前位置向前 seek（夹到 [0, duration]）。
+    fn seek_forward(&mut self, delta: Duration) {
+        self.seek_to(self.position.saturating_add(delta));
+    }
+
+    /// 跳到指定时间点（夹到 [0, duration]）。
+    fn seek_to(&mut self, target: Duration) {
+        let target = target.min(self.duration);
+        self.position = target;
+        let _ = self.cmd.unbounded_send(playback::PlaybackCommand::Seek(target));
+    }
+
+    /// 点击进度条：把窗口内 x 坐标映射到播放时间。
+    fn seek_click(&mut self, x: gpui::Pixels, window: &mut Window) {
+        let bounds = window.bounds();
+        let width = bounds.size.width;
+        if width == px(0.0) {
+            return;
+        }
+        // Pixels/Pixels → f32 比例。
+        let frac = ((x - bounds.origin.x) / width).clamp(0.0, 1.0);
+        let target = self.duration.mul_f32(frac);
+        self.seek_to(target);
+    }
+
+    /// 处理按键。返回 true 表示已消费。
+    fn on_key(&mut self, event: &KeyDownEvent) -> bool {
+        match event.keystroke.key.as_str() {
+            "space" => {
+                self.toggle_pause();
+                true
+            }
+            "left" => {
+                self.seek_backward(SEEK_STEP);
+                true
+            }
+            "right" => {
+                self.seek_forward(SEEK_STEP);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 impl Render for PlayerView {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 双缓冲回收：把上一帧的纹理 drop 掉，防止 sprite atlas 无限增长。
         if let Some(current) = self.current_rendered.take() {
             if let Some(prev) = self.previous_rendered.take() {
@@ -208,11 +299,93 @@ impl Render for PlayerView {
             self.previous_rendered = Some(current);
         }
 
+        // 进度条已填充比例。
+        let fill_pct = if self.duration.is_zero() {
+            0.0
+        } else {
+            (self.position.as_secs_f64() / self.duration.as_secs_f64()).clamp(0.0, 1.0) as f32
+        };
+        let time_text = format!(
+            "{:02}:{:02} / {:02}:{:02}",
+            self.position.as_secs() / 60,
+            self.position.as_secs() % 60,
+            self.duration.as_secs() / 60,
+            self.duration.as_secs() % 60,
+        );
+
+        let root = div()
+            .id("player")
+            .track_focus(&self.focus_handle)
+            .key_context("player")
+            .size_full()
+            .relative()
+            .on_key_down(cx.listener(|this, e, _, cx| {
+                this.on_key(e);
+                cx.notify();
+            }));
+
         let Some(frame) = self.latest_frame.clone() else {
-            return div().size_full().into_any_element();
+            return root.into_any_element();
         };
         self.current_rendered = Some(frame.clone());
+        let image = gpui::img(frame).size_full();
 
-        gpui::img(frame).size_full().into_any_element()
+        // 底部控制条：进度条 + 时间。
+        let bar = div()
+            .id("progress")
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .h(px(28.0))
+            .flex()
+            .items_center()
+            .px(px(12.0))
+            .gap(px(8.0))
+            .bg(rgba(0x00000066))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, e: &MouseDownEvent, window, _cx| {
+                this.seek_click(e.position.x, window);
+            }))
+            .child(
+                div()
+                    .id("bar")
+                    .flex_1()
+                    .h(px(4.0))
+                    .bg(rgba(0xffffff33))
+                    .rounded_full()
+                    .child(
+                        div()
+                            .id("fill")
+                            .h_full()
+                            .w(relative(fill_pct))
+                            .bg(green())
+                            .rounded_full(),
+                    ),
+            )
+            .child(div().text_color(white()).child(time_text));
+
+        let mut content = root.child(image).child(bar);
+
+        // 暂停遮罩。
+        if self.paused {
+            content = content.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_color(white())
+                            .text_2xl()
+                            .child("⏸ 已暂停"),
+                    ),
+            );
+        }
+
+        content.into_any_element()
     }
 }

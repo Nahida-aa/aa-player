@@ -45,9 +45,13 @@ const SEND_BACKOFF: Duration = Duration::from_millis(2);
 /// 反过来拖慢 worker，污染我们要测的东西。
 const DECODE_LOG_EVERY: u64 = 60;
 
-/// 送往渲染侧的一帧：图像 + 显示时刻（PTS，微秒）。
+/// 送往渲染侧的一帧：图像 + 显示时刻（PTS，微秒）+ 文件总时长（微秒）。
 /// `None` 表示流结束（EOF 或出错）。
-pub type FrameMsg = Option<(Arc<RenderImage>, u64)>;
+///
+/// 总时长随每帧带上，渲染侧无需自行 open 文件就能画进度条。
+/// 它是常量（每帧都相同），但 `Duration` 是 `Copy`、队列又很浅，
+/// 顺带捎带的成本可忽略。
+pub type FrameMsg = Option<(Arc<RenderImage>, u64, u64)>;
 
 pub type FrameSender = mpsc::Sender<FrameMsg>;
 pub type FrameReceiver = mpsc::Receiver<FrameMsg>;
@@ -55,6 +59,28 @@ pub type FrameReceiver = mpsc::Receiver<FrameMsg>;
 /// 建一条帧通道。
 pub fn frame_channel() -> (FrameSender, FrameReceiver) {
     mpsc::channel(FRAME_QUEUE_CAP)
+}
+
+/// 播放器控制命令：UI → 解码线程。
+///
+/// 用 **unbounded** 通道：控制命令不能因背压丢失，也不能让 UI 线程
+/// 阻塞等队列（否则拖拽 seek 时界面会卡）。命令量极小，无满队列之虞。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackCommand {
+    /// 暂停。声卡冻结、画面停走、source 不再前进。
+    Pause,
+    /// 恢复。
+    Resume,
+    /// 跳转到指定时刻。解码线程 seek + 重建声卡流重锚时钟。
+    Seek(Duration),
+}
+
+pub type CommandSender = mpsc::UnboundedSender<PlaybackCommand>;
+pub type CommandReceiver = mpsc::UnboundedReceiver<PlaybackCommand>;
+
+/// 建一条命令通道。
+pub fn command_channel() -> (CommandSender, CommandReceiver) {
+    mpsc::unbounded()
 }
 
 /// 音频主时钟的交接点。
@@ -65,20 +91,37 @@ pub fn frame_channel() -> (FrameSender, FrameReceiver) {
 ///
 /// 渲染侧在时钟就位前按墙钟走——文件无音轨时它会**永远**是空的，
 /// 那也是正确行为。
+///
+/// 与 `OnceLock` 不同，这里用 `Mutex<Option<_>>`：seek 时会**重建**声卡流
+/// （硬件时钟不能倒带，只能重开让 `frames_played` 归零），所以时钟句柄
+/// 必须能被替换。
+///
+/// `generation` 每次 `attach` 递增：渲染侧据此判断「时钟是否换了新柄」。
+/// 只在换代时才重建 [`PlaybackClock`]，避免每帧重建把墙钟 `origin` 反复清零
+/// ——否则启动时（音频尚未出声，走墙钟）每帧都重置原点，视频会不受节流地
+/// 提前刷出，等音频一出声又猛然等 400ms 追赶（实测的启动 427ms 卡顿与
+/// 400ms 领先正是这么来的）。
 #[derive(Default)]
 pub struct AudioClockSource {
-    clock: std::sync::OnceLock<AudioClock>,
+    clock: std::sync::Mutex<Option<AudioClock>>,
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl AudioClockSource {
-    /// 解码线程确认有音轨后调用，把时钟交出来。
-    pub fn attach(&self, output: &AudioOutput) {
-        let _ = self.clock.set(output.clock());
+    /// 解码线程确认有音轨后（或 seek 重建流后）把时钟交出来。
+    pub fn attach(&self, clock: AudioClock) {
+        *self.clock.lock().unwrap_or_else(|e| e.into_inner()) = Some(clock);
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 取当前的音频时钟；尚未就位（或无音轨）时为 `None`。
-    pub fn get(&self) -> Option<&AudioClock> {
-        self.clock.get()
+    /// 取当前的音频时钟与代次；尚未就位（或无音轨）时为 `None`。
+    ///
+    /// `generation` 用来自检换柄：渲染侧记住上次用的 `generation`，
+    /// 变了才重建时钟，没变则沿用（墙钟 origin 得以保持）。
+    pub fn get_with_generation(&self) -> (u64, Option<AudioClock>) {
+        let generation = self.generation.load(Ordering::Relaxed);
+        let clock = self.clock.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (generation, clock)
     }
 }
 
@@ -105,6 +148,7 @@ pub fn spawn_decode_thread(
     running: Arc<AtomicBool>,
     stats: Arc<ProfileStats>,
     clock_source: Arc<AudioClockSource>,
+    mut cmd_rx: CommandReceiver,
 ) {
     std::thread::spawn(move || {
         // 声卡打不开不该让整个播放失败——没有声音总比放不了强。
@@ -129,71 +173,165 @@ pub fn spawn_decode_thread(
         // 只有确实有音轨时才让时钟切到音频主时钟。
         // 设备开了但文件是纯视频的话，声卡永远不会推进，
         // 拿它当主时钟会让画面彻底不动。
-        let audio = audio.filter(|_| source.audio_info().is_some());
+        let mut audio = audio.filter(|_| source.audio_info().is_some());
         if let Some(a) = audio.as_ref() {
-            clock_source.attach(a);
+            clock_source.attach(a.clock());
             info!("音频主时钟已启用");
         } else {
             info!("无音轨，使用墙钟");
         }
 
+        let duration_us = source.video_info().duration.as_micros() as u64;
+        let mut paused = false;
         let mut frame_no: u64 = 0;
-        while running.load(Ordering::Relaxed) {
-            let t0 = Instant::now();
-            let frame = match source.next_event() {
-                Ok(Some(MediaEvent::Video(f))) => {
-                    frame_no += 1;
-                    if frame_no.is_multiple_of(DECODE_LOG_EVERY) {
-                        debug!(frame = frame_no, pts_ms = f.pts.as_millis(), "解码进度");
-                    }
-                    f
-                }
-                Ok(Some(MediaEvent::Audio(chunk))) => {
-                    if let Some(a) = audio.as_ref() {
-                        // 背压：缓冲够深就等一等，别把整轨解进内存。
-                        // 这里可以安心 sleep——音频缓冲里还有几百毫秒垫着。
-                        while running.load(Ordering::Relaxed)
-                            && a.queued_duration() > AUDIO_BUFFER
-                        {
-                            std::thread::sleep(AUDIO_BACKOFF);
-                        }
-                        a.push_samples(&chunk.samples);
-                        if a.take_underrun() {
-                            warn!("音频欠载：解码跟不上声卡消费");
-                        }
-                    }
-                    continue;
-                }
-                Ok(None) => {
-                    info!(frames = frame_no, "解码到达文件末尾");
-                    // 别急着退：声卡缓冲里还有几百毫秒没播完，
-                    // 此刻返回会把 AudioOutput drop 掉，声音戛然而止。
-                    if let Some(a) = audio.as_ref() {
-                        drain_audio(a, &running);
-                    }
-                    let _ = tx.try_send(None);
-                    return;
-                }
-                Err(e) => {
-                    error!(error = %e, frames = frame_no, "解码失败，停止");
-                    let _ = tx.try_send(None);
-                    return;
-                }
-            };
 
-            let decode_us = t0.elapsed().as_micros() as u64;
-            let render = decoded_to_render_image(&frame);
-            // 计数放在这里而非投递成功之后：投递会阻塞重试，
-            // 挂在成功分支上会让"队列持续满"表现为 fps=0（曾误判成线程死亡）。
-            stats.record_decoded(decode_us);
+        // 每次 seek 都要重建声卡流来重锚时钟；这个 audio 由 `run_one_seek` 移动式持有。
+        run_until_eof(
+            &mut source,
+            &mut tx,
+            &running,
+            &stats,
+            &clock_source,
+            &mut cmd_rx,
+            &mut audio,
+            &mut paused,
+            &mut frame_no,
+            duration_us,
+        );
+    });
+}
 
-            let pts_us = frame.pts.as_micros() as u64;
-            if !send_blocking(&mut tx, (render, pts_us), &running) {
-                return; // 接收端关闭或被要求停止
+/// 解码直到文件末尾，期间响应暂停/seek 命令。
+///
+/// `paused` 为真时进入暂停态：不再 `next_event`、不推音频、不发帧，
+/// 仅轮询命令直到恢复或 seek。这样暂停期间 source 不前进、声卡冻结，
+/// 恢复后位置天然连续。
+#[allow(clippy::too_many_arguments)]
+fn run_until_eof(
+    source: &mut FfmpegSource,
+    tx: &mut FrameSender,
+    running: &Arc<AtomicBool>,
+    stats: &Arc<ProfileStats>,
+    clock_source: &Arc<AudioClockSource>,
+    cmd_rx: &mut CommandReceiver,
+    audio: &mut Option<AudioOutput>,
+    paused: &mut bool,
+    frame_no: &mut u64,
+    duration_us: u64,
+) {
+    let mut next_frame: Option<(Arc<RenderImage>, u64)> = None;
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // 优先响应命令（尤其 seek/暂停），非阻塞。
+        if let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                PlaybackCommand::Pause => {
+                    if let Some(a) = audio.as_ref() {
+                        a.pause();
+                    }
+                    *paused = true;
+                }
+                PlaybackCommand::Resume => {
+                    *paused = false;
+                    if let Some(a) = audio.as_ref() {
+                        a.resume();
+                    }
+                }
+                PlaybackCommand::Seek(ts) => {
+                    if let Err(e) = source.seek(ts) {
+                        error!(error = %e, seek_ms = ts.as_millis(), "seek 失败");
+                    } else {
+                        info!(seek_ms = ts.as_millis(), "seek");
+                        seek_rebuild_audio(audio, clock_source);
+                    }
+                    next_frame = None; // 丢弃 seek 前暂存的帧
+                }
+            }
+            continue;
+        }
+
+        if *paused {
+            // 暂停态：不推音频、不发帧、不前进。睡一下等命令。
+            std::thread::sleep(Duration::from_millis(8));
+            continue;
+        }
+
+        // 有条暂存的待发帧？先发掉（投递会背压），再解下一帧。
+        if let Some((render, pts_us)) = next_frame.take() {
+            if !send_blocking(tx, (render, pts_us, duration_us), running) {
+                return;
+            }
+            continue;
+        }
+
+        let t0 = Instant::now();
+        match source.next_event() {
+            Ok(Some(MediaEvent::Video(f))) => {
+                *frame_no += 1;
+                if frame_no.is_multiple_of(DECODE_LOG_EVERY) {
+                    debug!(frame = *frame_no, pts_ms = f.pts.as_millis(), "解码进度");
+                }
+                let decode_us = t0.elapsed().as_micros() as u64;
+                let render = decoded_to_render_image(&f);
+                // 计数放在这里而非投递成功之后：投递会阻塞重试，
+                // 挂在成功分支上会让"队列持续满"表现为 fps=0（曾误判成线程死亡）。
+                stats.record_decoded(decode_us);
+                let pts_us = f.pts.as_micros() as u64;
+                // 交给下一轮发，避免在 seek 后发送 seek 前的帧。
+                next_frame = Some((render, pts_us));
+            }
+            Ok(Some(MediaEvent::Audio(chunk))) => {
+                if let Some(a) = audio.as_ref() {
+                    // 背压：缓冲够深就等一等，别把整轨解进内存。
+                    while running.load(Ordering::Relaxed)
+                        && a.queued_duration() > AUDIO_BUFFER
+                    {
+                        std::thread::sleep(AUDIO_BACKOFF);
+                    }
+                    a.push_samples(&chunk.samples);
+                    if a.take_underrun() {
+                        warn!("音频欠载：解码跟不上声卡消费");
+                    }
+                }
+            }
+            Ok(None) => {
+                info!(frames = *frame_no, "解码到达文件末尾");
+                // 别急着退：声卡缓冲里还有几百毫秒没播完，
+                // 此刻返回会把 AudioOutput drop 掉，声音戛然而止。
+                if let Some(a) = audio.as_ref() {
+                    drain_audio(a, running);
+                }
+                let _ = tx.try_send(None);
+                return;
+            }
+            Err(e) => {
+                error!(error = %e, frames = *frame_no, "解码失败，停止");
+                let _ = tx.try_send(None);
+                return;
             }
         }
-        debug!(frames = frame_no, "解码线程正常退出（窗口关闭）");
-    });
+    }
+}
+
+/// seek 后重建声卡流，让音频时钟归零。
+///
+/// 声卡硬件时钟不能倒带：seek 到新位置后，旧 `frames_played` 还在原处，
+/// 画面相对旧音频位置会被判定"大幅落后"→ 丢帧风暴。重建流（`AudioOutput::new`）
+/// 让计数器归零，再把新时钟句柄交回渲染侧。会有一瞬静音/爆音（可接受）。
+fn seek_rebuild_audio(audio: &mut Option<AudioOutput>, clock_source: &Arc<AudioClockSource>) {
+    *audio = match AudioOutput::new() {
+        Ok(o) => Some(o),
+        Err(e) => {
+            warn!(error = %e, "seek 后重开音频设备失败，将以无声模式播放");
+            None
+        }
+    };
+    if let Some(a) = audio.as_ref() {
+        clock_source.attach(a.clock());
+    }
 }
 
 /// 等声卡把缓冲里剩下的采样播完。
@@ -214,7 +352,7 @@ fn drain_audio(audio: &AudioOutput, running: &AtomicBool) {
 /// 表现为忽快忽卡。早期版本"重试一次仍满就丢弃"正是卡顿的根源。
 fn send_blocking(
     tx: &mut FrameSender,
-    item: (Arc<RenderImage>, u64),
+    item: (Arc<RenderImage>, u64, u64),
     running: &AtomicBool,
 ) -> bool {
     let mut pending = Some(item);
@@ -274,12 +412,14 @@ impl PlaybackClock {
         }
     }
 
-    /// 以音频为主时钟。
-    pub fn with_audio(audio: AudioClock) -> Self {
-        Self {
-            audio: Some(audio),
-            origin: None,
-        }
+    /// 更换音频主时钟句柄，但**保留墙钟 origin**。
+    ///
+    /// seek 重建声卡流后会换上全新的时钟；此时若直接重建整个
+    /// `PlaybackClock`，墙钟模式的 `origin` 会被清掉。音频出声后 origin 无意义，
+    /// 但在"音频已 attach 尚未 start"的启动窗口里，我们仍走墙钟，origin 必须
+    /// 只在首帧设置一次——每帧重建正是导致启动画面提前刷出的根因。
+    pub fn set_audio(&mut self, audio: AudioClock) {
+        self.audio = Some(audio);
     }
 
     /// 为 PTS 为 `target` 的帧决定何时显示。
@@ -413,7 +553,7 @@ mod tests {
 
     #[test]
     fn audio_clock_waits_for_future_frame() {
-        let mut clock = PlaybackClock::with_audio(fake_clock(0));
+        let mut clock = audio_clock(fake_clock(0));
         // 音频已出声（started=true）。目标帧在 500ms 之后 → 应等待。
         match clock.schedule(Duration::from_millis(500)) {
             Schedule::Wait(d) => assert!(d > Duration::from_millis(400)),
@@ -421,7 +561,7 @@ mod tests {
         }
         // 时钟走到帧的位置 → 立即显示。
         assert!(matches!(
-            PlaybackClock::with_audio(fake_clock(500)).schedule(Duration::from_millis(500)),
+            audio_clock(fake_clock(500)).schedule(Duration::from_millis(500)),
             Schedule::Now
         ));
     }
@@ -430,7 +570,7 @@ mod tests {
     fn audio_clock_drops_frame_when_far_behind() {
         // 音频已播到 5 秒，目标帧才 100ms：落后远超 100ms 阈值，
         // 且音频没法重置 → 必须丢帧。
-        let mut clock = PlaybackClock::with_audio(fake_clock(5000));
+        let mut clock = audio_clock(fake_clock(5000));
         match clock.schedule(Duration::from_millis(100)) {
             Schedule::Drop { behind } => {
                 assert!(behind > DROP_THRESHOLD, "落后 {behind:?} 应超过丢帧阈值");
@@ -443,7 +583,7 @@ mod tests {
     fn audio_clock_shows_frame_within_drop_tolerance() {
         // 音频播到 150ms，目标帧在 100ms：落后 50ms（< 100ms 阈值），
         // 属抖动范围，直接显示而不丢帧。
-        let mut clock = PlaybackClock::with_audio(fake_clock(150));
+        let mut clock = audio_clock(fake_clock(150));
         assert!(matches!(
             clock.schedule(Duration::from_millis(100)),
             Schedule::Now
@@ -455,8 +595,36 @@ mod tests {
         // 声卡还没播出第一个采样时 position()==0 但 started()==false，
         // 不能拿它当基准（会让每帧都判成"未来"卡在首帧）。
         // 此时应退回墙钟：首帧立即显示。
-        let mut clock = PlaybackClock::with_audio(fake_clock_unstarted(0));
+        let mut clock = audio_clock(fake_clock_unstarted(0));
         assert!(matches!(clock.schedule(Duration::ZERO), Schedule::Now));
+    }
+
+    /// 构造一个已挂音频时钟的 `PlaybackClock`（测试用）。
+    fn audio_clock(audio: AudioClock) -> PlaybackClock {
+        let mut clock = PlaybackClock::new();
+        clock.set_audio(audio);
+        clock
+    }
+
+    /// 启动时音频已 attach 但尚未 start，走墙钟；`set_audio` 只换时钟柄、
+    /// **不清墙钟 origin**。若每帧重建（`with_audio`），origin 反复清零，
+    /// 画面会不受节流提前刷出——这是实测启动 427ms 卡顿的根因。
+    #[test]
+    fn set_audio_preserves_wallclock_origin() {
+        let mut clock = PlaybackClock::new();
+        // 首帧（音频未出声，走墙钟）定 origin 并立即显示。
+        assert!(matches!(clock.schedule(Duration::ZERO), Schedule::Now));
+
+        // 换上一个"未出声"的音频时钟，模拟启动窗口：应仍走墙钟、保持 origin。
+        clock.set_audio(fake_clock_unstarted(0));
+        // 假设 0.5s 后来了 pts=500ms 的帧；若 origin 被清，会误判为"未来/立即"，
+        // 若 origin 保留，则按墙钟节奏应等待 ~0.5s。
+        match clock.schedule(Duration::from_millis(500)) {
+            Schedule::Wait(d) => {
+                assert!(d > Duration::from_millis(400), "origin 应保留，等待约 0.5s");
+            }
+            other => panic!("origin 被清掉了，首帧之后本应等待，得到 {other:?}"),
+        }
     }
 
     /// 构造一个"已出声、读数可控"的假音频时钟。
@@ -467,5 +635,32 @@ mod tests {
     /// 构造一个"未出声、读数可控"的假音频时钟。
     fn fake_clock_unstarted(ms: u64) -> AudioClock {
         AudioClock::for_test(Duration::from_millis(ms), false)
+    }
+
+    // ---- AudioClockSource：可换柄 ----
+
+    /// seek 会重建声卡流并重新 `attach` 时钟；旧柄必须能被替换，
+    /// 渲染侧重读拿到**新**时钟（这才是 seek 后时间轴对齐的关键）。
+    #[test]
+    fn clock_source_returns_latest_attached_clock() {
+        let src = AudioClockSource::default();
+        // 尚未 attach → None。
+        let (gen0, c0) = src.get_with_generation();
+        assert!(c0.is_none());
+        assert_eq!(gen0, 0);
+
+        // 第一次 attach：位置 1s，代次 +1。
+        src.attach(fake_clock(1000));
+        let (gen1, c1) = src.get_with_generation();
+        let c1 = c1.expect("attach 后应可取到");
+        assert_eq!(c1.position(), Duration::from_millis(1000));
+        assert_eq!(gen1, 1);
+
+        // 模拟 seek 重建：换成一个位置 0 的新时钟，代次再 +1。
+        src.attach(fake_clock(0));
+        let (gen2, c2) = src.get_with_generation();
+        let c2 = c2.expect("换柄后应可取到新时钟");
+        assert_eq!(c2.position(), Duration::ZERO, "应拿到重建后的新时钟");
+        assert_eq!(gen2, 2, "每次 attach 代次都要递增，渲染侧据此换柄");
     }
 }

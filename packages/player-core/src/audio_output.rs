@@ -46,6 +46,9 @@ pub struct AudioOutput {
     underrun: Arc<AtomicBool>,
     /// 是否已经播出过第一个采样。见 [`AudioOutput::started`]。
     started: StartedFlag,
+    /// 是否处于暂停态。暂停时声卡设备冻结，时钟也随之停走，
+    /// 恢复后位置天然连续——这是 seek/暂停能对齐画面的基础。
+    paused: Arc<AtomicBool>,
 }
 
 /// 播放是否真正开始过（收到过非空采样）。
@@ -104,6 +107,7 @@ impl AudioOutput {
         let underrun = Arc::new(AtomicBool::new(false));
 
         let started: StartedFlag = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
 
         let stream = Self::build_stream(
             &device,
@@ -123,6 +127,7 @@ impl AudioOutput {
             frames_played,
             underrun,
             started,
+            paused,
         })
     }
 
@@ -249,6 +254,27 @@ impl AudioOutput {
     /// 取出并清除「发生过欠载」的标记。
     pub fn take_underrun(&self) -> bool {
         self.underrun.swap(false, Ordering::Relaxed)
+    }
+
+    /// 暂停播放。声卡设备冻结，时钟（`frames_played`）随之停走，
+    /// 已缓冲但未播出的采样保留，恢复后从停点继续。
+    ///
+    /// 暂停不影响队列内容：解码侧应同时停止推送，否则暂停期间
+    /// 队列持续累积、恢复后反而超前播放。
+    pub fn pause(&self) {
+        self._stream.pause().ok();
+        self.paused.store(true, Ordering::Relaxed);
+    }
+
+    /// 恢复播放（见 [`pause`](Self::pause)）。
+    pub fn resume(&self) {
+        self._stream.play().ok();
+        self.paused.store(false, Ordering::Relaxed);
+    }
+
+    /// 当前是否处于暂停态。
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
     }
 }
 
