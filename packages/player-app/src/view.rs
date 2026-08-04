@@ -37,7 +37,10 @@ const LIVE_SEEK: bool = true;
 /// 拖动中预览 seek 的节流间隔。拖动会高频触发 mouse_move，每个都 `source.seek`
 /// （ffmpeg 定位关键帧 + 解码）开销大，会卡。节流限频，进度条仍跟随鼠标，
 /// 松开时 Commit 精确跳到最终位置。
-const PREVIEW_THROTTLE: Duration = Duration::from_millis(50);
+///
+/// 调低到 ~16ms（一帧）让画面更快跟随鼠标位置；配合解码线程覆盖合并（只执行
+/// 最后 Preview），解码线程聚焦最新目标，画面更连续。
+const PREVIEW_THROTTLE: Duration = Duration::from_millis(16);
 
 /// 播放器视图：持有一帧最新的解码画面，并接收键盘/鼠标控制。
 pub struct PlayerView {
