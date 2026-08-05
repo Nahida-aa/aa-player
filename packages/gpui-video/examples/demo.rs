@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, size};
+use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;
 use gpui_video::Player;
 
@@ -32,7 +32,9 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| Player::new(path.clone(), window, cx)),
+                |window, cx| {
+                    cx.new(|cx| Player::new(path.clone(), window, cx).max_size(px(800.0)))
+                },
             )
             .unwrap();
             cx.activate(true);

@@ -36,6 +36,8 @@ pub struct Player {
     controller: Entity<PlayerController>,
     /// 进度条状态（0..duration 毫秒）。
     progress: Entity<SliderState>,
+    /// 视频画面等比上限；None 填满容器（letterbox）。
+    max_size: Option<gpui::Pixels>,
     /// 上一帧（双缓冲回收）。
     previous_frame: Option<Arc<gpui::RenderImage>>,
     /// 渲染循环任务句柄（保活）。
@@ -194,10 +196,18 @@ impl Player {
         Self {
             controller,
             progress,
+            max_size: None,
             previous_frame: None,
             _render_task,
             focus_handle,
         }
+    }
+
+    /// 设置视频画面等比上限：组件按视频原始宽高比缩放，最大边不超 `max`。
+    /// 未设则视频填满父容器（letterbox）。
+    pub fn max_size(mut self, max: gpui::Pixels) -> Self {
+        self.max_size = Some(max);
+        self
     }
 
     /// 程序化触发一次拖动 seek（拖动中 preview + 松手 release）。
@@ -306,7 +316,10 @@ impl Render for Player {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(VideoSurface::new(&self.controller)),
+                    .child(match self.max_size {
+                        Some(max) => VideoSurface::new(&self.controller).max_size(max),
+                        None => VideoSurface::new(&self.controller),
+                    }),
             )
             .child(
                 div()

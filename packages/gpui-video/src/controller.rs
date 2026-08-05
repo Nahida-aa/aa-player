@@ -137,6 +137,8 @@ pub struct PlayerController {
     pub clock: Arc<AudioClockSource>,
     /// 性能统计（解码 fps/耗时），仅 debug 时启用。
     pub stats: Arc<ProfileStats>,
+    /// 视频原始分辨率 (width, height)，解码线程打开后填入。供组件按视频比例定尺寸。
+    video_size: Arc<std::sync::Mutex<(u32, u32)>>,
     /// 关窗时停止解码线程。
     _running: Arc<AtomicBool>,
 }
@@ -153,6 +155,7 @@ impl PlayerController {
         let cancel_seek = Arc::new(AtomicBool::new(false));
         let clock = Arc::new(AudioClockSource::new());
         let stats = Arc::new(ProfileStats::default());
+        let video_size = Arc::new(std::sync::Mutex::new((0, 0)));
 
         spawn_decode_thread(
             path,
@@ -162,6 +165,7 @@ impl PlayerController {
             cancel_seek.clone(),
             clock.clone(),
             stats.clone(),
+            video_size.clone(),
         );
 
         (
@@ -175,6 +179,7 @@ impl PlayerController {
                 cancel_seek,
                 clock,
                 stats,
+                video_size,
                 _running: running,
             },
             rx,
@@ -189,6 +194,11 @@ impl PlayerController {
 
     pub fn duration(&self) -> Duration {
         self.duration
+    }
+
+    /// 视频原始分辨率 (width, height)。尚未打开（解码线程未填入）时为 (0,0)。
+    pub fn video_size(&self) -> (u32, u32) {
+        *self.video_size.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn position(&self) -> Duration {
@@ -290,6 +300,7 @@ fn spawn_decode_thread(
     cancel: Arc<AtomicBool>,
     clock_source: Arc<AudioClockSource>,
     stats: Arc<ProfileStats>,
+    video_size: Arc<std::sync::Mutex<(u32, u32)>>,
 ) {
     std::thread::spawn(move || {
         // 声卡打不开不该让整个播放失败——没有声音总比放不了强。
@@ -321,6 +332,9 @@ fn spawn_decode_thread(
         }
 
         let duration_us = source.video_info().duration.as_micros() as u64;
+        // 记录视频原始分辨率，供组件按视频比例定尺寸。
+        let vinfo = source.video_info();
+        *video_size.lock().unwrap_or_else(|e| e.into_inner()) = (vinfo.width, vinfo.height);
         let mut paused = false;
         // 拖动预览模式：解出的帧标记 preview，渲染侧直接显示。
         let mut previewing = false;
