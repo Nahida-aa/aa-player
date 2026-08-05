@@ -26,7 +26,7 @@ fn main() {
             // 加载内置字体，保证时间文本正常渲染。
             let _ = assets::Assets.load_fonts(cx);
 
-            let bounds = Bounds::centered(None, size(960.0.into(), 640.0.into()), cx);
+            let bounds = Bounds::centered(None, size(1280.0.into(), 720.0.into()), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
