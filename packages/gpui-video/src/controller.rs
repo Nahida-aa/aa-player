@@ -284,6 +284,11 @@ fn spawn_decode_thread(
     stats: Arc<ProfileStats>,
 ) {
     std::thread::spawn(move || {
+        // 抑制 ffmpeg 的 warning/debug 噪音（如快速拖动抢占 seek 时打印的
+        // "Packet corrupt" / "Invalid NAL"）。这些是抢占 seek 的预期副作用，
+        // 解码器会自行恢复；只保留 error 及以上，避免刷屏。
+        ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Error);
+
         // 声卡打不开不该让整个播放失败——没有声音总比放不了强。
         let audio = match AudioOutput::new() {
             Ok(o) => Some(o),
