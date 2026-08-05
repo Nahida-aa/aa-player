@@ -36,8 +36,7 @@ impl Player {
             let (c, rx) = PlayerController::open(path);
             (cx.new(|_| c), rx)
         };
-        let progress = cx.new(|_| SliderState::new().min(0.0).max(1.0).step(1.0));
-        let focus_handle = cx.focus_handle();
+        let progress = cx.new(|_| SliderState::new().min(0.0).max(1.0).step(1.0));        let focus_handle = cx.focus_handle();
 
         // 音频时钟交接点（渲染循环调度用）。克隆进异步任务，避免跨实体读。
         let clock_source = controller.read(cx).clock.clone();
@@ -97,16 +96,17 @@ impl Player {
         });
 
         // 进度条事件 → 控制器 seek：Change=拖动预览，Release=提交。
+        // 单位：Slider 值 = 毫秒（step=1 → 1ms 步进），seek 精确到毫秒。
         cx.subscribe(&progress, move |this, _slider, event, cx| {
             match event {
                 SliderEvent::Change(v) => {
                     this.controller.update(cx, |c, _| {
-                        c.seek_preview(Duration::from_secs_f32(v.end()))
+                        c.seek_preview(Duration::from_millis(v.end() as u64))
                     });
                 }
                 SliderEvent::Release(v) => {
                     this.controller.update(cx, |c, _| {
-                        c.seek_release(Duration::from_secs_f32(v.end()))
+                        c.seek_release(Duration::from_millis(v.end() as u64))
                     });
                 }
             }
@@ -149,10 +149,11 @@ impl Render for Player {
             (c.position(), c.duration(), c.is_dragging())
         };
         if !dragging {
-            let max = duration.as_secs_f32().max(1.0);
+            // 进度条值域 = 视频时长（毫秒）。
+            let max_ms = duration.as_millis() as f32;
             self.progress.update(cx, |s, cx| {
-                s.set_max(max, cx);
-                s.set_value(position.as_secs_f32().min(max), cx);
+                s.set_max(max_ms, cx);
+                s.set_value((position.as_millis() as f32).min(max_ms), cx);
             });
         }
 
