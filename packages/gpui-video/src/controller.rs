@@ -567,3 +567,67 @@ fn send_blocking(
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// player-core 的内置样本视频（含音轨）。
+    fn sample_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../player-core/tests/assets/sample.mp4")
+    }
+
+    /// 轮询读一帧，直到拿到一帧或超时。返回是否拿到。
+    fn try_recv_frame(rx: &mut mpsc::Receiver<FrameMsg>, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match rx.try_next() {
+                Ok(Some(Some(_))) => return true,
+                _ => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    /// 打开控制器，消费一批帧，触发一次拖动 seek（preview + release），
+    /// 验证 seek 后**解码线程不卡死、持续产帧**（对齐之前"拖动后画面/进度条
+    /// 不动、声音继续"的 bug——seek 后解码必须继续，不能停）。
+    #[test]
+    fn seek_preview_release_keeps_frames_flowing() {
+        let (mut controller, mut rx) = PlayerController::open(sample_path());
+
+        // 1) 消费若干帧（解码线程在跑）。
+        let mut got = 0;
+        while got < 30 {
+            if try_recv_frame(&mut rx, Duration::from_secs(5)) {
+                got += 1;
+            } else {
+                break;
+            }
+        }
+        assert!(got >= 30, "应解出至少 30 帧，实际 {got}");
+
+        // 2) 拖动 seek（preview 拖动中 + release 提交）。
+        controller.seek_preview(Duration::from_secs(2));
+        controller.seek_release(Duration::from_secs(2));
+
+        // 3) seek 后继续产帧（解码不卡死）。
+        let mut got_after = 0;
+        while got_after < 10 {
+            if try_recv_frame(&mut rx, Duration::from_secs(5)) {
+                got_after += 1;
+            } else {
+                break;
+            }
+        }
+        assert!(
+            got_after >= 10,
+            "seek 后应持续产帧（解码不卡死），实际 {got_after}"
+        );
+    }
+}
