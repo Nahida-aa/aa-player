@@ -284,11 +284,6 @@ fn spawn_decode_thread(
     stats: Arc<ProfileStats>,
 ) {
     std::thread::spawn(move || {
-        // 抑制 ffmpeg 的 warning/debug 噪音（如快速拖动抢占 seek 时打印的
-        // "Packet corrupt" / "Invalid NAL"）。这些是抢占 seek 的预期副作用，
-        // 解码器会自行恢复；只保留 error 及以上，避免刷屏。
-        ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Error);
-
         // 声卡打不开不该让整个播放失败——没有声音总比放不了强。
         let audio = match AudioOutput::new() {
             Ok(o) => Some(o),
@@ -370,8 +365,18 @@ fn spawn_decode_thread(
             // 执行合并后的最新 seek（有则优先于暂停态处理）。
             if let Some((target, cmd)) = latest_seek {
                 let t = seek_clamped(target, duration_us);
-                // seek 会撤销 draining，重新可读；丢弃 seek 前暂存的旧帧
-                // （对齐 player-app playback.rs:357-359），避免 seek 后先发旧帧。
+                // 先执行 seek。被更新的 Preview 抢占取消（SeekCancelled）时，
+                // **放弃本次状态设置**，回循环顶部读最新命令重新 seek（对齐
+                // player-app playback.rs:341-354）——否则带着半途 seek 的解码器
+                // 状态继续读，会解出坏帧（快速拖动时高频抢占尤其明显）。
+                if let Err(e) = source.seek(t) {
+                    if e.root_cause().downcast_ref::<SeekCancelled>().is_some() {
+                        tracing::debug!("seek 被抢占取消，重读最新命令");
+                        continue;
+                    }
+                    tracing::debug!(?e, "seek 失败，继续");
+                }
+                // seek 会撤销 draining，重新可读；丢弃 seek 前暂存的旧帧。
                 finished = false;
                 next_frame = None;
                 match cmd {
@@ -381,17 +386,11 @@ fn spawn_decode_thread(
                             a.pause();
                             a.clear();
                         }
-                        if let Err(e) = source.seek(t) {
-                            tracing::debug!(?e, "Preview seek 被打断/失败，重试最新命令");
-                        }
                         previewing = true;
                         video_seek_target = None;
                     }
                     PlayerCommand::SeekCommit(_) => {
                         // 完整 seek：重建声卡流 + 重锚，进入正常播放。
-                        if let Err(e) = source.seek(t) {
-                            tracing::debug!(?e, "Commit seek 失败");
-                        }
                         previewing = false;
                         pending_anchor = true;
                         start_audio = true;

@@ -49,12 +49,12 @@ fn main() {
                 let targets = [10.0f32, 20.0, 5.0, 30.0, 15.0, 40.0, 25.0, 2.0];
                 loop {
                     cx.background_executor()
-                        .timer(Duration::from_millis(if step == 0 { 4000 } else { 300 }))
+                        .timer(Duration::from_millis(if step == 0 { 4000 } else { 1500 }))
                         .await;
                     let t = targets[(step as usize) % targets.len()];
                     // 连续发多次 preview（模拟快速拖动中的连续移动），最后 release。
-                    for i in 0..10 {
-                        let target = t * (i + 1) as f32 / 10.0;
+                    for i in 0..5 {
+                        let target = t * (i + 1) as f32 / 5.0;
                         player2.update(cx, |player, cx| {
                             player.seek_preview(Duration::from_secs_f32(target), cx);
                         });
