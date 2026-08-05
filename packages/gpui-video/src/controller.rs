@@ -318,6 +318,8 @@ fn spawn_decode_thread(
         let mut previewing = false;
         // seek 后丢弃目标前帧。
         let mut video_seek_target: Option<Duration> = None;
+        // seek 后丢弃目标前音频（避免旧位置声音/时钟超前）。
+        let mut audio_seek_target: Option<Duration> = None;
         // seek 后首帧锚定偏移。
         let mut pending_anchor = false;
         // seek 后音频是否已满足起播条件。
@@ -389,6 +391,8 @@ fn spawn_decode_thread(
                         pending_anchor = true;
                         start_audio = true;
                         video_seek_target = Some(t);
+                        // 音频也丢弃目标前内容，避免旧位置声音/时钟超前。
+                        audio_seek_target = Some(t);
                         seek_rebuild_audio(&mut audio, &clock_source);
                         paused = false;
                     }
@@ -444,6 +448,13 @@ fn spawn_decode_thread(
                     next_frame = Some((render, pts_us, previewing));
                 }
                 Ok(Some(MediaEvent::Audio(chunk))) => {
+                    // seek 后丢弃目标前音频（避免旧位置声音/时钟超前）。
+                    if let Some(target) = audio_seek_target {
+                        if chunk.pts < target {
+                            continue;
+                        }
+                        audio_seek_target = None;
+                    }
                     if let Some(a) = audio.as_ref() {
                         // 背压：音频缓冲够深就等，别把整轨解进内存。
                         // seek 后音频是暂停态或拖动预览，队列不被消费，此时不背压。

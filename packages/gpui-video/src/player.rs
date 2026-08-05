@@ -34,8 +34,7 @@ pub struct Player {
 
 impl Player {
     /// 打开视频并启动播放器。`window` 用于绑定渲染任务生命周期（关窗自动取消）。
-    pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (controller, mut rx) = {
+    pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {        let (controller, mut rx) = {
             let (c, rx) = PlayerController::open(path);
             (cx.new(|_| c), rx)
         };
