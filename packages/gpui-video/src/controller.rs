@@ -336,6 +336,9 @@ fn spawn_decode_thread(
         let mut next_frame: Option<(Arc<RenderImage>, u64, bool)> = None;
         // 已放完（EOF），只等 seek 命令。
         let mut finished = false;
+        // 暂停中 scrub（拖动/跳转）临时允许解码：解出目标帧显示画面，
+        // 但保持暂停（不 start 音频、不推进播放）。
+        let mut scrub_paused = false;
 
         loop {
             if !running.load(Ordering::Relaxed) {
@@ -404,26 +407,35 @@ fn spawn_decode_thread(
                         }
                         previewing = true;
                         video_seek_target = None;
+                        // 暂停中拖动：临时允许解码出预览帧显示画面。
+                        if paused {
+                            scrub_paused = true;
+                        }
                     }
                     PlayerCommand::SeekCommit(_) => {
-                        // 完整 seek：重建声卡流 + 重锚，进入正常播放。
+                        // 完整 seek：重建声卡流 + 重锚。
                         // **不改变 paused**：暂停时 seek 应保持暂停（只跳位置，
-                        // 不自动播放）。暂停态由 Pause/Resume 命令控制；若 paused
-                        // 为 true，循环停在暂停态，不推帧/不 start 音频。
+                        // 不自动播放）。播放时 seek 正常恢复（start_audio）。
                         previewing = false;
                         pending_anchor = true;
-                        start_audio = true;
                         video_seek_target = Some(t);
                         // 音频也丢弃目标前内容，避免旧位置声音/时钟超前。
                         audio_seek_target = Some(t);
                         seek_rebuild_audio(&mut audio, &clock_source);
+                        if paused {
+                            // 暂停中跳转：保持暂停，但临时解码出目标帧显示画面。
+                            scrub_paused = true;
+                            start_audio = false;
+                        } else {
+                            start_audio = true;
+                        }
                     }
                     _ => unreachable!(),
                 }
                 continue; // 刚 seek 过，回循环顶部读下一批命令
             }
 
-            if paused {
+            if paused && !scrub_paused {
                 std::thread::sleep(Duration::from_millis(8));
                 continue;
             }
@@ -437,7 +449,10 @@ fn spawn_decode_thread(
                 if !send_blocking(&mut tx, (render, pts_us, duration_us, preview), &running) {
                     return;
                 }
+                // 暂停中 scrub 已解出目标帧（画面更新），恢复暂停。
+                scrub_paused = false;
                 // 首个 post-seek 视频帧已送出；若音频缓冲也够，就开播。
+                // 暂停时 start_audio 为 false，不会 start。
                 try_start_audio(&audio, &mut start_audio);
                 continue;
             }
@@ -476,6 +491,11 @@ fn spawn_decode_thread(
                             continue;
                         }
                         audio_seek_target = None;
+                    }
+                    // 暂停中 scrub（拖动/跳转）只解视频预览帧，不推音频——
+                    // 声卡已 pause 冻结，推入只会堆积。
+                    if scrub_paused {
+                        continue;
                     }
                     if let Some(a) = audio.as_ref() {
                         // 背压：音频缓冲够深就等，别把整轨解进内存。
