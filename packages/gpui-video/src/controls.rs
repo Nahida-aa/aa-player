@@ -6,7 +6,7 @@
 //! 布局对齐 aa-player 原版：底部半透明黑 overlay，两行——
 //! 上行是「播放/暂停 + 时间文本」（右对齐），下行是占满宽度的进度条。
 
-use gpui::{Entity, IntoElement, MouseButton, RenderOnce, Window, div, prelude::*, px, rgb, white};
+use gpui::{Entity, IntoElement, MouseButton, RenderOnce, Window, div, prelude::*, px, rgba, white};
 use ui_gpui::{Slider, SliderState};
 
 use crate::controller::PlayerController;
@@ -68,7 +68,7 @@ impl RenderOnce for PlaybackControls {
             .items_center()
             .justify_center()
             .rounded_full()
-            .bg(rgb(0xffffff22))
+            .bg(rgba(0xffffff22))
             .text_color(white())
             .child(play_label);
         if let Some(toggle) = self.on_toggle {
@@ -91,7 +91,7 @@ impl RenderOnce for PlaybackControls {
             .pt(px(6.0))
             .pb(px(8.0))
             .px(px(12.0))
-            .bg(rgb(0x00000066))
+            .bg(rgba(0x00000066))
             // 上行：按钮靠左，时间文本右对齐（占满宽）。
             .child(
                 div()
