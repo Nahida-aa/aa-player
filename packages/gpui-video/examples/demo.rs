@@ -19,16 +19,22 @@ fn main() {
             .join("../player-core/tests/assets/sample.mp4"),
     };
 
-    application().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(960.0.into(), 640.0.into()), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|cx| Player::new(path.clone(), cx)),
-        )
-        .unwrap();
-        cx.activate(true);
-    });
+    application()
+        // 提供内嵌资源（图标/字体），供 svg().path("icons/…") 加载。
+        .with_assets(assets::Assets)
+        .run(move |cx: &mut App| {
+            // 加载内置字体，保证时间文本正常渲染。
+            let _ = assets::Assets.load_fonts(cx);
+
+            let bounds = Bounds::centered(None, size(960.0.into(), 640.0.into()), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|cx| Player::new(path.clone(), cx)),
+            )
+            .unwrap();
+            cx.activate(true);
+        });
 }

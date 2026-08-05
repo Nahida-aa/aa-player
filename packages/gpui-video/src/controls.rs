@@ -13,9 +13,9 @@ use ui_gpui::{Slider, SliderState};
 
 use crate::controller::PlayerController;
 
-/// 图标文件路径（编译期由包目录 + assets 拼接；运行时 external_path 从磁盘读）。
-const ICON_PLAY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/play_filled.svg");
-const ICON_PAUSE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/debug_pause.svg");
+/// 图标资源路径（内嵌 via asset source，`Application::new().with_assets(…)` 提供）。
+const ICON_PLAY: &str = "icons/play_filled.svg";
+const ICON_PAUSE: &str = "icons/debug_pause.svg";
 
 /// 播放/暂停按钮回调：驱动控制器切换播放状态。
 type ToggleHandler = Box<dyn Fn(&mut PlayerController) + 'static>;
@@ -78,7 +78,7 @@ impl RenderOnce for PlaybackControls {
             .text_color(white())
             .child(
                 svg()
-                    .external_path(icon_path)
+                    .path(icon_path)
                     .w(px(16.0))
                     .h(px(16.0)),
             );
