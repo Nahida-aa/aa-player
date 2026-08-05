@@ -32,7 +32,7 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|cx| Player::new(path.clone(), cx)),
+                |window, cx| cx.new(|cx| Player::new(path.clone(), window, cx)),
             )
             .unwrap();
             cx.activate(true);

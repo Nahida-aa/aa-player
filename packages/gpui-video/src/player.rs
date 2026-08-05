@@ -20,7 +20,7 @@ use crate::surface::VideoSurface;
 pub struct Player {
     /// 无 GUI 播放状态机。
     controller: Entity<PlayerController>,
-    /// 进度条状态（0..duration 秒）。
+    /// 进度条状态（0..duration 毫秒）。
     progress: Entity<SliderState>,
     /// 上一帧（双缓冲回收）。
     previous_frame: Option<Arc<gpui::RenderImage>>,
@@ -30,19 +30,23 @@ pub struct Player {
 }
 
 impl Player {
-    /// 打开视频并启动播放器。
-    pub fn new(path: PathBuf, cx: &mut Context<Self>) -> Self {
+    /// 打开视频并启动播放器。`window` 用于绑定渲染任务生命周期（关窗自动取消）。
+    pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (controller, mut rx) = {
             let (c, rx) = PlayerController::open(path);
             (cx.new(|_| c), rx)
         };
-        let progress = cx.new(|_| SliderState::new().min(0.0).max(1.0).step(1.0));        let focus_handle = cx.focus_handle();
+        let progress = cx.new(|_| SliderState::new().min(0.0).max(1.0).step(1.0));
+        let focus_handle = cx.focus_handle();
+        let dragging = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // 音频时钟交接点（渲染循环调度用）。克隆进异步任务，避免跨实体读。
         let clock_source = controller.read(cx).clock.clone();
 
         // 渲染循环：异步收帧 → 按播放时钟调度 → 更新 controller → notify。
-        let _render_task = cx.spawn(async move |this, cx| {
+        // 用 spawn_in(window) 绑定窗口生命周期：关窗即取消，避免任务泄漏。
+        let dragging_render = dragging.clone();
+        let _render_task = cx.spawn_in(window, async move |this, cx| {
             let mut clock = PlaybackClock::new();
             // 记住音频时钟代次，换代才换时钟柄（保留墙钟 origin）。
             let mut audio_generation: u64 = 0;
@@ -59,31 +63,34 @@ impl Player {
                 }
                 clock.set_audio_offset(offset_us);
 
-                // preview 帧（拖动中）：直接显示，不走音频时钟调度。
-                let show = match &item {
-                    Some((_, _, dur_us, true)) => {
-                        clock.set_duration(*dur_us);
-                        true
-                    }
-                    Some((_, pts_us, dur_us, false)) => {
-                        clock.set_duration(*dur_us);
-                        match clock.schedule(Duration::from_micros(*pts_us)) {
-                            Schedule::Now | Schedule::Resynced { .. } => true,
-                            // 未来帧：等点到再显示。封顶 1s——超过几乎必是 seek 后
-                            // 残留旧帧，真等会卡住画面数秒、音频趁机超前。
-                            Schedule::Wait(d) => {
-                                if d.as_millis() > 1000 {
-                                    false // 旧帧/时钟错位，丢弃
-                                } else {
-                                    cx.background_executor().timer(d).await;
-                                    true
+                // 预览帧或拖动中：直接显示，不走音频时钟调度。
+                // （拖动时声卡静音、音频时钟冻结，正常帧会被 Wait/Drop 卡住；
+                //  拖动中所有帧直接显示，避免残留正常帧用冻结时钟卡住画面。）
+                let is_preview = matches!(&item, Some((_, _, _, true)));
+                let show = if is_preview || dragging_render.load(std::sync::atomic::Ordering::Relaxed) {
+                    true
+                } else {
+                    match &item {
+                        Some((_, pts_us, dur_us, false)) => {
+                            clock.set_duration(*dur_us);
+                            match clock.schedule(Duration::from_micros(*pts_us)) {
+                                Schedule::Now | Schedule::Resynced { .. } => true,
+                                // 未来帧：等点到再显示。封顶 1s——超过几乎必是 seek 后
+                                // 残留旧帧，真等会卡住画面数秒、音频趁机超前。
+                                Schedule::Wait(d) => {
+                                    if d.as_millis() > 1000 {
+                                        false // 旧帧/时钟错位，丢弃
+                                    } else {
+                                        cx.background_executor().timer(d).await;
+                                        true
+                                    }
                                 }
+                                // 落后太多：丢帧，让画面追上声音。
+                                Schedule::Drop { .. } => false,
                             }
-                            // 落后太多：丢帧，让画面追上声音。
-                            Schedule::Drop { .. } => false,
                         }
+                        _ => true, // EOF 等
                     }
-                    None => true, // EOF：更新状态（进度条拉满）
                 };
 
                 if show {
@@ -97,14 +104,19 @@ impl Player {
 
         // 进度条事件 → 控制器 seek：Change=拖动预览，Release=提交。
         // 单位：Slider 值 = 毫秒（step=1 → 1ms 步进），seek 精确到毫秒。
+        // 拖动标志用原子量同步给渲染循环（独立 async task 读）。
+        let dragging_change = dragging.clone();
+        let dragging_release = dragging.clone();
         cx.subscribe(&progress, move |this, _slider, event, cx| {
             match event {
                 SliderEvent::Change(v) => {
+                    dragging_change.store(true, std::sync::atomic::Ordering::Relaxed);
                     this.controller.update(cx, |c, _| {
                         c.seek_preview(Duration::from_millis(v.end() as u64))
                     });
                 }
                 SliderEvent::Release(v) => {
+                    dragging_release.store(false, std::sync::atomic::Ordering::Relaxed);
                     this.controller.update(cx, |c, _| {
                         c.seek_release(Duration::from_millis(v.end() as u64))
                     });
