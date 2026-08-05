@@ -331,7 +331,10 @@ fn spawn_decode_thread(
                 return;
             }
 
-            // 1) 处理命令。
+            // 1) 处理命令。**Seek 覆盖合并**：拖动会积压多个 seek，只保留最新一个
+            // 再执行（每个 ffmpeg seek 都慢，逐个执行会让解码线程全耗在 seek 上、
+            // 画面卡住）。Preview 只留最新；Commit 是最终位置，后到覆盖且优先。
+            let mut latest_seek: Option<(Duration, PlayerCommand)> = None;
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     PlayerCommand::Pause => {
@@ -346,22 +349,34 @@ fn spawn_decode_thread(
                             a.resume();
                         }
                     }
-                    PlayerCommand::SeekPreview(t) => {
+                    PlayerCommand::SeekPreview(_) | PlayerCommand::SeekCommit(_) => {
+                        latest_seek = Some((match cmd {
+                            PlayerCommand::SeekPreview(t) => t,
+                            PlayerCommand::SeekCommit(t) => t,
+                            _ => unreachable!(),
+                        }, cmd));
+                    }
+                }
+            }
+
+            // 执行合并后的最新 seek（有则优先于暂停态处理）。
+            if let Some((target, cmd)) = latest_seek {
+                let t = seek_clamped(target, duration_us);
+                match cmd {
+                    PlayerCommand::SeekPreview(_) => {
                         // 拖动中预览：静音（停声卡）+ seek 视频出预览帧，不重建音频流。
                         if let Some(a) = audio.as_ref() {
                             a.pause();
                             a.clear();
                         }
-                        let t = seek_clamped(t, duration_us);
                         if let Err(e) = source.seek(t) {
                             tracing::debug!(?e, "Preview seek 被打断/失败，重试最新命令");
                         }
                         previewing = true;
                         video_seek_target = None;
                     }
-                    PlayerCommand::SeekCommit(t) => {
+                    PlayerCommand::SeekCommit(_) => {
                         // 完整 seek：重建声卡流 + 重锚，进入正常播放。
-                        let t = seek_clamped(t, duration_us);
                         if let Err(e) = source.seek(t) {
                             tracing::debug!(?e, "Commit seek 失败");
                         }
@@ -372,7 +387,9 @@ fn spawn_decode_thread(
                         seek_rebuild_audio(&mut audio, &clock_source);
                         paused = false;
                     }
+                    _ => unreachable!(),
                 }
+                continue; // 刚 seek 过，回循环顶部读下一批命令
             }
 
             if paused {
