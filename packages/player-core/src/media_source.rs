@@ -470,6 +470,15 @@ impl FfmpegSource {
                 Err(Error::Eof) => return Ok(None),
                 // 坏包：解复用器能越过 AVERROR_INVALIDDATA 重新同步，跳过即可。
                 Err(Error::InvalidData) => continue,
+                // interrupt 回调令本次 I/O 中断（ffmpeg 返回 AVERROR_EXIT）。
+                // 这正是「可抢占 seek」机制的一部分：它不只是 seek 会被打断，
+                // 普通读帧（`av_read_frame`）在 I/O 阻塞时同样会被打断——因为
+                // 新 Preview 到达时主线程置了 cancel=true。这不是故障，而是
+                // 「有更新的 seek 要处理」的信号：归一成 SeekCancelled，让上层
+                // 回到命令循环跳到最新目标。否则会被误判为致命错误、解码线程退出。
+                // 注意：只有 cancel 置位才会触发 Exit；正常播放 cancel 恒为 false，
+                // 不会走到这里，真实 I/O 错误仍走下面的 Err 分支如实上报。
+                Err(Error::Exit) => return Err(SeekCancelled.into()),
                 Err(e) => return Err(e.into()),
             }
         }

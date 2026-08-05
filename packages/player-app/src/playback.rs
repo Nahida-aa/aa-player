@@ -489,6 +489,13 @@ fn run_until_eof(
                 finished = true;
             }
             Err(e) => {
+                // 被更新的 Preview 抢占取消：interrupt 回调也会打断普通读帧
+                // （不只是 seek），这时 next_event 返回 SeekCancelled。上下文
+                // 一致、可安全复用，回到循环顶部读最新命令重试，不是故障。
+                if e.root_cause().downcast_ref::<SeekCancelled>().is_some() {
+                    debug!(frames = *frame_no, "next_event 被抢占取消，重读命令");
+                    continue;
+                }
                 error!(error = %e, frames = *frame_no, "解码失败，停止");
                 let _ = tx.try_send(None);
                 return;
