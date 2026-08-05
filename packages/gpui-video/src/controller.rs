@@ -630,4 +630,47 @@ mod tests {
             "seek 后应持续产帧（解码不卡死），实际 {got_after}"
         );
     }
+
+    /// 模拟**快速拖动**：短时间内快速连续发几十次 seek_preview（不同目标，
+    /// 模拟鼠标快速来回拖），最后 seek_release。验证 seek 覆盖合并 + 抢占
+    /// seek 下解码线程不卡死、seek 后持续产帧（对齐之前"快速拖动画面卡住"）。
+    #[test]
+    fn rapid_drag_does_not_stall_decode() {
+        let (mut controller, mut rx) = PlayerController::open(sample_path());
+
+        // 1) 消费若干帧（解码线程在跑）。
+        let mut got = 0;
+        while got < 20 {
+            if try_recv_frame(&mut rx, Duration::from_secs(5)) {
+                got += 1;
+            } else {
+                break;
+            }
+        }
+        assert!(got >= 20, "应解出至少 20 帧，实际 {got}");
+
+        // 2) 快速拖动：1 秒内快速发 50 次 seek_preview，目标在 0..2.5s 之间递增
+        //    （模拟快速向右拖），紧接着 seek_release 提交到最终位置。
+        for i in 0..50 {
+            let t = Duration::from_millis((i * 50) as u64);
+            controller.seek_preview(t);
+            // 不 sleep：命令在 unbounded channel 堆积，由解码线程覆盖合并，
+            // 模拟"拖动比解码线程处理还快"的最坏情况。
+        }
+        controller.seek_release(Duration::from_millis(2500));
+
+        // 3) 快速拖动结束后应持续产帧（解码线程合并 seek 后不卡死）。
+        let mut got_after = 0;
+        while got_after < 10 {
+            if try_recv_frame(&mut rx, Duration::from_secs(10)) {
+                got_after += 1;
+            } else {
+                break;
+            }
+        }
+        assert!(
+            got_after >= 10,
+            "快速拖动后应持续产帧（解码不卡死），实际 {got_after}"
+        );
+    }
 }
