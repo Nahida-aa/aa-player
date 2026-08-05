@@ -363,6 +363,10 @@ fn spawn_decode_thread(
             // 执行合并后的最新 seek（有则优先于暂停态处理）。
             if let Some((target, cmd)) = latest_seek {
                 let t = seek_clamped(target, duration_us);
+                // seek 会撤销 draining，重新可读；丢弃 seek 前暂存的旧帧
+                // （对齐 player-app playback.rs:357-359），避免 seek 后先发旧帧。
+                finished = false;
+                next_frame = None;
                 match cmd {
                     PlayerCommand::SeekPreview(_) => {
                         // 拖动中预览：静音（停声卡）+ seek 视频出预览帧，不重建音频流。
