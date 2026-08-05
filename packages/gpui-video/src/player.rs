@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use gpui::{App, Context, Entity, FocusHandle, Focusable, Render, Window, div, prelude::*};
+use gpui::{
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent, Render, Window, div,
+    prelude::*,
+};
 use ui_gpui::{SliderEvent, SliderState};
 
 use crate::controller::PlayerController;
@@ -18,6 +21,14 @@ use crate::surface::VideoSurface;
 
 /// 性能统计上报窗口（秒）。
 const STATS_WINDOW_SECS: u64 = 2;
+/// 键盘方向键 seek 步长（秒）。
+const SEEK_STEP: Duration = Duration::from_secs(5);
+
+/// 解码结束（EOF）时发出，供外部监听（如播放列表自动切下一集）。
+#[derive(Debug)]
+pub struct PlaybackEnded;
+
+impl EventEmitter<PlaybackEnded> for Player {}
 
 /// 播放器视图：给一个视频路径即可用。
 pub struct Player {
@@ -117,6 +128,8 @@ impl Player {
                     }
                 }
             }
+            // 渲染循环结束（解码通道关闭 / 窗口关闭）：通知外部播放结束。
+            this.update(cx, |_, cx| cx.emit(PlaybackEnded)).ok();
         });
 
         // 性能统计上报：周期取快照，卡顿/失步打日志。
@@ -203,6 +216,45 @@ impl Player {
         self.controller.update(cx, |c, _| c.seek_preview(target));
         cx.notify();
     }
+
+    /// 播放/暂停切换（键盘空格、外部控制）。
+    pub fn toggle(&mut self, cx: &mut Context<Self>) {
+        let paused = self.controller.read(cx).paused();
+        self.controller
+            .update(cx, |c, _| if paused { c.play() } else { c.pause() });
+        cx.notify();
+    }
+
+    /// 相对当前位置向前 seek（键盘方向键，夹到 [0, duration]）。
+    pub fn seek_forward(&mut self, delta: Duration, cx: &mut Context<Self>) {
+        let pos = self.controller.read(cx).position();
+        let dur = self.controller.read(cx).duration();
+        let target = (pos + delta).min(dur);
+        self.seek_to(target, cx);
+    }
+
+    /// 相对当前位置向后 seek（键盘方向键，夹到 [0, duration]）。
+    pub fn seek_backward(&mut self, delta: Duration, cx: &mut Context<Self>) {
+        let pos = self.controller.read(cx).position();
+        let target = pos.saturating_sub(delta);
+        self.seek_to(target, cx);
+    }
+
+    /// 正式 seek（Commit），供点击/键盘/松开。同步 position。
+    fn seek_to(&mut self, target: Duration, cx: &mut Context<Self>) {
+        self.controller.update(cx, |c, _| c.seek_to(target));
+        cx.notify();
+    }
+
+    /// 键盘快捷键处理（对齐 player-app view.rs:401-417）。
+    fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "space" => self.toggle(cx),
+            "left" => self.seek_backward(SEEK_STEP, cx),
+            "right" => self.seek_forward(SEEK_STEP, cx),
+            _ => {}
+        }
+    }
 }
 
 impl Focusable for Player {
@@ -243,6 +295,11 @@ impl Render for Player {
             .size_full()
             .relative()
             .track_focus(&self.focus_handle(cx))
+            .key_context("player")
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+                this.on_key(e, cx);
+                cx.notify();
+            }))
             .child(
                 div()
                     .size_full()
