@@ -7,7 +7,8 @@
 //! 上行是「播放/暂停 + 时间文本」（右对齐），下行是占满宽度的进度条。
 
 use gpui::{
-    Entity, IntoElement, MouseButton, RenderOnce, Window, div, prelude::*, px, rgba, svg, white,
+    Entity, IntoElement, MouseButton, RenderOnce, Window, div, linear_color_stop, linear_gradient,
+    prelude::*, px, rgba, svg, white,
 };
 use ui_gpui::{Slider, SliderState};
 
@@ -104,7 +105,12 @@ impl RenderOnce for PlaybackControls {
             .pt(px(6.0))
             .pb(px(8.0))
             .px(px(12.0))
-            .bg(rgba(0x00000066))
+            // 背景从上到下渐变：顶部完全透明 → 底部半透明黑（经典控制条效果）。
+            .bg(linear_gradient(
+                180.0,
+                linear_color_stop(rgba(0x00000000), 0.0),
+                linear_color_stop(rgba(0x00000066), 1.0),
+            ))
             // 上行：按钮靠左，时间文本右对齐（占满宽）。
             .child(
                 div()
