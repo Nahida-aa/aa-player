@@ -6,10 +6,16 @@
 //! 布局对齐 aa-player 原版：底部半透明黑 overlay，两行——
 //! 上行是「播放/暂停 + 时间文本」（右对齐），下行是占满宽度的进度条。
 
-use gpui::{Entity, IntoElement, MouseButton, RenderOnce, Window, div, prelude::*, px, rgba, white};
+use gpui::{
+    Entity, IntoElement, MouseButton, RenderOnce, Window, div, prelude::*, px, rgba, svg, white,
+};
 use ui_gpui::{Slider, SliderState};
 
 use crate::controller::PlayerController;
+
+/// 图标文件路径（编译期由包目录 + assets 拼接；运行时 external_path 从磁盘读）。
+const ICON_PLAY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/play_filled.svg");
+const ICON_PAUSE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/debug_pause.svg");
 
 /// 播放/暂停按钮回调：驱动控制器切换播放状态。
 type ToggleHandler = Box<dyn Fn(&mut PlayerController) + 'static>;
@@ -56,9 +62,9 @@ impl RenderOnce for PlaybackControls {
             duration.as_secs() / 60,
             duration.as_secs() % 60,
         );
-        let play_label = if paused { "▶" } else { "⏸" };
+        let icon_path = if paused { ICON_PLAY } else { ICON_PAUSE };
 
-        // 播放/暂停按钮。
+        // 播放/暂停按钮（zed 图标，染白）。
         let mut btn = div()
             .id("toggle")
             .w(px(28.0))
@@ -70,7 +76,12 @@ impl RenderOnce for PlaybackControls {
             .rounded_full()
             .bg(rgba(0xffffff22))
             .text_color(white())
-            .child(play_label);
+            .child(
+                svg()
+                    .external_path(icon_path)
+                    .w(px(16.0))
+                    .h(px(16.0)),
+            );
         if let Some(toggle) = self.on_toggle {
             let ctrl = self.controller.clone();
             btn = btn.on_mouse_up(
