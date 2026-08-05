@@ -407,6 +407,9 @@ fn spawn_decode_thread(
                     }
                     PlayerCommand::SeekCommit(_) => {
                         // 完整 seek：重建声卡流 + 重锚，进入正常播放。
+                        // **不改变 paused**：暂停时 seek 应保持暂停（只跳位置，
+                        // 不自动播放）。暂停态由 Pause/Resume 命令控制；若 paused
+                        // 为 true，循环停在暂停态，不推帧/不 start 音频。
                         previewing = false;
                         pending_anchor = true;
                         start_audio = true;
@@ -414,7 +417,6 @@ fn spawn_decode_thread(
                         // 音频也丢弃目标前内容，避免旧位置声音/时钟超前。
                         audio_seek_target = Some(t);
                         seek_rebuild_audio(&mut audio, &clock_source);
-                        paused = false;
                     }
                     _ => unreachable!(),
                 }
