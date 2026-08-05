@@ -112,7 +112,7 @@ impl RenderOnce for PlaybackControls {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
+                    .gap(px(6.0))
                     .child(btn)
                     .child(
                         div()
@@ -124,14 +124,14 @@ impl RenderOnce for PlaybackControls {
                             .child(time_text),
                     ),
             )
-            // 下行：进度条占满宽。
+            // 下行：进度条占满宽。thumb 设 12px（比默认 16 小一点）。
             .child(
                 div()
                     .w_full()
                     .h(px(20.0))
                     .flex()
                     .items_center()
-                    .child(Slider::new(&self.progress)),
+                    .child(Slider::new(&self.progress).thumb_size(px(12.0))),
             )
     }
 }
