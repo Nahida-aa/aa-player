@@ -100,7 +100,7 @@ impl RenderOnce for PlaybackControls {
             .w_full()
             .flex()
             .flex_col()
-            .gap(px(6.0))
+            .gap(px(2.0))
             .pt(px(6.0))
             .pb(px(8.0))
             .px(px(12.0))
@@ -124,14 +124,18 @@ impl RenderOnce for PlaybackControls {
                             .child(time_text),
                     ),
             )
-            // 下行：进度条占满宽。thumb 设 12px（比默认 16 小一点）。
+            // 下行：进度条占满宽，细轨道。thumb 12px、轨道 4px。
             .child(
                 div()
                     .w_full()
-                    .h(px(20.0))
+                    .h(px(12.0))
                     .flex()
                     .items_center()
-                    .child(Slider::new(&self.progress).thumb_size(px(12.0))),
+                    .child(
+                        Slider::new(&self.progress)
+                            .thumb_size(px(12.0))
+                            .track_size(px(4.0)),
+                    ),
             )
     }
 }
