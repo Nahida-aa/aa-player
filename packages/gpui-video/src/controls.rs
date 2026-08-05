@@ -80,7 +80,9 @@ impl RenderOnce for PlaybackControls {
                 svg()
                     .path(icon_path)
                     .w(px(16.0))
-                    .h(px(16.0)),
+                    .h(px(16.0))
+                    // svg 元素自身必须设 text_color，否则 gpui 不渲染（svg.rs:119）。
+                    .text_color(white()),
             );
         if let Some(toggle) = self.on_toggle {
             let ctrl = self.controller.clone();
