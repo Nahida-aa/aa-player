@@ -52,8 +52,9 @@ core:
     cargo check -p player-core
 
 # ---- gpui-video：可复用播放器组件 demo ----
-# 用法：just video-demo [视频路径]
-# 可选传视频路径（第一个参数）：`just video-demo /path/to/video.mp4`；
-# 不传则播放 player-core 的内置样本。
-video-demo *video:
+# 用法：
+#   just video-demo /path/to/video.mp4   # 第一个参数显式传路径
+#   VIDEO=/path/x.mp4 just video-demo    # 或环境变量 VIDEO（默认值 ${VIDEO} 由 shell 展开）
+#   都不传 → 播放 player-core 内置样本。
+video-demo *video="${VIDEO}":
     cargo run -p gpui-video --example demo -- {{video}}
