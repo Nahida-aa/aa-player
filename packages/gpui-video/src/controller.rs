@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::channel::mpsc;
 use gpui::RenderImage;
@@ -18,6 +18,8 @@ use image::{Frame, RgbaImage};
 use player_core::{
     AudioClock, AudioOutput, DecodedFrame, FfmpegSource, MediaEvent, MediaSource, SeekCancelled,
 };
+
+use crate::stats::ProfileStats;
 
 /// 帧队列容量。故意浅：渲染侧按 PTS 等待，队列几乎总是满的（背压）。
 const FRAME_QUEUE_CAP: usize = 3;
@@ -130,6 +132,8 @@ pub struct PlayerController {
     cancel_seek: Arc<AtomicBool>,
     /// 音频主时钟交接点（供渲染侧调度视频）。
     pub clock: Arc<AudioClockSource>,
+    /// 性能统计（解码 fps/耗时），仅 debug 时启用。
+    pub stats: Arc<ProfileStats>,
     /// 关窗时停止解码线程。
     _running: Arc<AtomicBool>,
 }
@@ -145,6 +149,7 @@ impl PlayerController {
         let running = Arc::new(AtomicBool::new(true));
         let cancel_seek = Arc::new(AtomicBool::new(false));
         let clock = Arc::new(AudioClockSource::new());
+        let stats = Arc::new(ProfileStats::default());
 
         spawn_decode_thread(
             path,
@@ -153,6 +158,7 @@ impl PlayerController {
             cmd_rx,
             cancel_seek.clone(),
             clock.clone(),
+            stats.clone(),
         );
 
         (
@@ -165,6 +171,7 @@ impl PlayerController {
                 dragging: false,
                 cancel_seek,
                 clock,
+                stats,
                 _running: running,
             },
             rx,
@@ -273,6 +280,7 @@ fn spawn_decode_thread(
     mut cmd_rx: mpsc::UnboundedReceiver<PlayerCommand>,
     cancel: Arc<AtomicBool>,
     clock_source: Arc<AudioClockSource>,
+    stats: Arc<ProfileStats>,
 ) {
     std::thread::spawn(move || {
         // 声卡打不开不该让整个播放失败——没有声音总比放不了强。
@@ -387,6 +395,7 @@ fn spawn_decode_thread(
             }
 
             // 3) 拉一个单元。
+            let t0 = Instant::now();
             match source.next_event() {
                 Ok(Some(MediaEvent::Video(f))) => {
                     // seek 后丢弃目标前帧。
@@ -407,6 +416,8 @@ fn spawn_decode_thread(
                         clock_source.set_seek_offset(anchor);
                     }
                     let render = decoded_to_render_image(&f);
+                    // 解码+像素转换总耗时（微秒）。
+                    stats.record_decoded(t0.elapsed().as_micros() as u64);
                     let pts_us = f.pts.as_micros() as u64;
                     next_frame = Some((render, pts_us, previewing));
                 }

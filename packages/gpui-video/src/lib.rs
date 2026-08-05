@@ -11,9 +11,11 @@ pub mod controller;
 pub mod controls;
 pub mod playback_clock;
 pub mod player;
+pub mod stats;
 pub mod surface;
 
 pub use controller::{AudioClockSource, PlayerController};
 pub use playback_clock::{PlaybackClock, Schedule};
 pub use player::Player;
+pub use stats::{ProfileStats, Snapshot};
 pub use surface::VideoSurface;
