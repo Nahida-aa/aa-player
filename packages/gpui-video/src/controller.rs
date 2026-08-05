@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc;
+use ffmpeg_next::Error as FfmpegError;
 use gpui::RenderImage;
 use image::{Frame, RgbaImage};
 use player_core::{
@@ -467,6 +468,15 @@ fn spawn_decode_thread(
                     // 被更新的 Preview 抢占取消：interrupt 回调也会打断普通读帧。
                     if e.root_cause().downcast_ref::<SeekCancelled>().is_some() {
                         tracing::debug!("next_event 被抢占取消，重读命令");
+                        continue;
+                    }
+                    // 单个坏帧/坏包（如 NAL 损坏）：可恢复，跳过继续——解复用器/
+                    // 解码器能越过坏帧重新同步到下一个关键帧，不应终止整个播放。
+                    if matches!(
+                        e.root_cause().downcast_ref::<FfmpegError>(),
+                        Some(FfmpegError::InvalidData)
+                    ) {
+                        tracing::debug!(?e, "坏帧跳过");
                         continue;
                     }
                     tracing::error!(?e, "解码失败");
