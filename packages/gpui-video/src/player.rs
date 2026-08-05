@@ -51,7 +51,15 @@ impl Player {
             let (c, rx) = PlayerController::open(path);
             (cx.new(|_| c), rx)
         };
-        let progress = cx.new(|_| SliderState::new().min(0.0).max(1.0).step(1.0));
+        let progress = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(1.0)
+                .step(1.0)
+                // 播放器进度条用 OnHover 模式：默认不显示 thumb，悬停轨道才显示，
+                // 拖动时只变色不变大（视频播放器常见风格）。
+                .thumb_mode(ui_gpui::ThumbMode::OnHover)
+        });
         let focus_handle = cx.focus_handle();
         let dragging = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
