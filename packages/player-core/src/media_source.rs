@@ -12,6 +12,8 @@
 //! 而那个缓冲要么无界（吃光内存）要么会死锁。
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ffmpeg_next::{
@@ -85,6 +87,25 @@ pub trait MediaSource {
     fn seek(&mut self, ts: Duration) -> Result<()>;
 }
 
+/// seek 被「取消信号」中断（对应 Chromium 的 `CancelPendingSeek`）。
+///
+/// 拖动快时，解码线程可能正卡在旧 `avformat_seek_file` 上；新 Preview 到达
+/// 时主线程置位取消标志，ffmpeg 的 interrupt 回调令旧 seek 以 `AVERROR_EXIT`
+/// 干净返回。此时上下文一致、可安全复用，上层应读到最新命令重试 seek，
+/// 而不是把「半途而废」的旧 seek 当成功（否则画面会停在错误位置）。
+///
+/// 用独立错误类型而不是普通 anyhow，让上层能精确区分「被打断」与「真失败」。
+#[derive(Debug)]
+pub struct SeekCancelled;
+
+impl std::fmt::Display for SeekCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("seek cancelled by newer request")
+    }
+}
+
+impl std::error::Error for SeekCancelled {}
+
 /// 基于 `ffmpeg-next` 的媒体源实现。
 pub struct FfmpegSource {
     input: ffmpeg_next::format::context::Input,
@@ -110,6 +131,14 @@ pub struct FfmpegSource {
     audio: Option<AudioTrack>,
     /// 已 send_eof、正在把解码器内部缓冲吐干净。
     draining: bool,
+    /// 取消标志（共享）。打开时通过 `input_with_interrupt` 挂到 `AVFormatContext`：
+    /// ffmpeg 在 I/O 阻塞（含 `avformat_seek_file`）期间反复调用回调，返回 `true`
+    /// 即中断当前操作。主线程在发**新** Preview 前置 `true`，让进行中的旧 seek
+    /// 立即退出，对齐 Chromium 的 `CancelPendingSeek`。
+    ///
+    /// 每次 `seek` 调用前先清 `false`：这样「当前正在执行的 seek」不会被自己这次
+    /// 的取消打断，只有「之后更新的 Preview」置位才会打断它。
+    cancel: Arc<AtomicBool>,
 }
 
 /// 音频那一路的状态。
@@ -214,8 +243,21 @@ impl MediaSource for FfmpegSource {
 
     fn seek(&mut self, ts: Duration) -> Result<()> {
         let ts_us = ts.as_micros() as i64;
+        // 开始一次新 seek：清取消标志。这样「本次 seek」不会被自己打断，
+        // 只有之后更新的 Preview 置位才会中断它（抢占取消）。
+        self.cancel.store(false, Ordering::Relaxed);
         // avformat_seek_file：stream_index=-1 表示 ts 单位是微秒（AV_TIME_BASE）。
-        self.input.seek(ts_us, ..ts_us)?;
+        // 若期间主线程置位了 cancel（新 Preview 到达），ffmpeg 的 interrupt 回调
+        // 令本次 seek 以 AVERROR_EXIT 干净返回——上下文一致、可安全重试。
+        match self.input.seek(ts_us, ..ts_us) {
+            Ok(()) => {}
+            Err(Error::Exit) => {
+                // 被更新的 seek 请求抢占：不要当成功（否则会停在错误半途位置），
+                // 也不要当真失败。返回哨兵错误，让上层读到最新命令重新 seek。
+                return Err(SeekCancelled.into());
+            }
+            Err(e) => return Err(e.into()),
+        }
         // seek 后必须 flush 解码器，丢弃残留守帧，否则花屏。
         self.decoder.flush();
         if let Some(a) = self.audio.as_mut() {
@@ -309,7 +351,44 @@ impl FfmpegSource {
             fps,
             audio,
             draining: false,
+            cancel: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// 带「可中断 seek」的打开：拖动中能取消进行中的 seek（对齐 Chromium
+    /// `CancelPendingSeek`）。
+    ///
+    /// 与 [`MediaSource::open_with`] 的区别只在于底层 `Input` 用
+    /// `input_with_interrupt` 打开，并把 `cancel` 标志挂到 ffmpeg 的
+    /// interrupt 回调上。普通打开（无取消需求，如 ocr-lab 抽帧）仍走
+    /// [`MediaSource::open_with`]，不受影响。
+    pub fn open_with_interrupt(
+        path: &Path,
+        audio_format: Option<AudioFormat>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        ffmpeg_next::init()?;
+
+        if !path.exists() {
+            return Err(anyhow::anyhow!("source not found: {}", path.display()));
+        }
+
+        // 闭包捕获 cancel 的一个 clone；ffmpeg 在每次 I/O 阻塞时调用它，
+        // 返回 true 即中断当前操作。回调发生在解码线程（同一个线程），
+        // `Arc<AtomicBool>` 是 Send+Sync，安全。
+        let cb = cancel.clone();
+        let input = ffmpeg_next::format::input_with_interrupt(path, move || {
+            cb.load(Ordering::Relaxed)
+        })?;
+
+        let mut this = Self::from_input_with(input, audio_format)?;
+        this.cancel = cancel; // 用调用方提供的同一份，UI 侧持有另一个 clone
+        Ok(this)
+    }
+
+    /// 取取消标志的 clone（供 UI 侧在发新 Preview 前置位）。
+    pub fn cancel_handle(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
     }
 
     /// 看看两个解码器里有没有已经解好、可以直接交付的东西。
@@ -467,6 +546,35 @@ mod tests {
     ///
     /// 注意这里走 [`FfmpegSource::from_input_with`] 而非 `open`：`open` 只接受
     /// 存在的本地路径，这是有意的约束，不该为了测试去放宽它。
+    /// `open_with_interrupt` 与 `input_with_interrupt` 打开的文件必须能正常解码与
+    /// seek——interrupt 回调挂上去不应影响正常路径（否则拖动外的播放全坏）。
+    ///
+    /// 这是可抢占 seek 重构的回归护栏：确认「带取消标志打开」不引入功能回退。
+    #[test]
+    fn open_with_interrupt_decodes_and_seeks() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/assets/sample.mp4");
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut src = FfmpegSource::open_with_interrupt(&path, None, cancel)
+            .expect("带 interrupt 打开应成功");
+
+        // 正常解码若干帧。
+        let mut frames = 0u32;
+        while frames < 30 {
+            match src.next_frame() {
+                Ok(Some(_)) => frames += 1,
+                Ok(None) => break,
+                Err(e) => panic!("解码失败: {e}"),
+            }
+        }
+        assert!(frames >= 30, "应至少解出 30 帧，实际 {frames}");
+
+        // 没有被取消过：seek 必须成功（不返回 SeekCancelled）。
+        src.seek(Duration::from_millis(500))
+            .expect("未取消时 seek 应成功");
+        // seek 后仍能继续解帧。
+        assert!(src.next_frame().unwrap().is_some(), "seek 后应能继续解帧");
+    }
+
     #[test]
     fn read_error_surfaces_instead_of_looking_like_eof() {
         use std::io::{Read, Write};

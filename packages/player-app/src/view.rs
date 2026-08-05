@@ -54,6 +54,11 @@ pub struct PlayerView {
     /// 是否正在拖动进度条。用 `Arc<AtomicBool>` 以便渲染循环（独立 async task）
     /// 读取——拖动中直接显示预览帧，不走音频时钟调度。
     dragging: Arc<AtomicBool>,
+    /// 拖动预览的「取消」标志：发新 Preview 前置 `true`，让解码线程里进行中的
+    /// 旧 seek 立即被 ffmpeg 的 interrupt 回调中断（对齐 Chromium CancelPendingSeek），
+    /// 解码线程重读最新命令重试，画面跟手。与解码线程的 `FfmpegSource.cancel` 是
+    /// 同一份 `Arc`。
+    cancel_seek: Arc<AtomicBool>,
     /// 键盘焦点句柄：让本视图能收到按键。
     focus_handle: FocusHandle,
 }
@@ -77,6 +82,10 @@ impl PlayerView {
         // 音频主时钟的交接点：解码线程确认有音轨后填入，渲染侧异步切过去。
         let clock_source = Arc::new(playback::AudioClockSource::default());
 
+        // 取消标志：发给解码线程做可抢占 seek。UI 持有此 clone，发新 Preview 前置
+        // `true`；解码线程的 FfmpegSource 持有另一个 clone（同一份底层原子）。
+        let cancel_seek = Arc::new(AtomicBool::new(false));
+
         // 关窗时停止解码线程。
         let running_on_release = running.clone();
         cx.on_release(move |_, _cx| {
@@ -91,6 +100,7 @@ impl PlayerView {
             stats.clone(),
             clock_source.clone(),
             cmd_rx,
+            cancel_seek.clone(),
         );
 
         let focus_handle = cx.focus_handle();
@@ -221,6 +231,7 @@ impl PlayerView {
             position: Duration::ZERO,
             paused: false,
             dragging,
+            cancel_seek,
             focus_handle,
         }
     }
@@ -330,6 +341,10 @@ impl PlayerView {
     fn seek_preview(&mut self, target: Duration) {
         let target = target.min(self.duration);
         self.position = target;
+        // 发新 Preview 前置位取消标志：解码线程里进行中的旧 seek 立即被 ffmpeg
+        // 的 interrupt 回调中断（对齐 Chromium CancelPendingSeek），解码线程
+        // 重读命令跳到最新目标。这样拖动快时画面不会被旧 seek 拖住。
+        self.cancel_seek.store(true, Ordering::Relaxed);
         let _ = self.cmd.unbounded_send(playback::PlaybackCommand::Seek(
             target,
             playback::SeekKind::Preview,

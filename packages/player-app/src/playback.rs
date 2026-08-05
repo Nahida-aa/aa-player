@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 
 use futures::channel::mpsc;
 use gpui::RenderImage;
-use player_core::{AudioClock, AudioOutput, FfmpegSource, MediaEvent, MediaSource};
+use player_core::{
+    AudioClock, AudioOutput, FfmpegSource, MediaEvent, MediaSource, SeekCancelled,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::render_image::decoded_to_render_image;
@@ -193,6 +195,7 @@ pub fn spawn_decode_thread(
     stats: Arc<ProfileStats>,
     clock_source: Arc<AudioClockSource>,
     mut cmd_rx: CommandReceiver,
+    cancel: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         // 声卡打不开不该让整个播放失败——没有声音总比放不了强。
@@ -205,7 +208,10 @@ pub fn spawn_decode_thread(
         };
         let audio_format = audio.as_ref().map(|a| a.format());
 
-        let mut source = match FfmpegSource::open_with(&path, audio_format) {
+        // 用「可中断 seek」打开：拖动快时，主线程在发新 Preview 前置位 `cancel`，
+        // 进行中的旧 seek 立即被 ffmpeg 的 interrupt 回调中断（AVERROR_EXIT），
+        // 解码线程读到最新命令重试，对齐 Chromium 的 CancelPendingSeek。
+        let mut source = match FfmpegSource::open_with_interrupt(&path, audio_format, cancel) {
             Ok(s) => s,
             Err(e) => {
                 error!(error = %e, path = %path.display(), "打开视频失败");
@@ -332,9 +338,19 @@ fn run_until_eof(
                     if ts.as_micros() as u64 > max_seek {
                         ts = Duration::from_micros(max_seek);
                     }
-                    if let Err(e) = source.seek(ts) {
-                        error!(error = %e, seek_ms = ts.as_millis(), "seek 失败");
-                        continue;
+                    match source.seek(ts) {
+                        Ok(()) => {}
+                        // 被更新的 Preview 抢占取消：上下文安全，回到循环顶部
+                        // 读最新命令重新 seek（对应 Chromium 的 CancelPendingSeek）。
+                        // 不打 error 日志——这是常态而非故障。
+                        Err(e) if e.root_cause().downcast_ref::<SeekCancelled>().is_some() => {
+                            debug!(seek_ms = ts.as_millis(), "seek 被抢占取消，重读命令");
+                            continue;
+                        }
+                        Err(e) => {
+                            error!(error = %e, seek_ms = ts.as_millis(), "seek 失败");
+                            continue;
+                        }
                     }
                     info!(seek_ms = ts.as_millis(), kind = ?kind, "seek");
                     // seek 会撤销 draining，重新可读，即可继续播放。
@@ -1118,6 +1134,7 @@ mod tests {
         let (tx, mut rx) = frame_channel();
         let (cmd, cmd_rx) = command_channel();
         let running = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(ProfileStats::default());
         let clock_source = Arc::new(AudioClockSource::default());
 
@@ -1130,6 +1147,7 @@ mod tests {
             stats.clone(),
             clock_source.clone(),
             cmd_rx,
+            cancel.clone(),
         );
 
         // 等 EOF（None 信号）。解码线程把 10s 音频按真实速度播完才到 EOF，
@@ -1187,6 +1205,7 @@ mod tests {
         let (tx, mut rx) = frame_channel();
         let (cmd, cmd_rx) = command_channel();
         let running = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(ProfileStats::default());
         let clock_source = Arc::new(AudioClockSource::default());
 
@@ -1199,6 +1218,7 @@ mod tests {
             stats.clone(),
             clock_source.clone(),
             cmd_rx,
+            cancel.clone(),
         );
 
         // 先播到 ~8s（把音频时钟推到 8s），再**向后** seek 到 2.5s——复现用户
@@ -1271,6 +1291,7 @@ mod tests {
         let (tx, mut rx) = frame_channel();
         let (cmd, cmd_rx) = command_channel();
         let running = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(ProfileStats::default());
         let clock_source = Arc::new(AudioClockSource::default());
 
@@ -1283,6 +1304,7 @@ mod tests {
             stats.clone(),
             clock_source.clone(),
             cmd_rx,
+            cancel.clone(),
         );
 
         // 播 ~2s 后 seek 到 0.95s（近开头，用户最新日志 seek=951 的场景）。
@@ -1349,6 +1371,7 @@ mod tests {
         let (tx, mut rx) = frame_channel();
         let (cmd, cmd_rx) = command_channel();
         let running = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(ProfileStats::default());
         let clock_source = Arc::new(AudioClockSource::default());
 
@@ -1361,6 +1384,7 @@ mod tests {
             stats.clone(),
             clock_source.clone(),
             cmd_rx,
+            cancel.clone(),
         );
 
         // 播 ~1s 后开始"拖动"：先 MuteAudio（真实拖动静音），再快速发多个 Preview。
@@ -1418,6 +1442,7 @@ mod tests {
         let (tx, mut rx) = frame_channel();
         let (cmd, cmd_rx) = command_channel();
         let running = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(ProfileStats::default());
         let clock_source = Arc::new(AudioClockSource::default());
 
@@ -1430,6 +1455,7 @@ mod tests {
             stats.clone(),
             clock_source.clone(),
             cmd_rx,
+            cancel.clone(),
         );
 
         // 播 ~0.5s 后开始连续 Preview（每 50ms 一个，模拟拖动），目标递增。
@@ -1479,6 +1505,7 @@ mod tests {
         let (tx, mut rx) = frame_channel();
         let (cmd, cmd_rx) = command_channel();
         let running = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(ProfileStats::default());
         let clock_source = Arc::new(AudioClockSource::default());
 
@@ -1491,6 +1518,7 @@ mod tests {
             stats.clone(),
             clock_source.clone(),
             cmd_rx,
+            cancel.clone(),
         );
 
         // 播 ~0.5s 后发一个 Preview（拖到 3s），然后测 1s 内解出多少帧。
