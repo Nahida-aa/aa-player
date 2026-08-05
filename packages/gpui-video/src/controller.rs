@@ -40,7 +40,11 @@ const SEEK_END_MARGIN_US: u64 = 1_000_000;
 ///
 /// `preview` = Preview seek 解出（拖动中），渲染侧应**直接显示**，不走音频时钟
 /// 同步（拖动时声卡被静音，音频时钟冻结，正常调度会卡住画面）。
-pub type FrameMsg = Option<(Arc<RenderImage>, u64, u64, bool)>;
+///
+/// 末尾 `u64` = **seek 代次**：该帧是在哪一次 seek 之后解码投递的。用于渲染侧
+/// 丢弃 seek 前已投递进通道的在途旧帧（它们会覆盖预测的 position，造成进度条/
+/// thumb 闪回），同时不影响 seek 后的正常帧。
+pub type FrameMsg = Option<(Arc<RenderImage>, u64, u64, bool, u64)>;
 
 /// 播放器控制命令（UI → 解码线程）。unbounded：命令不能因背压丢失。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,10 +53,10 @@ pub enum PlayerCommand {
     Resume,
     /// 拖动开始：静音（停声卡 + 清队列），与 Preview 解耦，只发一次。
     MuteAudio,
-    /// 拖动中：seek 视频出预览帧（不重建音频流、不再静音）。
-    SeekPreview(Duration),
-    /// 松开/点击：完整 seek（重建音频 + 重锚）。
-    SeekCommit(Duration),
+    /// 拖动中：seek 视频出预览帧（不重建音频流、不再静音）。带 seek 代次。
+    SeekPreview(Duration, u64),
+    /// 松开/点击：完整 seek（重建音频 + 重锚）。带 seek 代次。
+    SeekCommit(Duration, u64),
 }
 
 /// 音频主时钟的交接点。
@@ -131,6 +135,9 @@ pub struct PlayerController {
     paused: bool,
     /// 是否正在拖动进度条。
     dragging: bool,
+    /// 最近一次 seek 的代次（每次 seek_preview/seek_to 自增）。帧携带自己所属
+    /// 的 seek 代次，`consume_frame` 据此丢弃 seek 前在途的旧帧（不覆盖 position）。
+    seek_gen: u64,
     /// 取消标志：发新 Preview 前置 true，中断解码线程里进行中的旧 seek。
     cancel_seek: Arc<AtomicBool>,
     /// 音频主时钟交接点（供渲染侧调度视频）。
@@ -176,6 +183,7 @@ impl PlayerController {
                 position: Duration::ZERO,
                 paused: false,
                 dragging: false,
+                seek_gen: 0,
                 cancel_seek,
                 clock,
                 stats,
@@ -237,12 +245,22 @@ impl PlayerController {
         }
     }
 
-    /// 跳到指定时刻（正式，松开/点击）。同步更新本地 position。
+    /// 跳到指定时刻（正式，松开/点击）。同步更新本地 position（预测）。
+    ///
+    /// position 在这里**立即预测成 target**：seek 有几十毫秒固有延迟（ffmpeg seek +
+    /// 重建声卡流），若等真实解码帧慢慢爬过来，进度条/画面会在 seek 期间停在旧值，
+    /// 看起来"卡住一下"。先预测让进度条立刻跳到目标（反馈跟手）。
+    ///
+    /// 预测的 position 被 seek 前投递进帧通道的旧帧覆盖（thumb 闪回）的问题，由
+    /// 渲染循环在 seek 时（检测到音频时钟换代）丢弃在途旧帧来兜底。
     pub fn seek_to(&mut self, target: Duration) {
         let target = target.min(self.duration);
         self.position = target;
         self.dragging = false;
-        let _ = self.cmd.unbounded_send(PlayerCommand::SeekCommit(target));
+        // 每发一次正式 seek 就推进 seek 代次：seek 前在途的旧帧（代次更小）会在
+        // consume_frame 被丢弃，不覆盖这里预测的 position（避免进度条/thumb 闪回）。
+        self.seek_gen += 1;
+        let _ = self.cmd.unbounded_send(PlayerCommand::SeekCommit(target, self.seek_gen));
     }
 
     /// 拖动开始：静音（停声卡 + 清队列）。与 Preview 解耦，拖动开始时发一次。
@@ -257,7 +275,10 @@ impl PlayerController {
         self.position = target;
         self.dragging = true;
         self.cancel_seek.store(true, Ordering::Relaxed);
-        let _ = self.cmd.unbounded_send(PlayerCommand::SeekPreview(target));
+        self.seek_gen += 1;
+        let _ = self
+            .cmd
+            .unbounded_send(PlayerCommand::SeekPreview(target, self.seek_gen));
     }
 
     /// 结束拖动：发正式 seek，清拖动态。
@@ -268,7 +289,7 @@ impl PlayerController {
 
     /// 渲染循环消费一帧：更新 position/duration/latest_frame。
     pub fn consume_frame(&mut self, item: FrameMsg, cx: &mut gpui::Context<Self>) {
-        let Some((render, pts_us, duration_us, _preview)) = item else {
+        let Some((render, pts_us, duration_us, _preview, frame_gen)) = item else {
             // EOF：进度条拉满，但解码线程仍活着等 seek 命令。
             if self.duration != Duration::ZERO {
                 self.position = self.duration;
@@ -277,7 +298,13 @@ impl PlayerController {
             return;
         };
         self.duration = Duration::from_micros(duration_us);
-        if !self.dragging {
+        // seek 后在途的旧帧（所属 seek 代次 < 当前代次）会先于真实目标帧到达。
+        // 若用它们的 pts 更新 position，会把 `seek_to` 预测的目标覆盖回 seek 前
+        // 的位置 —— 连续按方向键时 thumb 闪回"原点"。丢弃这些旧帧的 position。
+        // （画面仍可显示——渲染循环已用时钟丢弃了大多数旧帧；这里保证 position
+        //   不被旧帧污染，而 `latest_frame` 照常更新。）
+        let stale = frame_gen < self.seek_gen;
+        if !self.dragging && !stale {
             self.position = Duration::from_micros(pts_us);
         }
         self.latest_frame = Some(render);
@@ -347,12 +374,20 @@ fn spawn_decode_thread(
         // seek 后音频是否已满足起播条件。
         let mut start_audio = false;
         // 待发帧（seek 后避免发 seek 前帧，先在下一轮发）。
-        let mut next_frame: Option<(Arc<RenderImage>, u64, bool)> = None;
+        let mut next_frame: Option<(Arc<RenderImage>, u64, bool, u64)> = None;
         // 已放完（EOF），只等 seek 命令。
         let mut finished = false;
         // 暂停中 scrub（拖动/跳转）临时允许解码：解出目标帧显示画面，
         // 但保持暂停（不 start 音频、不推进播放）。
         let mut scrub_paused = false;
+        // 拖动预览「定格」：preview 模式下解出目标帧后**停住**，不再继续往解码
+        // （否则按住 thumb 不松手时，预览会以解码速度一帧帧快进 —— 用户实测的
+        // "点 thumb 不滑动画面自动快播"）。等到下一个命令（新的 Preview 或 Commit）
+        // 才解除定格、seek 到新目标。
+        let mut preview_stall = false;
+        // 最近一次执行 seek 的代次；投递的每一帧都打上它，供渲染侧丢弃 seek 前
+        // 在途的旧帧（代次更小）——它们会覆盖预测的 position 造成进度条闪回。
+        let mut current_gen: u64 = 0;
 
         loop {
             if !running.load(Ordering::Relaxed) {
@@ -384,10 +419,10 @@ fn spawn_decode_thread(
                             a.clear();
                         }
                     }
-                    PlayerCommand::SeekPreview(_) | PlayerCommand::SeekCommit(_) => {
+                    PlayerCommand::SeekPreview(_, _) | PlayerCommand::SeekCommit(_, _) => {
                         latest_seek = Some((match cmd {
-                            PlayerCommand::SeekPreview(t) => t,
-                            PlayerCommand::SeekCommit(t) => t,
+                            PlayerCommand::SeekPreview(t, _) => t,
+                            PlayerCommand::SeekCommit(t, _) => t,
                             _ => unreachable!(),
                         }, cmd));
                     }
@@ -408,11 +443,18 @@ fn spawn_decode_thread(
                     }
                     tracing::debug!(?e, "seek 失败，继续");
                 }
+                // 记住本次 seek 的代次：此后投递的帧都打上它，渲染侧据此丢弃更旧帧。
+                match cmd {
+                    PlayerCommand::SeekPreview(_, g) | PlayerCommand::SeekCommit(_, g) => {
+                        current_gen = g;
+                    }
+                    _ => unreachable!(),
+                }
                 // seek 会撤销 draining，重新可读；丢弃 seek 前暂存的旧帧。
                 finished = false;
                 next_frame = None;
                 match cmd {
-                    PlayerCommand::SeekPreview(_) => {
+                    PlayerCommand::SeekPreview(..) => {
                         // 拖动中预览：seek 视频出预览帧，不重建音频流。
                         // 静音由拖动开始的 MuteAudio 负责；这里每次 clear 清空
                         // 队列，防止拖动中（声卡已 pause 冻结）解码线程推的音频堆积。
@@ -420,17 +462,20 @@ fn spawn_decode_thread(
                             a.clear();
                         }
                         previewing = true;
+                        // 新的预览目标：解除上一帧的定格，重新 seek 出目标帧。
+                        preview_stall = false;
                         video_seek_target = None;
                         // 暂停中拖动：临时允许解码出预览帧显示画面。
                         if paused {
                             scrub_paused = true;
                         }
                     }
-                    PlayerCommand::SeekCommit(_) => {
+                    PlayerCommand::SeekCommit(..) => {
                         // 完整 seek：重建声卡流 + 重锚。
                         // **不改变 paused**：暂停时 seek 应保持暂停（只跳位置，
                         // 不自动播放）。播放时 seek 正常恢复（start_audio）。
                         previewing = false;
+                        preview_stall = false;
                         pending_anchor = true;
                         video_seek_target = Some(t);
                         // 音频也丢弃目标前内容，避免旧位置声音/时钟超前。
@@ -449,6 +494,13 @@ fn spawn_decode_thread(
                 continue; // 刚 seek 过，回循环顶部读下一批命令
             }
 
+            // 拖动预览「定格」：preview 模式下已把目标帧送出，停住等下一个命令，
+            // 不要继续往后解码（否则按住 thumb 不松手会以解码速度一帧帧快进）。
+            if previewing && preview_stall {
+                std::thread::sleep(Duration::from_millis(8));
+                continue;
+            }
+
             if paused && !scrub_paused {
                 std::thread::sleep(Duration::from_millis(8));
                 continue;
@@ -459,9 +511,14 @@ fn spawn_decode_thread(
             }
 
             // 2) 有暂存帧先发（投递会背压）。
-            if let Some((render, pts_us, preview)) = next_frame.take() {
-                if !send_blocking(&mut tx, (render, pts_us, duration_us, preview), &running) {
+            if let Some((render, pts_us, preview, frame_gen)) = next_frame.take() {
+                if !send_blocking(&mut tx, (render, pts_us, duration_us, preview, frame_gen), &running) {
                     return;
+                }
+                // 预览帧已送出：进入「定格」，不再继续往后解码，画面停在目标帧。
+                // 下一个命令（新 Preview / Commit）会解除定格。
+                if preview && previewing {
+                    preview_stall = true;
                 }
                 // 暂停中 scrub 已解出目标帧（画面更新），恢复暂停。
                 scrub_paused = false;
@@ -496,7 +553,7 @@ fn spawn_decode_thread(
                     // 解码+像素转换总耗时（微秒）。
                     stats.record_decoded(t0.elapsed().as_micros() as u64);
                     let pts_us = f.pts.as_micros() as u64;
-                    next_frame = Some((render, pts_us, previewing));
+                    next_frame = Some((render, pts_us, previewing, current_gen));
                 }
                 Ok(Some(MediaEvent::Audio(chunk))) => {
                     // seek 后丢弃目标前音频（避免旧位置声音/时钟超前）。
@@ -607,7 +664,7 @@ fn drain_audio(audio: &AudioOutput, running: &AtomicBool) {
 /// 把一帧送进队列，满则退避重试直到成功。返回 false 表示应结束线程。
 fn send_blocking(
     tx: &mut mpsc::Sender<FrameMsg>,
-    item: (Arc<RenderImage>, u64, u64, bool),
+    item: (Arc<RenderImage>, u64, u64, bool, u64),
     running: &AtomicBool,
 ) -> bool {
     let mut pending = Some(item);
@@ -638,8 +695,8 @@ mod tests {
     fn try_recv_frame(rx: &mut mpsc::Receiver<FrameMsg>, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            match rx.try_next() {
-                Ok(Some(Some(_))) => return true,
+            match rx.try_recv() {
+                Ok(Some(_)) => return true,
                 _ => {
                     if Instant::now() >= deadline {
                         return false;
@@ -728,5 +785,72 @@ mod tests {
             got_after >= 10,
             "快速拖动后应持续产帧（解码不卡死），实际 {got_after}"
         );
+    }
+
+    /// 回归测试：**按住 thumb 不松手、不滑动**（进入拖动预览但不再发新命令）。
+    ///
+    /// 修复前，Preview 模式下解码线程会继续往解码，预览帧以解码速度一帧帧快进，
+    /// 画面看起来在自动快播（无声音）。修复后：预览解出目标帧后应**定格**，
+    /// 不继续产帧（画面停住），直到下一个命令（新 Preview 或 Release 的 Commit）。
+    #[test]
+    fn preview_holds_still_freezes_not_fast_forward() {
+        let (mut controller, mut rx) = PlayerController::open(sample_path());
+
+        // 1) 消费若干帧（解码线程在跑）。
+        let mut got = 0;
+        while got < 30 {
+            if try_recv_frame(&mut rx, Duration::from_secs(5)) {
+                got += 1;
+            } else {
+                break;
+            }
+        }
+        assert!(got >= 30, "应解出至少 30 帧，实际 {got}");
+
+        // 2) 进入拖动预览：拖动开始（静音）+ 一个 Preview seek 到 4s，然后**停住**，
+        //    模拟"点住 thumb 不松手不滑动"。
+        controller.mute_audio();
+        controller.seek_preview(Duration::from_secs(4));
+
+        // 3) 等预览目标帧送达（画面应该跳过去）。
+        assert!(
+            try_recv_frame(&mut rx, Duration::from_secs(5)),
+            "Preview 应解出目标帧"
+        );
+        // 再消费掉紧随的 1~2 帧（seek 落点可能先送关键帧前的帧）。
+        while got < 34 {
+            if try_recv_frame(&mut rx, Duration::from_millis(200)) {
+                got += 1;
+            } else {
+                break;
+            }
+        }
+
+        // 4) **关键**：此后不再发任何命令（继续"按住不松"），短窗口内不应再有
+        //    新帧 —— 画面必须定格，否则就是快进 bug。
+        let mut leaked = 0;
+        let window = Duration::from_millis(300);
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            if try_recv_frame(&mut rx, Duration::from_millis(50)) {
+                leaked += 1;
+            }
+        }
+        assert!(
+            leaked == 0,
+            "按住不滑动时预览应定格（不应再产帧/快进），300ms 内泄漏了 {leaked} 帧"
+        );
+
+        // 5) 松开（Commit）：恢复正常播放，应重新持续产帧。
+        controller.seek_release(Duration::from_secs(4));
+        let mut got_after = 0;
+        while got_after < 5 {
+            if try_recv_frame(&mut rx, Duration::from_secs(5)) {
+                got_after += 1;
+            } else {
+                break;
+            }
+        }
+        assert!(got_after >= 5, "松开后应恢复产帧，实际 {got_after}");
     }
 }

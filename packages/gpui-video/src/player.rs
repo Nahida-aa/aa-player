@@ -86,18 +86,23 @@ impl Player {
                     }
                     // seek 发生：重置墙钟 origin。
                     clock.reset_origin();
+                    // **不要在这里清空帧通道/丢弃当前帧**：seek 后解码线程重建音频
+                    // （generation++）随之投递的第一个 post-seek 帧正是要显示的目标帧
+                    // （暂停中 seek 只投这一帧，丢了画面就不动）。seek 前在途的旧帧
+                    // 由 `consume_frame` 的 seek 代次检查（frame_gen < seek_gen）丢弃
+                    // position、由下方时钟调度丢弃画面（reset 后旧帧判 Wait>1s/Drop）。
                 }
                 clock.set_audio_offset(offset_us);
 
                 // 预览帧或拖动中：直接显示，不走音频时钟调度。
                 // （拖动时声卡静音、音频时钟冻结，正常帧会被 Wait/Drop 卡住；
                 //  拖动中所有帧直接显示，避免残留正常帧用冻结时钟卡住画面。）
-                let is_preview = matches!(&item, Some((_, _, _, true)));
+                let is_preview = matches!(&item, Some((_, _, _, true, _)));
                 let show = if is_preview || dragging_render.load(std::sync::atomic::Ordering::Relaxed) {
                     true
                 } else {
                     match &item {
-                        Some((_, pts_us, dur_us, false)) => {
+                        Some((_, pts_us, dur_us, false, _)) => {
                             clock.set_duration(*dur_us);
                             match clock.schedule(Duration::from_micros(*pts_us)) {
                                 Schedule::Now | Schedule::Resynced { .. } => true,
@@ -122,7 +127,7 @@ impl Player {
                 if show {
                     // 统计漂移：在移动 item 前取 pts 和音频位置。
                     let drift_us = match &item {
-                        Some((_, pts_us, _, false)) => audio
+                        Some((_, pts_us, _, false, _)) => audio
                             .as_ref()
                             .map(|a| a.position().as_micros() as i64 - *pts_us as i64),
                         _ => None,

@@ -2469,6 +2469,7 @@ dependencies = [
  "anyhow",
  "assets",
  "env_logger",
+ "ffmpeg-next",
  "futures",
  "gpui",
  "gpui_platform",
