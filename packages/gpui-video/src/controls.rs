@@ -2,10 +2,11 @@
 //!
 //! 进度条（ui-gpui Slider）+ 播放/暂停按钮 + 时间文本。作为一次性元素，
 //! 由拥有控制器和进度条状态的父视图（`Player`）构建。
+//!
+//! 布局对齐 aa-player 原版：底部半透明黑 overlay，两行——
+//! 上行是「播放/暂停 + 时间文本」（右对齐），下行是占满宽度的进度条。
 
-use std::time::Duration;
-
-use gpui::{Entity, IntoElement, MouseButton, RenderOnce, Window, div, prelude::*, px, rgb};
+use gpui::{Entity, IntoElement, MouseButton, RenderOnce, Window, div, prelude::*, px, rgb, white};
 use ui_gpui::{Slider, SliderState};
 
 use crate::controller::PlayerController;
@@ -55,19 +56,7 @@ impl RenderOnce for PlaybackControls {
             duration.as_secs() / 60,
             duration.as_secs() % 60,
         );
-
-        // 播放/暂停按钮标签。
         let play_label = if paused { "▶" } else { "⏸" };
-
-        let mut controls = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .w_full()
-            .px_2()
-            .py_1()
-            .bg(rgb(0x000000cc));
 
         // 播放/暂停按钮。
         let mut btn = div()
@@ -75,10 +64,12 @@ impl RenderOnce for PlaybackControls {
             .w(px(28.0))
             .h(px(28.0))
             .flex()
+            .flex_shrink_0()
             .items_center()
             .justify_center()
             .rounded_full()
             .bg(rgb(0xffffff22))
+            .text_color(white())
             .child(play_label);
         if let Some(toggle) = self.on_toggle {
             let ctrl = self.controller.clone();
@@ -90,21 +81,44 @@ impl RenderOnce for PlaybackControls {
                 },
             );
         }
-        controls = controls.child(btn);
 
-        // 进度条（ui-gpui Slider）：0..duration 秒，值 = 当前位置。
-        let progress_el = Slider::new(&self.progress);
-        controls = controls.child(div().flex_1().h(px(20.0)).child(progress_el));
-
-        // 时间文本。
-        controls = controls.child(div().text_size(px(12.0)).child(time_text));
-
-        controls
+        // 两行控制条：上行「按钮 + 时间」，下行「进度条」。
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .pt(px(6.0))
+            .pb(px(8.0))
+            .px(px(12.0))
+            .bg(rgb(0x00000066))
+            // 上行：按钮靠左，时间文本右对齐（占满宽）。
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(btn)
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .justify_end()
+                            .text_size(px(12.0))
+                            .text_color(white())
+                            .child(time_text),
+                    ),
+            )
+            // 下行：进度条占满宽。
+            .child(
+                div()
+                    .w_full()
+                    .h(px(20.0))
+                    .flex()
+                    .items_center()
+                    .child(Slider::new(&self.progress)),
+            )
     }
-}
-
-/// 让 `Duration` 在此模块有用途标注（进度条换算辅助，V1 简化）。
-#[allow(dead_code)]
-fn _secs(d: Duration) -> f32 {
-    d.as_secs_f32()
 }

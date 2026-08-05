@@ -35,7 +35,7 @@ impl Player {
             let (c, rx) = PlayerController::open(path);
             (cx.new(|_| c), rx)
         };
-        let progress = cx.new(|_| SliderState::new().min(0.0).max(1.0));
+        let progress = cx.new(|_| SliderState::new().min(0.0).max(1.0).step(1.0));
         let focus_handle = cx.focus_handle();
 
         // 渲染循环：异步收帧 → 更新 controller → notify。
@@ -94,15 +94,19 @@ impl Render for Player {
             self.previous_frame = Some(frame);
         }
 
-        // 进度条绑定控制器状态（0..duration 秒）。
-        let (position, duration) = {
+        // 进度条绑定控制器状态（0..duration 秒）。拖动时让滑块跟手（由 Slider
+        // 自身驱动），外部不覆盖 position。
+        let (position, duration, dragging) = {
             let c = self.controller.read(cx);
-            (c.position(), c.duration())
+            (c.position(), c.duration(), c.is_dragging())
         };
-        let max = duration.as_secs_f32().max(1.0);
-        self.progress.update(cx, |s, cx| {
-            s.set_value(position.as_secs_f32().min(max), cx);
-        });
+        if !dragging {
+            let max = duration.as_secs_f32().max(1.0);
+            self.progress.update(cx, |s, cx| {
+                s.set_max(max, cx);
+                s.set_value(position.as_secs_f32().min(max), cx);
+            });
+        }
 
         // 画面 + 控制条。
         div()
