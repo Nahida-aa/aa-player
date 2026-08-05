@@ -183,6 +183,23 @@ impl Player {
             focus_handle,
         }
     }
+
+    /// 程序化触发一次拖动 seek（拖动中 preview + 松手 release）。
+    ///
+    /// 供外部（自动拖动脚本 / 键盘快捷键 / 测试）驱动，等价于在进度条上
+    /// 按住拖到 `target` 再松开。`target` 单位秒。
+    pub fn seek(&mut self, target: Duration, cx: &mut Context<Self>) {
+        self.controller.update(cx, |c, _| c.seek_preview(target));
+        self.controller.update(cx, |c, _| c.seek_release(target));
+        cx.notify();
+    }
+
+    /// 拖动中 preview（按住不松、移动进度条）。配合 [`seek`](Self::seek) 用：
+    /// 连续多次 `seek_preview` 模拟快速拖动中的移动，最后 `seek` 提交。
+    pub fn seek_preview(&mut self, target: Duration, cx: &mut Context<Self>) {
+        self.controller.update(cx, |c, _| c.seek_preview(target));
+        cx.notify();
+    }
 }
 
 impl Focusable for Player {

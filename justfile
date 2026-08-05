@@ -58,3 +58,7 @@ core:
 #   都不传 → 播放 player-core 内置样本。
 video-demo *video="${VIDEO}":
     cargo run -p gpui-video --example demo -- {{video}}
+
+# 打开真实窗口 + 自动拖动（肉眼观察画面/进度条跟着自动 seek 动）
+video-auto-drag *video="${VIDEO}":
+    cargo run -p gpui-video --example auto_drag -- {{video}}
