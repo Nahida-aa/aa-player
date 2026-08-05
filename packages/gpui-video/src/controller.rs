@@ -47,7 +47,9 @@ pub type FrameMsg = Option<(Arc<RenderImage>, u64, u64, bool)>;
 pub enum PlayerCommand {
     Pause,
     Resume,
-    /// 拖动中：静音 + seek 视频出预览帧（不重建音频流）。
+    /// 拖动开始：静音（停声卡 + 清队列），与 Preview 解耦，只发一次。
+    MuteAudio,
+    /// 拖动中：seek 视频出预览帧（不重建音频流、不再静音）。
     SeekPreview(Duration),
     /// 松开/点击：完整 seek（重建音频 + 重锚）。
     SeekCommit(Duration),
@@ -233,7 +235,13 @@ impl PlayerController {
         let _ = self.cmd.unbounded_send(PlayerCommand::SeekCommit(target));
     }
 
+    /// 拖动开始：静音（停声卡 + 清队列）。与 Preview 解耦，拖动开始时发一次。
+    pub fn mute_audio(&mut self) {
+        let _ = self.cmd.unbounded_send(PlayerCommand::MuteAudio);
+    }
+
     /// 拖动中预览 seek：置取消标志中断旧 seek，本地 position 跟手。
+    /// 不再静音（静音由拖动开始的 [`mute_audio`](Self::mute_audio) 负责）。
     pub fn seek_preview(&mut self, target: Duration) {
         let target = target.min(self.duration);
         self.position = target;
@@ -352,6 +360,13 @@ fn spawn_decode_thread(
                             a.resume();
                         }
                     }
+                    PlayerCommand::MuteAudio => {
+                        // 拖动开始：静音（停声卡 + 清队列），不设 paused（解码继续）。
+                        if let Some(a) = audio.as_ref() {
+                            a.pause();
+                            a.clear();
+                        }
+                    }
                     PlayerCommand::SeekPreview(_) | PlayerCommand::SeekCommit(_) => {
                         latest_seek = Some((match cmd {
                             PlayerCommand::SeekPreview(t) => t,
@@ -381,9 +396,10 @@ fn spawn_decode_thread(
                 next_frame = None;
                 match cmd {
                     PlayerCommand::SeekPreview(_) => {
-                        // 拖动中预览：静音（停声卡）+ seek 视频出预览帧，不重建音频流。
+                        // 拖动中预览：seek 视频出预览帧，不重建音频流。
+                        // 静音由拖动开始的 MuteAudio 负责；这里每次 clear 清空
+                        // 队列，防止拖动中（声卡已 pause 冻结）解码线程推的音频堆积。
                         if let Some(a) = audio.as_ref() {
-                            a.pause();
                             a.clear();
                         }
                         previewing = true;

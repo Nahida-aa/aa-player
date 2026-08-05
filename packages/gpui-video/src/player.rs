@@ -159,7 +159,10 @@ impl Player {
         cx.subscribe(&progress, move |this, _slider, event, cx| {
             match event {
                 SliderEvent::Change(v) => {
-                    dragging_change.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // 拖动开始（第一次 Change）：静音一次（对齐 player-app 的 MuteAudio）。
+                    if !dragging_change.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        this.controller.update(cx, |c, _| c.mute_audio());
+                    }
                     this.controller.update(cx, |c, _| {
                         c.seek_preview(Duration::from_millis(v.end() as u64))
                     });
