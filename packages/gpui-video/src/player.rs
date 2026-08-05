@@ -13,6 +13,7 @@ use ui_gpui::{SliderEvent, SliderState};
 
 use crate::controller::PlayerController;
 use crate::controls::PlaybackControls;
+use crate::playback_clock::{PlaybackClock, Schedule};
 use crate::surface::VideoSurface;
 
 /// 播放器视图：给一个视频路径即可用。
@@ -38,13 +39,60 @@ impl Player {
         let progress = cx.new(|_| SliderState::new().min(0.0).max(1.0).step(1.0));
         let focus_handle = cx.focus_handle();
 
-        // 渲染循环：异步收帧 → 更新 controller → notify。
+        // 音频时钟交接点（渲染循环调度用）。克隆进异步任务，避免跨实体读。
+        let clock_source = controller.read(cx).clock.clone();
+
+        // 渲染循环：异步收帧 → 按播放时钟调度 → 更新 controller → notify。
         let _render_task = cx.spawn(async move |this, cx| {
+            let mut clock = PlaybackClock::new();
+            // 记住音频时钟代次，换代才换时钟柄（保留墙钟 origin）。
+            let mut audio_generation: u64 = 0;
             while let Some(item) = rx.next().await {
-                this.update(cx, |this, cx| {
-                    this.controller.update(cx, |c, cx| c.consume_frame(item, cx));
-                })
-                .ok();
+                // 从音频时钟交接点取 (代次, seek偏移, 时钟)，调度视频帧。
+                let (generation, offset_us, audio) = clock_source.get_with_generation();
+                if generation != audio_generation {
+                    audio_generation = generation;
+                    if let Some(a) = audio {
+                        clock.set_audio(a);
+                    }
+                    // seek 发生：重置墙钟 origin。
+                    clock.reset_origin();
+                }
+                clock.set_audio_offset(offset_us);
+
+                // preview 帧（拖动中）：直接显示，不走音频时钟调度。
+                let show = match &item {
+                    Some((_, _, dur_us, true)) => {
+                        clock.set_duration(*dur_us);
+                        true
+                    }
+                    Some((_, pts_us, dur_us, false)) => {
+                        clock.set_duration(*dur_us);
+                        match clock.schedule(Duration::from_micros(*pts_us)) {
+                            Schedule::Now | Schedule::Resynced { .. } => true,
+                            // 未来帧：等点到再显示。封顶 1s——超过几乎必是 seek 后
+                            // 残留旧帧，真等会卡住画面数秒、音频趁机超前。
+                            Schedule::Wait(d) => {
+                                if d.as_millis() > 1000 {
+                                    false // 旧帧/时钟错位，丢弃
+                                } else {
+                                    cx.background_executor().timer(d).await;
+                                    true
+                                }
+                            }
+                            // 落后太多：丢帧，让画面追上声音。
+                            Schedule::Drop { .. } => false,
+                        }
+                    }
+                    None => true, // EOF：更新状态（进度条拉满）
+                };
+
+                if show {
+                    this.update(cx, |this, cx| {
+                        this.controller.update(cx, |c, cx| c.consume_frame(item, cx));
+                    })
+                    .ok();
+                }
             }
         });
 
