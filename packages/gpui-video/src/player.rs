@@ -43,6 +43,9 @@ pub struct Player {
     /// 渲染循环任务句柄（保活）。
     _render_task: gpui::Task<()>,
     focus_handle: FocusHandle,
+    /// 控制条是否可见：默认隐藏，鼠标移入控制区才显示（移出后隐藏）。
+    /// 菜单/info 打开时强制可见，避免失焦即收起。
+    controls_visible: bool,
 }
 
 impl Player {
@@ -213,6 +216,7 @@ impl Player {
             previous_frame: None,
             _render_task,
             focus_handle,
+            controls_visible: false,
         }
     }
 
@@ -323,6 +327,22 @@ impl Render for Player {
                 this.on_key(e, cx);
                 cx.notify();
             }))
+            // 鼠标移入播放区（移动即触发）：显示控制条。
+            .on_mouse_move(cx.listener(|this, _event, _window, cx| {
+                if !this.controls_visible {
+                    this.controls_visible = true;
+                    cx.notify();
+                }
+            }))
+            // 鼠标移出播放区：隐藏（菜单/info 打开时保持显示）。
+            .on_mouse_exit(cx.listener(|this, _event, _window, cx| {
+                let keep = this.controller.read(cx).is_menu_open()
+                    || this.controller.read(cx).is_info_open();
+                if !keep {
+                    this.controls_visible = false;
+                    cx.notify();
+                }
+            }))
             // 点击播放区（浮层外）关闭「更多」菜单与「info」面板。按钮/菜单项
             // 自身在 mouse_down 已 stop_propagation，故点它们不会触发这里。
             .on_mouse_down(
@@ -346,22 +366,24 @@ impl Render for Player {
                         None => VideoSurface::new(&self.controller),
                     }),
             )
-            .child(
-                div()
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .right_0()
-                    .child(
-                        PlaybackControls::new(&self.controller, &self.progress)
-                            .on_toggle(|c| {
-                                if c.paused() {
-                                    c.play();
-                                } else {
-                                    c.pause();
-                                }
-                            }),
-                    ),
-            )
+            .when(self.controls_visible, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .child(
+                            PlaybackControls::new(&self.controller, &self.progress)
+                                .on_toggle(|c| {
+                                    if c.paused() {
+                                        c.play();
+                                    } else {
+                                        c.pause();
+                                    }
+                                }),
+                        ),
+                )
+            })
     }
 }
