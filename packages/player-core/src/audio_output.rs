@@ -10,7 +10,7 @@
 //!
 //! 这也是选 cpal 而非 rodio 的原因：rodio 把这层信息藏起来了。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -49,6 +49,10 @@ pub struct AudioOutput {
     /// 是否处于暂停态。暂停时声卡设备冻结，时钟也随之停走，
     /// 恢复后位置天然连续——这是 seek/暂停能对齐画面的基础。
     paused: Arc<AtomicBool>,
+    /// 输出音量增益（0.0=静音，1.0=正常）。回调里乘到每个采样上，
+    /// 实现持久静音（与拖动时的临时 `pause()` 静音正交）。
+    /// 用 `AtomicU32` 存 `f32` bits（稳定 Rust 无 `AtomicF32`）。
+    volume: Arc<AtomicU32>,
 }
 
 /// 播放是否真正开始过（收到过非空采样）。
@@ -121,6 +125,7 @@ impl AudioOutput {
 
         let started: StartedFlag = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
+        let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
 
         let stream = Self::build_stream(
             &device,
@@ -130,6 +135,7 @@ impl AudioOutput {
             underrun.clone(),
             started.clone(),
             format.channels,
+            volume.clone(),
         )?;
         if play {
             stream.play()?;
@@ -143,6 +149,7 @@ impl AudioOutput {
             underrun,
             started,
             paused,
+            volume,
         })
     }
 
@@ -163,6 +170,7 @@ impl AudioOutput {
         underrun: Arc<AtomicBool>,
         started: StartedFlag,
         channels: u16,
+        volume: Arc<AtomicU32>,
     ) -> Result<cpal::Stream> {
         let cfg = config.config();
         let err_fn = |e| tracing::error!(error = %e, "音频流错误");
@@ -174,15 +182,17 @@ impl AudioOutput {
                 let frames_played = frames_played.clone();
                 let underrun = underrun.clone();
                 let started = started.clone();
+                let volume = volume.clone();
                 device.build_output_stream(
                     cfg.clone(),
                     move |out: &mut [$sample], _: &cpal::OutputCallbackInfo| {
                         let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
                         let mut filled = 0usize;
+                        let gain = f32::from_bits(volume.load(Ordering::Relaxed));
                         for slot in out.iter_mut() {
                             match q.pop_front() {
                                 Some(v) => {
-                                    *slot = $convert(v);
+                                    *slot = $convert(v * gain);
                                     filled += 1;
                                 }
                                 // 队列空：补静音而不是留脏数据（否则是刺耳噪声）。
@@ -303,6 +313,18 @@ impl AudioOutput {
     /// 当前是否处于暂停态。
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
+    }
+
+    /// 设置输出音量增益（0.0=静音，1.0=正常）。用于在回调里乘到每个采样上，
+    /// 实现持久静音——与拖动时的临时 `pause()` 静音互不干扰。
+    pub fn set_volume(&self, v: f32) {
+        self.volume
+            .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// 当前输出音量增益。
+    pub fn volume(&self) -> f32 {
+        f32::from_bits(self.volume.load(Ordering::Relaxed))
     }
 }
 

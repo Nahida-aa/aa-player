@@ -43,6 +43,13 @@ pub struct AudioDecoder {
     /// 目标格式（= 声卡格式）。
     target: AudioFormat,
     info: AudioInfo,
+    /// 播放速度倍率（1.0=原速，>1 快进，<1 慢放）。通过改变重采样**输出**采样率
+    /// 实现：声卡按固定设备率消费，产出采样数 = 输入 × (设备率/output_rate)，
+    /// 故 output_rate = 设备率/speed 时真实播放时长 = 原时长/speed。
+    /// 音频主时钟用设备率读数，不受 output_rate 影响，故视频帧调度自动同步。
+    speed: f64,
+    /// 当前重采样输出采样率（= 设备率/speed）。缓存以便 seek 后 flush 重建。
+    output_rate: u32,
     /// 复用：解码器输出帧。
     raw: Audio,
     /// 复用：重采样输出帧。
@@ -67,15 +74,14 @@ impl AudioDecoder {
         };
         let dst_layout = ChannelLayout::default(target.channels as i32);
 
-        let resampler = Resampler::get(
+        // speed=1 时 output_rate = 设备率；倍速经 set_speed 改变。
+        let output_rate = target.sample_rate;
+        let resampler = Self::build_resampler(
             decoder.format(),
             src_layout,
             decoder.rate(),
-            // 统一输出交错 f32：cpal 的缓冲就是交错的，
-            // 末端要转 i16/u16 时再由 AudioOutput 负责。
-            SampleFormat::F32(ffmpeg_next::format::sample::Type::Packed),
             dst_layout,
-            target.sample_rate,
+            output_rate,
         )?;
 
         let duration = Duration::from_secs_f64(
@@ -95,10 +101,64 @@ impl AudioDecoder {
             time_base,
             target,
             info,
+            speed: 1.0,
+            output_rate,
             raw: Audio::empty(),
             resampled: Audio::empty(),
             next_pts: Duration::ZERO,
         })
+    }
+
+    /// 构造一个重采样器：输入为源格式/率，输出为交错的 f32，目标设备格式，
+    /// 输出采样率为 `output_rate`（= 设备率/speed）。抽出来给 `new`/`set_speed`/
+    /// `flush` 共用，三处都要按当前 speed 重建重采样器。
+    fn build_resampler(
+        in_format: ffmpeg_next::format::Sample,
+        in_layout: ChannelLayout,
+        in_rate: u32,
+        out_layout: ChannelLayout,
+        out_sample_rate: u32,
+    ) -> Result<Resampler> {
+        Ok(Resampler::get(
+            in_format,
+            in_layout,
+            in_rate,
+            // 统一输出交错 f32：cpal 的缓冲就是交错的，
+            // 末端要转 i16/u16 时再由 AudioOutput 负责。
+            SampleFormat::F32(ffmpeg_next::format::sample::Type::Packed),
+            out_layout,
+            out_sample_rate,
+        )?)
+    }
+
+    /// 当前播放速度倍率。
+    pub fn speed(&self) -> f64 {
+        self.speed
+    }
+
+    /// 设置播放速度倍率（clamp 到 [0.25, 4.0]）。改变重采样输出率，使真实
+    /// 播放时长 = 原时长/speed，音频主时钟仍按设备率读数，视频自动同步。
+    pub fn set_speed(&mut self, speed: f64) {
+        let speed = speed.clamp(0.25, 4.0);
+        if (speed - self.speed).abs() < f64::EPSILON {
+            return;
+        }
+        self.speed = speed;
+        // output_rate = 设备率 / speed（speed 越大产出越少采样 → 播得越快）。
+        self.output_rate = (self.target.sample_rate as f64 / speed) as u32;
+        if let Ok(r) = Self::build_resampler(
+            self.decoder.format(),
+            if self.decoder.channel_layout().is_empty() {
+                ChannelLayout::default(self.decoder.channels() as i32)
+            } else {
+                self.decoder.channel_layout()
+            },
+            self.decoder.rate(),
+            ChannelLayout::default(self.target.channels as i32),
+            self.output_rate,
+        ) {
+            self.resampler = r;
+        }
     }
 
     /// 源音频流的元信息。
@@ -194,7 +254,8 @@ impl AudioDecoder {
         self.decoder.flush();
         // 重采样器没有 reset API；重建一个是最干净的做法。
         // 残留采样若不清掉，seek 后开头会混入上一个位置的声音。
-        if let Ok(r) = Resampler::get(
+        // 用当前 speed 对应的 output_rate 重建，否则 seek 后变速会失效。
+        if let Ok(r) = Self::build_resampler(
             self.decoder.format(),
             if self.decoder.channel_layout().is_empty() {
                 ChannelLayout::default(self.decoder.channels() as i32)
@@ -202,9 +263,8 @@ impl AudioDecoder {
                 self.decoder.channel_layout()
             },
             self.decoder.rate(),
-            SampleFormat::F32(ffmpeg_next::format::sample::Type::Packed),
             ChannelLayout::default(self.target.channels as i32),
-            self.target.sample_rate,
+            self.output_rate,
         ) {
             self.resampler = r;
         }
@@ -243,7 +303,7 @@ impl AudioDecoder {
         AudioChunk {
             samples,
             channels: self.target.channels,
-            sample_rate: self.target.sample_rate,
+            sample_rate: self.output_rate,
             pts,
         }
     }

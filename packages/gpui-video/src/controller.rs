@@ -47,7 +47,7 @@ const SEEK_END_MARGIN_US: u64 = 1_000_000;
 pub type FrameMsg = Option<(Arc<RenderImage>, u64, u64, bool, u64)>;
 
 /// 播放器控制命令（UI → 解码线程）。unbounded：命令不能因背压丢失。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlayerCommand {
     Pause,
     Resume,
@@ -57,6 +57,10 @@ pub enum PlayerCommand {
     SeekPreview(Duration, u64),
     /// 松开/点击：完整 seek（重建音频 + 重锚）。带 seek 代次。
     SeekCommit(Duration, u64),
+    /// 设置持久静音（作用于音量增益，非拖动临时静音）。
+    SetMuted(bool),
+    /// 设置播放速度倍率（作用于音频重采样输出率，视频随音频主时钟同步）。
+    SetSpeed(f64),
 }
 
 /// 音频主时钟的交接点。
@@ -135,6 +139,12 @@ pub struct PlayerController {
     paused: bool,
     /// 是否正在拖动进度条。
     dragging: bool,
+    /// 是否静音（持久静音，作用于音量增益，与拖动临时静音正交）。
+    muted: bool,
+    /// 「更多」菜单是否展开（UI 状态，供控制条条件渲染浮层）。
+    menu_open: bool,
+    /// 播放速度倍率（1.0=原速）。经 SetSpeed 命令下发到解码线程改音频重采样率。
+    speed: f64,
     /// 最近一次 seek 的代次（每次 seek_preview/seek_to 自增）。帧携带自己所属
     /// 的 seek 代次，`consume_frame` 据此丢弃 seek 前在途的旧帧（不覆盖 position）。
     seek_gen: u64,
@@ -183,6 +193,9 @@ impl PlayerController {
                 position: Duration::ZERO,
                 paused: false,
                 dragging: false,
+                muted: false,
+                menu_open: false,
+                speed: 1.0,
                 seek_gen: 0,
                 cancel_seek,
                 clock,
@@ -219,6 +232,68 @@ impl PlayerController {
 
     pub fn is_dragging(&self) -> bool {
         self.dragging
+    }
+
+    /// 是否静音（持久静音）。
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
+    /// 切换静音（持久）。同时下发命令让解码线程调音量增益。
+    pub fn toggle_mute(&mut self) {
+        self.set_muted(!self.muted);
+    }
+
+    /// 设置静音（持久）。`muted=true` 增益置 0，否则恢复 1。
+    pub fn set_muted(&mut self, muted: bool) {
+        if self.muted == muted {
+            return;
+        }
+        self.muted = muted;
+        let _ = self.cmd.unbounded_send(PlayerCommand::SetMuted(muted));
+    }
+
+    /// 「更多」菜单是否展开。
+    pub fn is_menu_open(&self) -> bool {
+        self.menu_open
+    }
+
+    /// 切换「更多」菜单展开状态。
+    pub fn toggle_menu(&mut self) {
+        self.menu_open = !self.menu_open;
+    }
+
+    /// 关闭「更多」菜单（点击外部时调用）。
+    pub fn close_menu(&mut self) {
+        self.menu_open = false;
+    }
+
+    /// 播放速度档位（点击倍速菜单项时循环切换）。
+    pub const SPEED_STEPS: &'static [f64] = &[1.0, 1.25, 1.5, 2.0, 0.5];
+
+    /// 当前播放速度倍率。
+    pub fn speed(&self) -> f64 {
+        self.speed
+    }
+
+    /// 设置播放速度倍率（clamp 到合理范围后下发解码线程）。
+    pub fn set_speed(&mut self, speed: f64) {
+        let speed = speed.clamp(0.25, 4.0);
+        if (speed - self.speed).abs() < f64::EPSILON {
+            return;
+        }
+        self.speed = speed;
+        let _ = self.cmd.unbounded_send(PlayerCommand::SetSpeed(speed));
+    }
+
+    /// 循环切换到下一个速度档位（点击「倍速」菜单项时调用）。
+    pub fn cycle_speed(&mut self) {
+        let idx = Self::SPEED_STEPS
+            .iter()
+            .position(|&s| (s - self.speed).abs() < f64::EPSILON)
+            .unwrap_or(0);
+        let next = Self::SPEED_STEPS[(idx + 1) % Self::SPEED_STEPS.len()];
+        self.set_speed(next);
     }
 
     // ----- 控制 -----
@@ -418,6 +493,18 @@ fn spawn_decode_thread(
                             a.pause();
                             a.clear();
                         }
+                    }
+                    PlayerCommand::SetMuted(m) => {
+                        // 持久静音：调音量增益（0=静音），声卡照常跑。
+                        // 与拖动的临时 pause 正交，互不干扰。
+                        if let Some(a) = audio.as_ref() {
+                            a.set_volume(if m { 0.0 } else { 1.0 });
+                        }
+                    }
+                    PlayerCommand::SetSpeed(s) => {
+                        // 倍速：转发到媒体源，改音频重采样输出率；
+                        // 音频主时钟仍按设备率读数，视频帧调度随之同步。
+                        source.set_speed(s);
                     }
                     PlayerCommand::SeekPreview(_, _) | PlayerCommand::SeekCommit(_, _) => {
                         latest_seek = Some((match cmd {

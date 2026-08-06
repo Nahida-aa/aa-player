@@ -7,8 +7,8 @@
 //! 上行是「播放/暂停 + 时间文本」（右对齐），下行是占满宽度的进度条。
 
 use gpui::{
-    Entity, IntoElement, MouseButton, RenderOnce, Window, div, linear_color_stop, linear_gradient,
-    prelude::*, px, rgba, svg, white,
+    Div, Entity, IntoElement, MouseButton, RenderOnce, SharedString, Stateful, Window, div,
+    linear_color_stop, linear_gradient, prelude::*, px, rgba, svg, white,
 };
 use ui_gpui::{Slider, SliderState};
 
@@ -17,6 +17,9 @@ use crate::controller::PlayerController;
 /// 图标资源路径（内嵌 via asset source，`Application::new().with_assets(…)` 提供）。
 const ICON_PLAY: &str = "icons/play_filled.svg";
 const ICON_PAUSE: &str = "icons/debug_pause.svg";
+const ICON_VOLUME_ON: &str = "icons/audio_on.svg";
+const ICON_VOLUME_OFF: &str = "icons/audio_off.svg";
+const ICON_MORE: &str = "icons/ellipsis_vertical.svg";
 
 /// 播放/暂停按钮回调：驱动控制器切换播放状态。
 type ToggleHandler = Box<dyn Fn(&mut PlayerController) + 'static>;
@@ -64,27 +67,35 @@ impl RenderOnce for PlaybackControls {
             duration.as_secs() % 60,
         );
         let icon_path = if paused { ICON_PLAY } else { ICON_PAUSE };
+        let muted = ctrl.is_muted();
+        let menu_open = ctrl.is_menu_open();
+        let volume_icon = if muted { ICON_VOLUME_OFF } else { ICON_VOLUME_ON };
 
-        // 播放/暂停按钮（zed 图标，染白）。
-        let mut btn = div()
-            .id("toggle")
-            .w(px(28.0))
-            .h(px(28.0))
-            .flex()
-            .flex_shrink_0()
-            .items_center()
-            .justify_center()
-            .rounded_full()
-            .bg(rgba(0xffffff22))
-            .text_color(white())
-            .child(
-                svg()
-                    .path(icon_path)
-                    .w(px(16.0))
-                    .h(px(16.0))
-                    // svg 元素自身必须设 text_color，否则 gpui 不渲染（svg.rs:119）。
-                    .text_color(white()),
-            );
+        /// 控制条圆形图标按钮（28px，半透明白底，染白图标）。
+        fn icon_btn(id: &'static str, icon: &str) -> Stateful<Div> {
+            div()
+                .id(id)
+                .w(px(28.0))
+                .h(px(28.0))
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(rgba(0xffffff22))
+                .text_color(white())
+                .child(
+                    svg()
+                        .path(icon)
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        // svg 元素自身必须设 text_color，否则 gpui 不渲染（svg.rs:119）。
+                        .text_color(white()),
+                )
+        }
+
+        // 播放/暂停按钮。
+        let mut btn = icon_btn("toggle", icon_path);
         if let Some(toggle) = self.on_toggle {
             let ctrl = self.controller.clone();
             btn = btn.on_mouse_up(
@@ -94,6 +105,65 @@ impl RenderOnce for PlaybackControls {
                     c.update(cx, |c, _| toggle(c));
                 },
             );
+        }
+
+        // 静音按钮（独立、常用，不放进菜单）。
+        let ctrl_for_volume = self.controller.clone();
+        let volume_btn = icon_btn("volume", volume_icon).on_mouse_up(
+            MouseButton::Left,
+            move |_, _, cx| {
+                ctrl_for_volume.update(cx, |c, _| c.toggle_mute());
+            },
+        );
+
+        // 「更多」按钮（竖排三点 kebab），弹出浮层菜单。
+        let ctrl_for_more = self.controller.clone();
+        let mut more_btn = icon_btn("more", ICON_MORE)
+            .relative() // 让内部 anchored 浮层以本按钮为定位参照
+            // 用 mouse_down 切换并在按钮上掐断冒泡：这样点按钮不会先触发外层
+            // 的「点外部关闭」，从而稳定地开/关菜单（而非开→关抵消）。
+            .on_mouse_down(
+                MouseButton::Left,
+                move |_, _, cx| {
+                    cx.stop_propagation();
+                    ctrl_for_more.update(cx, |c, _| c.toggle_menu());
+                },
+            );
+        if menu_open {
+            // 浮层菜单：直接作为 more_btn(relative) 的 absolute 子元素，相对按钮定位——
+            // 贴着按钮正上方、右对齐弹出。比 anchored() 在此处的 Local 模式更可控
+            // （anchored 用的 bounds.origin 是自身布局原点而非按钮视觉位置，在 flex
+            // 居中下会偏移到左上方）。菜单项第一个控制倍速，其余为占位/可扩展。
+            let ctrl_for_menu = self.controller.clone();
+            let speed_label = format!("{}x", ctrl.speed());
+            let menu = div()
+                .id("more-menu")
+                .absolute()
+                .bottom(px(28.0)) // 菜单底边=按钮顶边，紧贴正上方
+                .right(px(0.0)) // 右对齐按钮
+                .flex()
+                .flex_col()
+                .min_w(px(160.0))
+                .overflow_hidden()
+                // 无圆角 + 半透明背景（88≈53% 不透明），叠加在控制条渐变之上仍清晰。
+                .bg(rgba(0x1e1e1e88))
+                .text_color(white())
+                // 第一个菜单项：循环切换播放速度（1→1.25→1.5→2→0.5→1）。
+                // 切换后保持菜单打开，方便连续点击看效果；点外部才关闭。
+                .child(menu_item(
+                    speed_label,
+                    ctrl_for_menu.clone(),
+                    |c| {
+                        c.cycle_speed();
+                    },
+                ))
+                // 其余菜单项占位，下一轮逐个填（如全屏、音轨选择等）。
+                .child(menu_item(
+                    "占位项".to_string(),
+                    ctrl_for_menu.clone(),
+                    |c| c.close_menu(),
+                ));
+            more_btn = more_btn.child(menu);
         }
 
         // 两行控制条：上行「按钮 + 时间」，下行「进度条」。
@@ -111,7 +181,7 @@ impl RenderOnce for PlaybackControls {
                 linear_color_stop(rgba(0x00000000), 0.0),
                 linear_color_stop(rgba(0x00000066), 1.0),
             ))
-            // 上行：按钮靠左，时间文本右对齐（占满宽）。
+            // 上行：播放按钮 + 时间（左对齐），中间撑开，右侧是静音 + 更多按钮。
             .child(
                 div()
                     .w_full()
@@ -122,13 +192,15 @@ impl RenderOnce for PlaybackControls {
                     .child(btn)
                     .child(
                         div()
-                            .flex_1()
+                            .flex_none()
                             .flex()
-                            .justify_end()
                             .text_size(px(12.0))
                             .text_color(white())
                             .child(time_text),
-                    ),
+                    )
+                    .child(div().flex_1().w(px(0.0)))
+                    .child(volume_btn)
+                    .child(more_btn),
             )
             // 下行：进度条占满宽，细轨道。thumb 12px、轨道 4px。
             .child(
@@ -144,4 +216,34 @@ impl RenderOnce for PlaybackControls {
                     ),
             )
     }
+}
+
+/// 浮层菜单项：单行可点击文本。点击时通过 `on_click` 驱动控制器（如切倍速、
+/// 关菜单）。`label` 可为动态文本（如「倍速 1.5x」）。
+fn menu_item(
+    label: impl Into<SharedString>,
+    ctrl: Entity<PlayerController>,
+    on_click: impl Fn(&mut PlayerController) + 'static,
+) -> Stateful<Div> {
+    let label: SharedString = label.into();
+    div()
+        .id(label.clone())
+        .px(px(12.0))
+        .py(px(6.0))
+        .text_size(px(13.0))
+        // 掐断 mousedown 冒泡：否则会先触发外层 Player 的「点外部关闭」，
+        // 菜单在 mouseup 前就被收走，导致点击既不变速、文字也不刷新。
+        .on_mouse_down(
+            MouseButton::Left,
+            |_, _, cx| {
+                cx.stop_propagation();
+            },
+        )
+        .on_mouse_up(
+            MouseButton::Left,
+            move |_, _, cx| {
+                ctrl.update(cx, |c, _| on_click(c));
+            },
+        )
+        .child(label)
 }

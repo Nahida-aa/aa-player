@@ -391,6 +391,14 @@ impl FfmpegSource {
         self.cancel.clone()
     }
 
+    /// 设置播放速度倍率（转发到音频重采样器）。无音轨时静默忽略——
+    /// 视频流无变速概念，音频主时钟不存在时本就是墙钟、按真实时间走。
+    pub fn set_speed(&mut self, speed: f64) {
+        if let Some(a) = self.audio.as_mut() {
+            a.decoder.set_speed(speed);
+        }
+    }
+
     /// 看看两个解码器里有没有已经解好、可以直接交付的东西。
     ///
     /// 视频优先只是个任意选择：同一轮里两者都有产出的情况很少，
