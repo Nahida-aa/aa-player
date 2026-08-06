@@ -18,6 +18,28 @@ use tracing::info;
 
 use assets::Assets;
 use gpui_video::{Player, TimeFormat};
+use ui_gpui::Assets as UiAssets;
+
+/// 组合资源源：先查 ui-gpui 内嵌资源（图标等），再查本应用资源（logo 等）。
+///
+/// gpui 的 `svg().path(...)` 只认 `with_assets(...)` 注册的 `AssetSource`，
+/// 而 ui-gpui 的图标内嵌在它自己的 `Assets` 里，故需把两者组合进来。
+struct CombinedAssets;
+
+impl gpui::AssetSource for CombinedAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if let Some(data) = UiAssets.load(path)? {
+            return Ok(Some(data));
+        }
+        Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
+        let mut items = UiAssets.list(path)?;
+        items.extend(Assets.list(path)?);
+        Ok(items)
+    }
+}
 
 /// 播放器的命令行参数。
 #[derive(Parser)]
@@ -63,7 +85,7 @@ fn main() {
 
     application()
         // 提供内嵌资源（图标/字体），供组件的 svg().path("icons/…") 与文本渲染。
-        .with_assets(Assets)
+        .with_assets(CombinedAssets)
         .run(move |cx: &mut App| {
             // 加载内嵌字体，保证时间文本等正常渲染。
             let _ = Assets.load_fonts(cx);

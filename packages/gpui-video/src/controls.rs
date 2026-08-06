@@ -8,21 +8,14 @@
 
 use gpui::{
     ClipboardItem, Div, Entity, IntoElement, MouseButton, RenderOnce, SharedString, Stateful,
-    Window, div, linear_color_stop, linear_gradient, prelude::*, px, rgba, svg, white,
+    Window, div, linear_color_stop, linear_gradient, prelude::*, px, rgba, white,
 };
 use std::time::Duration;
 
-use ui_gpui::{Slider, SliderState};
+use ui_gpui::{Icon, IconName, Slider, SliderState};
 
 use crate::controller::PlayerController;
 use crate::player::TimeFormat;
-
-/// 图标资源路径（内嵌 via asset source，`Application::new().with_assets(…)` 提供）。
-const ICON_PLAY: &str = "icons/play_filled.svg";
-const ICON_PAUSE: &str = "icons/debug_pause.svg";
-const ICON_VOLUME_ON: &str = "icons/audio_on.svg";
-const ICON_VOLUME_OFF: &str = "icons/audio_off.svg";
-const ICON_MORE: &str = "icons/ellipsis_vertical.svg";
 
 /// 播放/暂停按钮回调：驱动控制器切换播放状态。
 type ToggleHandler = Box<dyn Fn(&mut PlayerController) + 'static>;
@@ -76,13 +69,21 @@ impl RenderOnce for PlaybackControls {
             timecode(position, fps, self.time_format),
             timecode(duration, fps, self.time_format),
         );
-        let icon_path = if paused { ICON_PLAY } else { ICON_PAUSE };
+        let icon_name = if paused {
+            IconName::Play
+        } else {
+            IconName::Pause
+        };
         let muted = ctrl.is_muted();
         let menu_open = ctrl.is_menu_open();
-        let volume_icon = if muted { ICON_VOLUME_OFF } else { ICON_VOLUME_ON };
+        let volume_icon = if muted {
+            IconName::VolumeOff
+        } else {
+            IconName::VolumeOn
+        };
 
         /// 控制条圆形图标按钮（28px，半透明白底，染白图标）。
-        fn icon_btn(id: &'static str, icon: &str) -> Stateful<Div> {
+        fn icon_btn(id: &'static str, icon: IconName) -> Stateful<Div> {
             div()
                 .id(id)
                 .w(px(28.0))
@@ -95,17 +96,15 @@ impl RenderOnce for PlaybackControls {
                 .bg(rgba(0xffffff22))
                 .text_color(white())
                 .child(
-                    svg()
-                        .path(icon)
-                        .w(px(16.0))
-                        .h(px(16.0))
+                    Icon::new(icon)
+                        .size(px(16.0))
                         // svg 元素自身必须设 text_color，否则 gpui 不渲染（svg.rs:119）。
-                        .text_color(white()),
+                        .color(white()),
                 )
         }
 
         // 播放/暂停按钮。
-        let mut btn = icon_btn("toggle", icon_path);
+        let mut btn = icon_btn("toggle", icon_name);
         if let Some(toggle) = self.on_toggle {
             let ctrl = self.controller.clone();
             btn = btn.on_mouse_up(
@@ -128,7 +127,7 @@ impl RenderOnce for PlaybackControls {
 
         // 「更多」按钮（竖排三点 kebab），弹出浮层菜单。
         let ctrl_for_more = self.controller.clone();
-        let mut more_btn = icon_btn("more", ICON_MORE)
+        let mut more_btn = icon_btn("more", IconName::More)
             .relative() // 让内部 anchored 浮层以本按钮为定位参照
             // 用 mouse_down 切换并在按钮上掐断冒泡：这样点按钮不会先触发外层
             // 的「点外部关闭」，从而稳定地开/关菜单（而非开→关抵消）。

@@ -10,10 +10,10 @@ description = "可复用的 GPUI 视频播放器组件（controller + 渲染 + �
 # 同 workspace：媒体内核（FFmpeg 解码/时钟/seek）。
 player-core = { path = "../player-core" }
 
-# 跨仓库：gpui_learn 的自研控件库（进度条/按钮），与 aa-player 同源 gpui。
-# 走 GitHub git 源（锁到具体 commit，保证可复现；改 ui-gpui 后需先 push
-# gpui_learn 再更新此 rev）。
-ui-gpui = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "e5fb06e" }
+# 跨仓库：gpui_learn 的自研控件库（进度条/按钮/图标），与 aa-player 同源 gpui。
+# 本地校验阶段指向 gpui_learn 工作区副本；发布前需 push gpui_learn 并改回
+# git 源（锁到新 commit，保证可复现）。
+ui-gpui = { path = "../../../gpui_learn/packages/ui-gpui" }
 
 # 同源本地资产嵌入 crate（AssetSource），供 svg().path("icons/…")
 # 内嵌加载图标（对齐 zed/gpui-component，而非运行时磁盘路径）。

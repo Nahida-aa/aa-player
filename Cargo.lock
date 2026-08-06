@@ -15,6 +15,7 @@ dependencies = [
  "rfd",
  "tracing",
  "tracing-subscriber",
+ "ui-gpui",
  "wasm-bindgen",
 ]
 
@@ -6370,10 +6371,11 @@ dependencies = [
 [[package]]
 name = "ui-gpui"
 version = "0.1.0"
-source = "git+https://github.com/Nahida-aa/gpui_learn?rev=e5fb06e#e5fb06ea5a17d97c8260bf67210c39cb4f8ef1b1"
 dependencies = [
+ "anyhow",
  "gpui",
  "gpui_macros",
+ "rust-embed",
 ]
 
 [[package]]
