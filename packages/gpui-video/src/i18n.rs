@@ -70,7 +70,7 @@ impl Lang {
 pub enum StrKey {
     /// 「倍速」菜单项前缀（后接 " 1x"）。
     Speed,
-    /// 「info」信息面板菜单项 / 面板标题。
+    /// 「info」信息面板菜单项（随语言切换）。
     Info,
     /// 「步长」菜单项前缀（后接 " 5s"）。
     Step,
@@ -127,7 +127,7 @@ impl I18n {
     /// 顺序必须与枚举变体声明一致，否则键会错位。
     const TABLE: [[&'static str; 6]; 2] = [
         // Zh
-        ["倍速", "info", "步长", "语言", "分辨率", "帧率"],
+        ["倍速", "信息", "步长", "语言", "分辨率", "帧率"],
         // En
         ["Speed", "Info", "Step", "Language", "Resolution", "FPS"],
     ];

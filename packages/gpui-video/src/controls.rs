@@ -163,7 +163,7 @@ impl RenderOnce for PlaybackControls {
             // 居中下会偏移到左上方）。菜单项均按当前语言取文本（见 [`crate::i18n`]）。
             let ctrl_for_menu = self.controller.clone();
             let lang = ctrl.lang();
-            let speed_label = format!("{} {}", ctrl.t(crate::i18n::StrKey::Speed), ctrl.speed());
+            let speed_label = format!("{} {}x", ctrl.t(crate::i18n::StrKey::Speed), ctrl.speed());
             let menu = div()
                 .id("more-menu")
                 .absolute()
@@ -211,7 +211,8 @@ impl RenderOnce for PlaybackControls {
                         c.cycle_lang();
                     },
                 ))
-                // 其余菜单项：info 信息面板。点它关闭更多菜单、打开 info 面板。
+                // 其余菜单项：info 信息面板。随语言切换（info/Info）；
+                // 点它关闭更多菜单、打开 info 面板。
                 .child(menu_item(
                     ctrl.t(crate::i18n::StrKey::Info).to_string(),
                     ctrl_for_menu.clone(),
@@ -286,7 +287,6 @@ impl RenderOnce for PlaybackControls {
             // info 信息面板：点更多菜单里的 info 项展开，显示当前能分析到的视频信息。
             .when(ctrl.is_info_open(), |this| {
                 let (vw, vh) = ctrl.video_size();
-                let speed = ctrl.speed();
                 this.child(
                     div()
                         .id("info-panel")
@@ -311,11 +311,6 @@ impl RenderOnce for PlaybackControls {
                             "{}: {:.2} fps",
                             ctrl.t(crate::i18n::StrKey::Fps),
                             fps
-                        )))
-                        .child(info_line(format!(
-                            "{}: {}x",
-                            ctrl.t(crate::i18n::StrKey::Speed),
-                            speed
                         ))),
                 )
             })
