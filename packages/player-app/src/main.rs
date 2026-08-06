@@ -1,15 +1,8 @@
 //! player-app —— aa-player 的 GPUI 图形界面入口。
 //!
-//! 模块划分：
-//!   - [`playback`]     ：解码线程与 PTS 时间轴（播放管线）
-//!   - [`view`]         ：GPUI 视图，负责上屏
-//!   - [`stats`]        ：性能统计与卡顿判定
-//!   - [`render_image`] ：解码帧 → GPUI 纹理
-
-mod playback;
-mod render_image;
-mod stats;
-mod view;
+//! 本二进制只做窗口/资源/命令行装配，真正的播放（解码线程、音频主时钟、
+//! 视频上屏、控制条）全部交给可复用组件 `gpui_video::Player`。组件内部已自带
+//! 解码/渲染性能统计与卡顿日志，这里不再单独实现。
 
 use std::path::PathBuf;
 
@@ -18,7 +11,8 @@ use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, size};
 use gpui_platform::application;
 use tracing::info;
 
-use crate::view::PlayerView;
+use assets::Assets;
+use gpui_video::Player;
 
 /// 播放器的命令行参数。
 #[derive(Parser)]
@@ -67,16 +61,22 @@ fn main() {
     };
     info!(path = %path.display(), "播放");
 
-    application().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(1280.0.into(), 720.0.into()), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |window, cx| cx.new(|cx| PlayerView::new(path.clone(), window, cx)),
-        )
-        .unwrap();
-        cx.activate(true);
-    });
+    application()
+        // 提供内嵌资源（图标/字体），供组件的 svg().path("icons/…") 与文本渲染。
+        .with_assets(Assets)
+        .run(move |cx: &mut App| {
+            // 加载内嵌字体，保证时间文本等正常渲染。
+            let _ = Assets.load_fonts(cx);
+
+            let bounds = Bounds::centered(None, size(1280.0.into(), 720.0.into()), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                |window, cx| cx.new(|cx| Player::new(path.clone(), window, cx)),
+            )
+            .unwrap();
+            cx.activate(true);
+        });
 }
