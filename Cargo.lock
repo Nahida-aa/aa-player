@@ -6,7 +6,7 @@ version = 4
 name = "aa-player"
 version = "0.1.0"
 dependencies = [
- "assets",
+ "assets 0.1.0",
  "clap",
  "gpui",
  "gpui-video",
@@ -384,6 +384,16 @@ dependencies = [
 [[package]]
 name = "assets"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "rust-embed",
+]
+
+[[package]]
+name = "assets"
+version = "0.1.0"
+source = "git+https://github.com/Nahida-aa/gpui_learn?rev=315d3a6#315d3a68fe7dab518cc7d59b342c6fda400c2725"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2506,7 +2516,7 @@ name = "gpui-video"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "assets",
+ "assets 0.1.0",
  "env_logger",
  "ffmpeg-next",
  "futures",
@@ -6371,12 +6381,11 @@ dependencies = [
 [[package]]
 name = "ui-gpui"
 version = "0.1.0"
-source = "git+https://github.com/Nahida-aa/gpui_learn?rev=128d011#128d011781bc3f0bcbd649b97b96f21ba3503fad"
+source = "git+https://github.com/Nahida-aa/gpui_learn?rev=315d3a6#315d3a68fe7dab518cc7d59b342c6fda400c2725"
 dependencies = [
- "anyhow",
+ "assets 0.1.0 (git+https://github.com/Nahida-aa/gpui_learn?rev=315d3a6)",
  "gpui",
  "gpui_macros",
- "rust-embed",
 ]
 
 [[package]]
