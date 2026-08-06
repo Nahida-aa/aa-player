@@ -145,6 +145,8 @@ pub struct PlayerController {
     menu_open: bool,
     /// 播放速度倍率（1.0=原速）。经 SetSpeed 命令下发到解码线程改音频重采样率。
     speed: f64,
+    /// 「info」信息面板是否展开（UI 状态，供控制条条件渲染浮层）。
+    info_open: bool,
     /// 最近一次 seek 的代次（每次 seek_preview/seek_to 自增）。帧携带自己所属
     /// 的 seek 代次，`consume_frame` 据此丢弃 seek 前在途的旧帧（不覆盖 position）。
     seek_gen: u64,
@@ -196,6 +198,7 @@ impl PlayerController {
                 muted: false,
                 menu_open: false,
                 speed: 1.0,
+                info_open: false,
                 seek_gen: 0,
                 cancel_seek,
                 clock,
@@ -294,6 +297,21 @@ impl PlayerController {
             .unwrap_or(0);
         let next = Self::SPEED_STEPS[(idx + 1) % Self::SPEED_STEPS.len()];
         self.set_speed(next);
+    }
+
+    /// 「info」信息面板是否展开。
+    pub fn is_info_open(&self) -> bool {
+        self.info_open
+    }
+
+    /// 切换「info」信息面板（点更多菜单里的 info 项时调用）。
+    pub fn toggle_info(&mut self) {
+        self.info_open = !self.info_open;
+    }
+
+    /// 关闭「info」信息面板（点击外部时调用）。
+    pub fn close_info(&mut self) {
+        self.info_open = false;
     }
 
     // ----- 控制 -----

@@ -323,13 +323,16 @@ impl Render for Player {
                 this.on_key(e, cx);
                 cx.notify();
             }))
-            // 点击播放区（菜单外）关闭「更多」浮层。按钮自身在 mouse_down 已
-            // stop_propagation，故点按钮不会触发这里，菜单开/关稳定。
+            // 点击播放区（浮层外）关闭「更多」菜单与「info」面板。按钮/菜单项
+            // 自身在 mouse_down 已 stop_propagation，故点它们不会触发这里。
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event, _window, cx| {
                 if this.controller.read(cx).is_menu_open() {
                     this.controller.update(cx, |c, _| c.close_menu());
+                }
+                if this.controller.read(cx).is_info_open() {
+                    this.controller.update(cx, |c, _| c.close_info());
                 }
             }))
             .child(

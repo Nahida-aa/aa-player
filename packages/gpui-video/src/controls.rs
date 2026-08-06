@@ -157,11 +157,14 @@ impl RenderOnce for PlaybackControls {
                         c.cycle_speed();
                     },
                 ))
-                // 其余菜单项占位，下一轮逐个填（如全屏、音轨选择等）。
+                // 其余菜单项：info 信息面板。点它关闭更多菜单、打开 info 面板。
                 .child(menu_item(
-                    "占位项".to_string(),
+                    "info".to_string(),
                     ctrl_for_menu.clone(),
-                    |c| c.close_menu(),
+                    |c| {
+                        c.close_menu();
+                        c.toggle_info();
+                    },
                 ));
             more_btn = more_btn.child(menu);
         }
@@ -171,6 +174,7 @@ impl RenderOnce for PlaybackControls {
             .w_full()
             .flex()
             .flex_col()
+            .relative() // 让 info 信息面板 absolute 以控制条为定位参照
             .gap(px(2.0))
             .pt(px(6.0))
             .pb(px(8.0))
@@ -215,6 +219,40 @@ impl RenderOnce for PlaybackControls {
                             .track_size(px(4.0)),
                     ),
             )
+            // info 信息面板：点更多菜单里的 info 项展开，显示当前能分析到的视频信息。
+            .when(ctrl.is_info_open(), |this| {
+                let (vw, vh) = ctrl.video_size();
+                let dur = ctrl.duration();
+                let pos = ctrl.position();
+                let speed = ctrl.speed();
+                this.child(
+                    div()
+                        .id("info-panel")
+                        .absolute()
+                        .bottom(px(40.0)) // 浮在控制条上方
+                        .right(px(12.0))
+                        .flex()
+                        .flex_col()
+                        .min_w(px(180.0))
+                        .overflow_hidden()
+                        // 与更多菜单同款风格：无圆角、半透明背景。
+                        .bg(rgba(0x1e1e1e88))
+                        .text_color(white())
+                        .text_size(px(12.0))
+                        .child(info_line(format!("分辨率: {}x{}", vw, vh)))
+                        .child(info_line(format!(
+                            "时长: {:02}:{:02}",
+                            dur.as_secs() / 60,
+                            dur.as_secs() % 60
+                        )))
+                        .child(info_line(format!(
+                            "位置: {:02}:{:02}",
+                            pos.as_secs() / 60,
+                            pos.as_secs() % 60
+                        )))
+                        .child(info_line(format!("倍速: {}x", speed))),
+                )
+            })
     }
 }
 
@@ -246,4 +284,12 @@ fn menu_item(
             },
         )
         .child(label)
+}
+
+/// info 信息面板里的单行文本（左对齐、内边距）。
+fn info_line(text: String) -> Div {
+    div()
+        .px(px(12.0))
+        .py(px(4.0))
+        .child(text)
 }
