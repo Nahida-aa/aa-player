@@ -12,7 +12,7 @@ gpui-video = { path = "../gpui-video" }
 # 内嵌资源：图标(svg)与字体，供组件与文本渲染使用。同源本地 crate。
 assets = { path = "../assets" }
 # 复用 ui-gpui 的 Icon 控件与图标资源（组合进 with_assets 的 AssetSource）。
-ui-gpui = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "315d3a6" }
+ui-gpui = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "c5c412e" }
 
 gpui.workspace = true
 
