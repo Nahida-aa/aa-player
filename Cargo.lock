@@ -393,7 +393,7 @@ dependencies = [
 [[package]]
 name = "assets"
 version = "0.1.0"
-source = "git+https://github.com/Nahida-aa/gpui_learn?rev=c5c412e#c5c412e7adf16182b937d6f63409aed91ed978df"
+source = "git+https://github.com/Nahida-aa/gpui_learn?rev=7869597#7869597d8fd5ae1919c9d91adf89eed9e12718d0"
 dependencies = [
  "anyhow",
  "gpui",
@@ -6381,9 +6381,9 @@ dependencies = [
 [[package]]
 name = "ui-gpui"
 version = "0.1.0"
-source = "git+https://github.com/Nahida-aa/gpui_learn?rev=c5c412e#c5c412e7adf16182b937d6f63409aed91ed978df"
+source = "git+https://github.com/Nahida-aa/gpui_learn?rev=7869597#7869597d8fd5ae1919c9d91adf89eed9e12718d0"
 dependencies = [
- "assets 0.1.0 (git+https://github.com/Nahida-aa/gpui_learn?rev=c5c412e)",
+ "assets 0.1.0 (git+https://github.com/Nahida-aa/gpui_learn?rev=7869597)",
  "gpui",
  "gpui_macros",
 ]
