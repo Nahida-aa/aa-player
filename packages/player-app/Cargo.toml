@@ -9,8 +9,8 @@ publish = false
 [dependencies]
 # 复用自包含播放器组件（内含解码线程/音频时钟/画面/控制条/统计）。
 gpui-video = { path = "../gpui-video" }
-# 内嵌资源：图标(svg)与字体，供组件与文本渲染使用。
-assets = { path = "../../../gpui_learn/crates/assets" }
+# 内嵌资源：图标(svg)与字体，供组件与文本渲染使用。走 GitHub git 源。
+assets = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "e5fb06e" }
 
 gpui.workspace = true
 

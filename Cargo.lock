@@ -345,6 +345,7 @@ dependencies = [
 [[package]]
 name = "assets"
 version = "0.1.0"
+source = "git+https://github.com/Nahida-aa/gpui_learn?rev=e5fb06e#e5fb06ea5a17d97c8260bf67210c39cb4f8ef1b1"
 dependencies = [
  "anyhow",
  "gpui",
@@ -4505,15 +4506,11 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 name = "player-app"
 version = "0.1.0"
 dependencies = [
- "anyhow",
+ "assets",
  "clap",
- "futures",
  "gpui",
+ "gpui-video",
  "gpui_platform",
- "gpui_util",
- "image",
- "player-core",
- "smallvec",
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen",
@@ -6325,6 +6322,7 @@ dependencies = [
 [[package]]
 name = "ui-gpui"
 version = "0.1.0"
+source = "git+https://github.com/Nahida-aa/gpui_learn?rev=e5fb06e#e5fb06ea5a17d97c8260bf67210c39cb4f8ef1b1"
 dependencies = [
  "gpui",
  "gpui_macros",
