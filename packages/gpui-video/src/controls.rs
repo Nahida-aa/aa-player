@@ -116,6 +116,24 @@ impl RenderOnce for PlaybackControls {
             );
         }
 
+        // 快退按钮（按当前步长向后跳一步）。
+        let ctrl_for_rewind = self.controller.clone();
+        let rewind_btn = icon_btn("rewind", IconName::Rewind).on_mouse_up(
+            MouseButton::Left,
+            move |_, _, cx| {
+                ctrl_for_rewind.update(cx, |c, _| c.seek_backward_step());
+            },
+        );
+
+        // 快进按钮（按当前步长向前跳一步）。
+        let ctrl_for_forward = self.controller.clone();
+        let forward_btn = icon_btn("forward", IconName::FastForward).on_mouse_up(
+            MouseButton::Left,
+            move |_, _, cx| {
+                ctrl_for_forward.update(cx, |c, _| c.seek_forward_step());
+            },
+        );
+
         // 静音按钮（独立、常用，不放进菜单）。
         let ctrl_for_volume = self.controller.clone();
         let volume_btn = icon_btn("volume", volume_icon).on_mouse_up(
@@ -142,9 +160,10 @@ impl RenderOnce for PlaybackControls {
             // 浮层菜单：直接作为 more_btn(relative) 的 absolute 子元素，相对按钮定位——
             // 贴着按钮正上方、右对齐弹出。比 anchored() 在此处的 Local 模式更可控
             // （anchored 用的 bounds.origin 是自身布局原点而非按钮视觉位置，在 flex
-            // 居中下会偏移到左上方）。菜单项第一个控制倍速，其余为占位/可扩展。
+            // 居中下会偏移到左上方）。菜单项均按当前语言取文本（见 [`crate::i18n`]）。
             let ctrl_for_menu = self.controller.clone();
-            let speed_label = format!("{}x", ctrl.speed());
+            let lang = ctrl.lang();
+            let speed_label = format!("{} {}", ctrl.t(crate::i18n::StrKey::Speed), ctrl.speed());
             let menu = div()
                 .id("more-menu")
                 .absolute()
@@ -166,9 +185,35 @@ impl RenderOnce for PlaybackControls {
                         c.cycle_speed();
                     },
                 ))
+                // 「步长」菜单项：循环切换快进/快退步长
+                // （1帧→1ms→100ms→5s→10s→30s→1帧）。与倍速一样，切换后保持
+                // 菜单打开，方便连续点击；点外部才关闭。
+                .child(menu_item(
+                    format!(
+                        "{} {}",
+                        ctrl.t(crate::i18n::StrKey::Step),
+                        ctrl.seek_step().label(lang)
+                    ),
+                    ctrl_for_menu.clone(),
+                    |c| {
+                        c.cycle_seek_step();
+                    },
+                ))
+                // 「语言」菜单项：在中/英之间循环切换界面语言。
+                .child(menu_item(
+                    format!(
+                        "{} {}",
+                        ctrl.t(crate::i18n::StrKey::Language),
+                        lang.label()
+                    ),
+                    ctrl_for_menu.clone(),
+                    |c| {
+                        c.cycle_lang();
+                    },
+                ))
                 // 其余菜单项：info 信息面板。点它关闭更多菜单、打开 info 面板。
                 .child(menu_item(
-                    "info".to_string(),
+                    ctrl.t(crate::i18n::StrKey::Info).to_string(),
                     ctrl_for_menu.clone(),
                     |c| {
                         c.close_menu();
@@ -202,7 +247,9 @@ impl RenderOnce for PlaybackControls {
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
+                    .child(rewind_btn)
                     .child(btn)
+                    .child(forward_btn)
                     .child(
                         div()
                             .flex_none()
@@ -254,9 +301,22 @@ impl RenderOnce for PlaybackControls {
                         .bg(rgba(0x1e1e1e88))
                         .text_color(white())
                         .text_size(px(12.0))
-                        .child(info_line(format!("分辨率: {}x{}", vw, vh)))
-                        .child(info_line(format!("帧率: {:.2} fps", fps)))
-                        .child(info_line(format!("倍速: {}x", speed))),
+                        .child(info_line(format!(
+                            "{}: {}x{}",
+                            ctrl.t(crate::i18n::StrKey::Resolution),
+                            vw,
+                            vh
+                        )))
+                        .child(info_line(format!(
+                            "{}: {:.2} fps",
+                            ctrl.t(crate::i18n::StrKey::Fps),
+                            fps
+                        )))
+                        .child(info_line(format!(
+                            "{}: {}x",
+                            ctrl.t(crate::i18n::StrKey::Speed),
+                            speed
+                        ))),
                 )
             })
     }

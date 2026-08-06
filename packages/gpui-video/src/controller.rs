@@ -20,6 +20,7 @@ use player_core::{
     AudioClock, AudioOutput, DecodedFrame, FfmpegSource, MediaEvent, MediaSource, SeekCancelled,
 };
 
+use crate::i18n::{I18n, Lang, StrKey};
 use crate::stats::ProfileStats;
 
 /// 帧队列容量。故意浅：渲染侧按 PTS 等待，队列几乎总是满的（背压）。
@@ -61,6 +62,54 @@ pub enum PlayerCommand {
     SetMuted(bool),
     /// 设置播放速度倍率（作用于音频重采样输出率，视频随音频主时钟同步）。
     SetSpeed(f64),
+}
+
+/// 快进/快退步长的表示。
+///
+/// - [`SeekStep::Frames`]：按视频帧数跳转（1 帧 = `1/fps` 秒）。fps 未知时
+///   fallback 到 30，故「1 帧」在未知 fps 下约等于 33ms。
+/// - [`SeekStep::Duration`]：固定时长（如 1ms、5s），与帧率无关。
+///
+/// 用枚举而非纯 `Duration`，是因为「跳 1 帧」这种步长无法写成固定时长——
+/// 它依赖当前视频的 fps，必须在 seek 时按 fps 换算。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekStep {
+    /// N 帧（按 fps 换算成时长）。
+    Frames(u32),
+    /// 固定时长。
+    Duration(Duration),
+}
+
+impl SeekStep {
+    /// 解析成实际跳转时长：`Frames(n)` → `n/fps` 秒（fps≤0 用 30 兜底）；
+    /// `Duration(d)` 原样返回。
+    fn resolve(self, fps: f64) -> Duration {
+        match self {
+            SeekStep::Frames(n) => {
+                let fps = if fps > 0.0 { fps } else { 30.0 };
+                Duration::from_secs_f64(n as f64 / fps)
+            }
+            SeekStep::Duration(d) => d,
+        }
+    }
+
+    /// 菜单/按钮显示的简短标签，如「1帧」「1ms」「5s」（按语言）。
+    /// `ms`/`s` 两种语言通用；「帧」在英文下显示 `frame`。
+    pub fn label(self, lang: Lang) -> String {
+        match self {
+            SeekStep::Frames(n) => {
+                let unit = if lang == Lang::Zh { "帧" } else { "f" };
+                format!("{n}{unit}")
+            }
+            SeekStep::Duration(d) => {
+                if d < Duration::from_secs(1) {
+                    format!("{}ms", d.as_millis())
+                } else {
+                    format!("{}s", d.as_secs())
+                }
+            }
+        }
+    }
 }
 
 /// 音频主时钟的交接点。
@@ -145,6 +194,12 @@ pub struct PlayerController {
     menu_open: bool,
     /// 播放速度倍率（1.0=原速）。经 SetSpeed 命令下发到解码线程改音频重采样率。
     speed: f64,
+    /// 快进/快退步长（点击控制条左右箭头一次跳转的量）。单源状态，由 UI
+    /// （更多菜单的「步长」项）切换；控制条按钮与键盘方向键共用它。
+    /// 可为「N 帧」（按当前 fps 换算成时长）或「固定时长」（如 1ms）。
+    seek_step: SeekStep,
+    /// 当前界面语言（UI 状态，供控制条菜单项按语言取文本）。
+    i18n: I18n,
     /// 「info」信息面板是否展开（UI 状态，供控制条条件渲染浮层）。
     info_open: bool,
     /// 最近一次 seek 的代次（每次 seek_preview/seek_to 自增）。帧携带自己所属
@@ -202,6 +257,8 @@ impl PlayerController {
                 muted: false,
                 menu_open: false,
                 speed: 1.0,
+                seek_step: SeekStep::Duration(Duration::from_secs(5)),
+                i18n: I18n::default(),
                 info_open: false,
                 seek_gen: 0,
                 cancel_seek,
@@ -309,6 +366,69 @@ impl PlayerController {
         self.set_speed(next);
     }
 
+    /// 快进/快退步长档位（点击更多菜单里的「步长」项时循环切换）。
+    ///
+    /// 含「1 帧」（按当前 fps 换算）、「1ms」「100ms」等细粒度，以及常用的秒级档。
+    pub const SEEK_STEP_OPTIONS: &'static [SeekStep] = &[
+        SeekStep::Frames(1),
+        SeekStep::Duration(Duration::from_millis(1)),
+        SeekStep::Duration(Duration::from_millis(100)),
+        SeekStep::Duration(Duration::from_secs(5)),
+        SeekStep::Duration(Duration::from_secs(10)),
+        SeekStep::Duration(Duration::from_secs(30)),
+    ];
+
+    /// 当前快进/快退步长。
+    pub fn seek_step(&self) -> SeekStep {
+        self.seek_step
+    }
+
+    /// 当前步长解析成实际跳转时长（Frames 按 `fps` 换算；fps≤0 时 fallback 30）。
+    pub fn seek_step_duration(&self) -> Duration {
+        self.seek_step.resolve(self.fps())
+    }
+
+    /// 设置快进/快退步长（UI 直接指定，如自定义输入）。
+    pub fn set_seek_step(&mut self, step: SeekStep) {
+        self.seek_step = step;
+    }
+
+    /// 按当前步长向前跳一步（控制条快进按钮 / 键盘右方向键调用）。
+    pub fn seek_forward_step(&mut self) {
+        self.seek_forward(self.seek_step_duration());
+    }
+
+    /// 按当前步长向后跳一步（控制条快退按钮 / 键盘左方向键调用）。
+    pub fn seek_backward_step(&mut self) {
+        self.seek_backward(self.seek_step_duration());
+    }
+
+    /// 循环切换到下一个步长档位（点击「步长」菜单项时调用）。
+    pub fn cycle_seek_step(&mut self) {
+        let idx = Self::SEEK_STEP_OPTIONS
+            .iter()
+            .position(|&s| s == self.seek_step)
+            .unwrap_or(0);
+        self.seek_step = Self::SEEK_STEP_OPTIONS[(idx + 1) % Self::SEEK_STEP_OPTIONS.len()];
+    }
+
+    // ----- i18n -----
+
+    /// 当前语言。
+    pub fn lang(&self) -> Lang {
+        self.i18n.lang()
+    }
+
+    /// 取键的译文（按当前语言）。
+    pub fn t(&self, key: StrKey) -> &'static str {
+        self.i18n.get(key)
+    }
+
+    /// 循环切换语言（点击「语言」菜单项时调用）。
+    pub fn cycle_lang(&mut self) {
+        self.i18n.cycle();
+    }
+
     /// 「info」信息面板是否展开。
     pub fn is_info_open(&self) -> bool {
         self.info_open
@@ -387,6 +507,29 @@ impl PlayerController {
     /// 结束拖动：发正式 seek，清拖动态。
     pub fn seek_release(&mut self, target: Duration) {
         self.dragging = false;
+        self.seek_to(target);
+    }
+
+    /// 相对当前位置 seek（快进/快退）。`delta_ns` 为相对偏移（纳秒），正向前、
+    /// 负向后，按 `[0, duration]` 夹紧后发正式 seek（预测 position + 推进 seek
+    /// 代次），不进拖动预览态（快进快退是一次性跳转）。
+    pub fn seek_relative(&mut self, delta_ns: i64) {
+        if delta_ns >= 0 {
+            self.seek_forward(Duration::from_nanos(delta_ns as u64));
+        } else {
+            self.seek_backward(Duration::from_nanos((-delta_ns) as u64));
+        }
+    }
+
+    /// 相对当前位置向前 seek（夹到 `[0, duration]`）。
+    pub fn seek_forward(&mut self, delta: Duration) {
+        let target = (self.position() + delta).min(self.duration);
+        self.seek_to(target);
+    }
+
+    /// 相对当前位置向后 seek（夹到 `[0, duration]`）。
+    pub fn seek_backward(&mut self, delta: Duration) {
+        let target = self.position().saturating_sub(delta);
         self.seek_to(target);
     }
 

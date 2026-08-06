@@ -21,8 +21,6 @@ use crate::surface::VideoSurface;
 
 /// 性能统计上报窗口（秒）。
 const STATS_WINDOW_SECS: u64 = 2;
-/// 键盘方向键 seek 步长（秒）。
-const SEEK_STEP: Duration = Duration::from_secs(5);
 
 /// 解码结束（EOF）时发出，供外部监听（如播放列表自动切下一集）。
 #[derive(Debug)]
@@ -275,33 +273,13 @@ impl Player {
         cx.notify();
     }
 
-    /// 相对当前位置向前 seek（键盘方向键，夹到 [0, duration]）。
-    pub fn seek_forward(&mut self, delta: Duration, cx: &mut Context<Self>) {
-        let pos = self.controller.read(cx).position();
-        let dur = self.controller.read(cx).duration();
-        let target = (pos + delta).min(dur);
-        self.seek_to(target, cx);
-    }
-
-    /// 相对当前位置向后 seek（键盘方向键，夹到 [0, duration]）。
-    pub fn seek_backward(&mut self, delta: Duration, cx: &mut Context<Self>) {
-        let pos = self.controller.read(cx).position();
-        let target = pos.saturating_sub(delta);
-        self.seek_to(target, cx);
-    }
-
-    /// 正式 seek（Commit），供点击/键盘/松开。同步 position。
-    fn seek_to(&mut self, target: Duration, cx: &mut Context<Self>) {
-        self.controller.update(cx, |c, _| c.seek_to(target));
-        cx.notify();
-    }
-
     /// 键盘快捷键处理（对齐 player-app view.rs:401-417）。
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
             "space" => self.toggle(cx),
-            "left" => self.seek_backward(SEEK_STEP, cx),
-            "right" => self.seek_forward(SEEK_STEP, cx),
+            // 左右方向键也走可配置的步长（与控制条按钮一致：1帧/1ms/…）。
+            "left" => self.controller.update(cx, |c, _| c.seek_backward_step()),
+            "right" => self.controller.update(cx, |c, _| c.seek_forward_step()),
             _ => {}
         }
     }
