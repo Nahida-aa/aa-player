@@ -11,6 +11,7 @@ dependencies = [
  "gpui",
  "gpui-video",
  "gpui_platform",
+ "image",
  "rfd",
  "tracing",
  "tracing-subscriber",

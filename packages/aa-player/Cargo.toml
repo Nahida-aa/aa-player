@@ -24,6 +24,10 @@ clap = { version = "4", features = ["derive"] }
 # 系统文件选择器（无参打开时点击选择视频）。开 OS 原生对话框。
 rfd = "0.15"
 
+# 解码 PNG 设为窗口图标（X11）。版本须与 gpui 内部 image 一致（0.25），
+# 否则 WindowOptions.icon 的 RgbaImage 类型不匹配无法编译。
+image = "0.25"
+
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 

@@ -1,0 +1,48 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Background Gradient for App Icon -->
+    <linearGradient id="bg_grad" x1="512" y1="0" x2="512" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2a2b3d"/>
+      <stop offset="100%" stop-color="#181822"/>
+    </linearGradient>
+
+    <!-- Video Frame Gradient -->
+    <linearGradient id="frame_grad" x1="200" y1="200" x2="824" y2="824" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2b2d42"/>
+      <stop offset="100%" stop-color="#1e1e2e"/>
+    </linearGradient>
+
+    <!-- Play Button Gradient -->
+    <linearGradient id="play_grad" x1="400" y1="350" x2="680" y2="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#609eff"/>
+      <stop offset="100%" stop-color="#4c8bf5"/>
+    </linearGradient>
+
+    <!-- Drop Shadow for Frame -->
+    <filter id="shadow" x="140" y="140" width="744" height="744" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="16" stdDeviation="24" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Background Layer (Dark Rounded Square for OS Integration) -->
+  <rect x="96" y="96" width="832" height="832" rx="188" fill="url(#bg_grad)" filter="url(#shadow)" />
+
+  <!-- Video Frame (Rounded Rectangle) -->
+  <g filter="url(#shadow)">
+    <rect x="220" y="272" width="584" height="480" rx="48" fill="url(#frame_grad)" stroke="#3a3d58" stroke-width="8"/>
+  </g>
+
+  <!-- Play Triangle (Dominant Focal Point) -->
+  <path d="M440 380L636 512L440 644V380Z" fill="url(#play_grad)" />
+
+  <!-- Stylized "aa" Monogram Watermark in Bottom-Right Corner of the Frame -->
+  <g transform="translate(670, 630) scale(0.85)" opacity="0.65">
+    <!-- First 'a' -->
+    <path d="M22 28C22 18 30 10 42 10C54 10 62 18 62 28V50H54V42C50 48 44 52 36 52C26 52 18 44 18 34C18 24 26 16 38 16H60" stroke="#a2a5bf" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+    <path d="M54 28V36H60V28H54Z" fill="#a2a5bf"/>
+
+    <!-- Second 'a' (interlocked / adjacent) -->
+    <path d="M68 28C68 18 76 10 88 10C100 10 108 18 108 28V50H100V42C96 48 90 52 82 52C72 52 64 44 64 34C64 24 72 16 84 16H106" stroke="#a2a5bf" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+    <path d="M100 28V36H106V28H100Z" fill="#a2a5bf"/>
+  </g>
+</svg>

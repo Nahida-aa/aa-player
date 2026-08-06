@@ -6,10 +6,12 @@
 
 use std::path::PathBuf;
 
+use std::sync::Arc;
+
 use clap::Parser;
 use gpui::{
     App, AppContext, Bounds, FocusHandle, Focusable, MouseButton, Render, Window, WindowBounds,
-    WindowOptions, div, prelude::*, rgba, size, white,
+    WindowOptions, div, prelude::*, px, rgba, size, svg, white,
 };
 use gpui_platform::application;
 use tracing::info;
@@ -25,6 +27,15 @@ struct Cli {
     /// 不传则在应用内点击选择视频文件（系统文件选择器）。
     #[arg(value_name = "VIDEO")]
     video: Option<PathBuf>,
+}
+
+/// 从内嵌资源加载窗口图标（X11）。gpui 仅 X11 支持 `WindowOptions.icon`，
+/// 且要栅格图（`RgbaImage`），故用 Gemini 生成的 PNG 孪生文件，而非矢量 logo。
+/// Wayland 下的图标由 `.desktop` 文件提供，这里设了也不影响。
+fn load_window_icon(cx: &App) -> Option<Arc<image::RgbaImage>> {
+    let bytes = cx.asset_source().load("images/Gemini_Generated_Image_1kfs201kfs201kfs.png").ok().flatten()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    Some(Arc::new(img))
 }
 
 /// 初始化日志订阅者。
@@ -58,6 +69,8 @@ fn main() {
             let _ = Assets.load_fonts(cx);
 
             let bounds = Bounds::centered(None, size(1280.0.into(), 720.0.into()), cx);
+            // 窗口图标（X11 用栅格 PNG；Wayland 由 .desktop 提供）。每个窗口创建时都设。
+            let window_icon = load_window_icon(cx);
 
             match cli.video {
                 // 传了路径：直接打开播放器（相对路径相对当前工作目录解析）。
@@ -74,6 +87,7 @@ fn main() {
                         .open_window(
                             WindowOptions {
                                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                                icon: window_icon.clone(),
                                 ..Default::default()
                             },
                             |window, cx| {
@@ -96,6 +110,7 @@ fn main() {
                     cx.open_window(
                         WindowOptions {
                             window_bounds: Some(WindowBounds::Windowed(bounds)),
+                            icon: window_icon.clone(),
                             ..Default::default()
                         },
                         |_window, cx| cx.new(|cx| Launcher::new(cx)),
@@ -167,8 +182,15 @@ impl Render for Launcher {
                 }),
             )
             .child(
+                svg()
+                    .path("images/logo.svg")
+                    .w(px(160.0))
+                    .h(px(160.0)),
+            )
+            .child(
                 div()
                     .text_xl()
+                    .mt(px(16.0))
                     .child("点击任意位置选择视频文件"),
             )
     }
