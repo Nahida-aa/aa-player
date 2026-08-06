@@ -69,14 +69,21 @@ fn main() {
             let _ = Assets.load_fonts(cx);
 
             let bounds = Bounds::centered(None, size(1280.0.into(), 720.0.into()), cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    ..Default::default()
-                },
-                |window, cx| cx.new(|cx| Player::new(path.clone(), window, cx)),
-            )
-            .unwrap();
+            let window_handle = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        ..Default::default()
+                    },
+                    |window, cx| cx.new(|cx| Player::new(path.clone(), window, cx)),
+                )
+                .unwrap();
+            // 订阅播放结束（EOF）事件，便于外部感知（如自动下一集/提示）。
+            let player = window_handle.entity(cx).unwrap();
+            cx.subscribe(&player, |_player, _event, _cx| {
+                info!("播放结束（EOF）");
+            })
+            .detach();
             cx.activate(true);
         });
 }
