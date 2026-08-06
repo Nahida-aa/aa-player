@@ -140,14 +140,14 @@ impl RenderOnce for PlaybackControls {
             let menu = div()
                 .id("more-menu")
                 .absolute()
-                .bottom(px(30.0)) // 菜单底边距按钮顶边 2px 间隔（按钮约 28px 高）
+                .bottom(px(32.0)) // 菜单底边距按钮顶边 4px 间隔（按钮约 28px 高）
                 .right(px(0.0)) // 右对齐按钮
                 .flex()
                 .flex_col()
                 .min_w(px(160.0))
                 .overflow_hidden()
-                // 无圆角 + 半透明背景（88≈53% 不透明），叠加在控制条渐变之上仍清晰。
-                .bg(rgba(0x1e1e1e88))
+                // 无圆角 + 更透明背景（44≈27% 不透明），叠加在控制条渐变之上仍可读。
+                .bg(rgba(0x1e1e1e44))
                 .text_color(white())
                 // 第一个菜单项：循环切换播放速度（1→1.25→1.5→2→0.5→1）。
                 // 切换后保持菜单打开，方便连续点击看效果；点外部才关闭。
