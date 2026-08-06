@@ -30,10 +30,10 @@ struct Cli {
 }
 
 /// 从内嵌资源加载窗口图标（X11）。gpui 仅 X11 支持 `WindowOptions.icon`，
-/// 且要栅格图（`RgbaImage`），故用 Gemini 生成的 PNG 孪生文件，而非矢量 logo。
+/// 且要栅格图（`RgbaImage`），故用 logo 的 PNG 版（`logo.png`），而非矢量 `logo.svg`。
 /// Wayland 下的图标由 `.desktop` 文件提供，这里设了也不影响。
 fn load_window_icon(cx: &App) -> Option<Arc<image::RgbaImage>> {
-    let bytes = cx.asset_source().load("images/Gemini_Generated_Image_1kfs201kfs201kfs.png").ok().flatten()?;
+    let bytes = cx.asset_source().load("images/logo.png").ok().flatten()?;
     let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
     Some(Arc::new(img))
 }

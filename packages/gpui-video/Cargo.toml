@@ -15,9 +15,9 @@ player-core = { path = "../player-core" }
 # gpui_learn 再更新此 rev）。
 ui-gpui = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "e5fb06e" }
 
-# 跨仓库：gpui_learn 的资产嵌入 crate（AssetSource），供 svg().path("icons/…")
+# 同源本地资产嵌入 crate（AssetSource），供 svg().path("icons/…")
 # 内嵌加载图标（对齐 zed/gpui-component，而非运行时磁盘路径）。
-assets = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "e5fb06e" }
+assets = { path = "../assets" }
 
 gpui = { workspace = true }
 anyhow = { workspace = true }
@@ -35,7 +35,7 @@ futures = "0.3"
 [dev-dependencies]
 env_logger = "0.11"
 # example 用 asset source 加载图标/字体。
-assets = { git = "https://github.com/Nahida-aa/gpui_learn", rev = "e5fb06e" }
+assets = { path = "../assets" }
 # 桌面窗口后端（example 用 application() 入口）。
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dev-dependencies]
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
