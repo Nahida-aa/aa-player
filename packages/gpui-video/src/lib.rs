@@ -16,6 +16,6 @@ pub mod surface;
 
 pub use controller::{AudioClockSource, PlayerController};
 pub use playback_clock::{PlaybackClock, Schedule};
-pub use player::{PlaybackEnded, Player};
+pub use player::{PlaybackEnded, Player, TimeFormat};
 pub use stats::{ProfileStats, Snapshot};
 pub use surface::VideoSurface;

@@ -12,7 +12,7 @@ use gpui_platform::application;
 use tracing::info;
 
 use assets::Assets;
-use gpui_video::Player;
+use gpui_video::{Player, TimeFormat};
 
 /// 播放器的命令行参数。
 #[derive(Parser)]
@@ -75,7 +75,12 @@ fn main() {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
                         ..Default::default()
                     },
-                    |window, cx| cx.new(|cx| Player::new(path.clone(), window, cx)),
+                    |window, cx| {
+                    cx.new(|cx| {
+                        Player::new(path.clone(), window, cx)
+                            .time_format(TimeFormat::FrameMillis)
+                    })
+                },
                 )
                 .unwrap();
             // 订阅播放结束（EOF）事件，便于外部感知（如自动下一集/提示）。

@@ -30,6 +30,20 @@ pub struct PlaybackEnded;
 
 impl EventEmitter<PlaybackEnded> for Player {}
 
+/// 控制条时间文本的显示格式。
+///
+/// - [`TimeFormat::Frame`]：`mm:ss:ff`（ff = 帧），默认。
+/// - [`TimeFormat::FrameMillis`]：`mm:ss:ff,mmm,mmm`（第一个 mmm = 秒内毫秒，
+///   第二个 mmm = 当前原始毫秒/总位置）。供 player-app 等需要更精细时间戳的场景。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimeFormat {
+    /// `mm:ss:ff`（ff = 帧）。
+    #[default]
+    Frame,
+    /// `mm:ss:ff,mmm,mmm`。
+    FrameMillis,
+}
+
 /// 播放器视图：给一个视频路径即可用。
 pub struct Player {
     /// 无 GUI 播放状态机。
@@ -46,6 +60,8 @@ pub struct Player {
     /// 控制条是否可见：默认隐藏，鼠标移入控制区才显示（移出后隐藏）。
     /// 菜单/info 打开时强制可见，避免失焦即收起。
     controls_visible: bool,
+    /// 控制条时间文本格式，默认 [`TimeFormat::Frame`]（`mm:ss:ff`）。
+    time_format: TimeFormat,
 }
 
 impl Player {
@@ -217,6 +233,7 @@ impl Player {
             _render_task,
             focus_handle,
             controls_visible: false,
+            time_format: TimeFormat::default(),
         }
     }
 
@@ -224,6 +241,12 @@ impl Player {
     /// 未设则视频填满父容器（letterbox）。
     pub fn max_size(mut self, max: gpui::Pixels) -> Self {
         self.max_size = Some(max);
+        self
+    }
+
+    /// 设置控制条时间文本格式。默认 [`TimeFormat::Frame`]（`mm:ss:ff`）。
+    pub fn time_format(mut self, fmt: TimeFormat) -> Self {
+        self.time_format = fmt;
         self
     }
 
@@ -375,6 +398,7 @@ impl Render for Player {
                         .right_0()
                         .child(
                             PlaybackControls::new(&self.controller, &self.progress)
+                                .time_format(self.time_format)
                                 .on_toggle(|c| {
                                     if c.paused() {
                                         c.play();

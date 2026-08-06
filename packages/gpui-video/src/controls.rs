@@ -15,6 +15,7 @@ use std::time::Duration;
 use ui_gpui::{Slider, SliderState};
 
 use crate::controller::PlayerController;
+use crate::player::TimeFormat;
 
 /// 图标资源路径（内嵌 via asset source，`Application::new().with_assets(…)` 提供）。
 const ICON_PLAY: &str = "icons/play_filled.svg";
@@ -32,6 +33,7 @@ pub struct PlaybackControls {
     controller: Entity<PlayerController>,
     progress: Entity<SliderState>,
     on_toggle: Option<ToggleHandler>,
+    time_format: TimeFormat,
 }
 
 impl PlaybackControls {
@@ -41,6 +43,7 @@ impl PlaybackControls {
             controller: controller.clone(),
             progress: progress.clone(),
             on_toggle: None,
+            time_format: TimeFormat::default(),
         }
     }
 
@@ -50,6 +53,12 @@ impl PlaybackControls {
         handler: impl Fn(&mut PlayerController) + 'static,
     ) -> Self {
         self.on_toggle = Some(Box::new(handler));
+        self
+    }
+
+    /// 设置时间文本格式（由父视图 `Player` 透传）。
+    pub fn time_format(mut self, fmt: TimeFormat) -> Self {
+        self.time_format = fmt;
         self
     }
 }
@@ -64,8 +73,8 @@ impl RenderOnce for PlaybackControls {
         let fps = ctrl.fps();
         let time_text = format!(
             "{} / {}",
-            timecode(position, fps),
-            timecode(duration, fps),
+            timecode(position, fps, self.time_format),
+            timecode(duration, fps, self.time_format),
         );
         let icon_path = if paused { ICON_PLAY } else { ICON_PAUSE };
         let muted = ctrl.is_muted();
@@ -285,21 +294,28 @@ fn info_line(text: String) -> Div {
         .child(text)
 }
 
-/// 把时长格式化为 `mm:ss:ff,mmm,mmm`。
+/// 把时长格式化为时间码。格式由 `fmt` 决定：
 ///
-/// - `ff` = 帧，基于 `fps`：帧数 = 小数部分 × fps，clamp 到 `[0, fps-1]`
-///   （进位到 fps 整时归零）。`fps <= 0`（帧率未知）时 fallback 到 30。
-/// - 第一个 `mmm` = 秒内的毫秒（`total_ms % 1000`）。
-/// - 第二个 `mmm` = 当前原始毫秒（总时长/位置，单位毫秒）。
-fn timecode(d: Duration, fps: f64) -> String {
+/// - [`TimeFormat::Frame`]：`mm:ss:ff`
+/// - [`TimeFormat::FrameMillis`]：`mm:ss:ff,mmm,mmm`
+///
+/// `ff` = 帧，基于 `fps`：帧数 = 小数部分 × fps，clamp 到 `[0, fps-1]`
+/// （进位到 fps 整时归零）。`fps <= 0`（帧率未知）时 fallback 到 30。
+/// 第一个 `mmm` = 秒内的毫秒（`total_ms % 1000`）；第二个 `mmm` =
+/// 当前原始毫秒（总时长/位置，单位毫秒）。
+fn timecode(d: Duration, fps: f64, fmt: TimeFormat) -> String {
     let total = d.as_secs_f64();
     let total_ms = d.as_millis();
     let mm = total as u64 / 60;
     let ss = total as u64 % 60;
     let fps = if fps > 0.0 { fps } else { 30.0 };
     let ff = ((total.fract() * fps).round() as i64).clamp(0, fps as i64 - 1) as u64;
-    let ms_in_sec = total_ms % 1000;
-    format!(
-        "{mm:02}:{ss:02}:{ff:02},{ms_in_sec:03},{total_ms}",
-    )
+    let base = format!("{mm:02}:{ss:02}:{ff:02}");
+    match fmt {
+        TimeFormat::Frame => base,
+        TimeFormat::FrameMillis => {
+            let ms_in_sec = total_ms % 1000;
+            format!("{base},{ms_in_sec:03},{total_ms}")
+        }
+    }
 }
