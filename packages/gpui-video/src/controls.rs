@@ -7,8 +7,8 @@
 //! 上行是「播放/暂停 + 时间文本」（右对齐），下行是占满宽度的进度条。
 
 use gpui::{
-    Div, Entity, IntoElement, MouseButton, RenderOnce, SharedString, Stateful, Window, div,
-    linear_color_stop, linear_gradient, prelude::*, px, rgba, svg, white,
+    ClipboardItem, Div, Entity, IntoElement, MouseButton, RenderOnce, SharedString, Stateful,
+    Window, div, linear_color_stop, linear_gradient, prelude::*, px, rgba, svg, white,
 };
 use std::time::Duration;
 
@@ -210,6 +210,13 @@ impl RenderOnce for PlaybackControls {
                             .flex()
                             .text_size(px(12.0))
                             .text_color(white())
+                            // 点击时间文本：把当前位置的原始毫秒复制到剪贴板
+                            // （gpui 静态文本不可选，故用点击复制替代选取）。
+                            .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                                let ms = position.as_millis();
+                                cx.write_to_clipboard(ClipboardItem::new_string(ms.to_string()));
+                            })
+                            .cursor(gpui::CursorStyle::PointingHand)
                             .child(time_text),
                     )
                     .child(div().flex_1().w(px(0.0)))
