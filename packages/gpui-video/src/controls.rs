@@ -10,6 +10,8 @@ use gpui::{
     Div, Entity, IntoElement, MouseButton, RenderOnce, SharedString, Stateful, Window, div,
     linear_color_stop, linear_gradient, prelude::*, px, rgba, svg, white,
 };
+use std::time::Duration;
+
 use ui_gpui::{Slider, SliderState};
 
 use crate::controller::PlayerController;
@@ -59,12 +61,11 @@ impl RenderOnce for PlaybackControls {
         let duration = ctrl.duration();
         let paused = ctrl.paused();
 
+        let fps = ctrl.fps();
         let time_text = format!(
-            "{:02}:{:02} / {:02}:{:02}",
-            position.as_secs() / 60,
-            position.as_secs() % 60,
-            duration.as_secs() / 60,
-            duration.as_secs() % 60,
+            "{} / {}",
+            timecode(position, fps),
+            timecode(duration, fps),
         );
         let icon_path = if paused { ICON_PLAY } else { ICON_PAUSE };
         let muted = ctrl.is_muted();
@@ -240,16 +241,8 @@ impl RenderOnce for PlaybackControls {
                         .text_color(white())
                         .text_size(px(12.0))
                         .child(info_line(format!("分辨率: {}x{}", vw, vh)))
-                        .child(info_line(format!(
-                            "时长: {:02}:{:02}",
-                            dur.as_secs() / 60,
-                            dur.as_secs() % 60
-                        )))
-                        .child(info_line(format!(
-                            "位置: {:02}:{:02}",
-                            pos.as_secs() / 60,
-                            pos.as_secs() % 60
-                        )))
+                        .child(info_line(format!("时长: {}", timecode(dur, fps))))
+                        .child(info_line(format!("位置: {}", timecode(pos, fps))))
                         .child(info_line(format!("倍速: {}x", speed))),
                 )
             })
@@ -292,4 +285,17 @@ fn info_line(text: String) -> Div {
         .px(px(12.0))
         .py(px(4.0))
         .child(text)
+}
+
+/// 把时长格式化为 `mm:ss:ff`（ff = 帧，基于 `fps`）。
+///
+/// 帧数 = 小数部分 × fps，clamp 到 `[0, fps-1]`（进位到 fps 整时归零）。
+/// `fps <= 0`（帧率未知）时 fallback 到 30，避免无意义/除零。
+fn timecode(d: Duration, fps: f64) -> String {
+    let total = d.as_secs_f64();
+    let mm = total as u64 / 60;
+    let ss = total as u64 % 60;
+    let fps = if fps > 0.0 { fps } else { 30.0 };
+    let ff = ((total.fract() * fps).round() as i64).clamp(0, fps as i64 - 1) as u64;
+    format!("{mm:02}:{ss:02}:{ff:02}")
 }
