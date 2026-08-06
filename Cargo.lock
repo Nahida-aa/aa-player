@@ -3,6 +3,21 @@
 version = 4
 
 [[package]]
+name = "aa-player"
+version = "0.1.0"
+dependencies = [
+ "assets",
+ "clap",
+ "gpui",
+ "gpui-video",
+ "gpui_platform",
+ "rfd",
+ "tracing",
+ "tracing-subscriber",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "accesskit"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4524,21 +4539,6 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
-
-[[package]]
-name = "player-app"
-version = "0.1.0"
-dependencies = [
- "assets",
- "clap",
- "gpui",
- "gpui-video",
- "gpui_platform",
- "rfd",
- "tracing",
- "tracing-subscriber",
- "wasm-bindgen",
-]
 
 [[package]]
 name = "player-core"

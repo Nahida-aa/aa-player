@@ -8,7 +8,7 @@
 ## 已完成
 
 - [x] **骨架与构建** — cargo workspace 结构、`justfile`、依赖接入。
-  `packages/player-core`（库：解码 / seek，不依赖 GUI）+ `packages/player-app`（GPUI 界面）。
+  `packages/player-core`（库：解码 / seek，不依赖 GUI）+ `packages/aa-player`（GPUI 界面，发布到 AUR）。
 - [x] **视频解码 + 按 PTS 平稳播放（无音频）** — `MediaSource` trait + `FfmpegSource`：
   解包 → 解码 → BGRA 缩放 → 双缓冲上屏，按 PTS 用 GPUI timer 节流。
   commit `19c4ce3` 之前的多步提交。

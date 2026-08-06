@@ -14,7 +14,7 @@
 ```
 packages/
   player-core/   库包：解码、seek，不依赖 GUI
-  player-app/    应用包：GPUI 图形界面
+  aa-player/     应用包：GPUI 图形界面（发布到 AUR 的二进制）
 ```
 
 `player-core` 通过 `MediaSource` trait 暴露能力，当前实现基于 ffmpeg

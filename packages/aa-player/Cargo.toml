@@ -1,5 +1,5 @@
 [package]
-name = "player-app"
+name = "aa-player"
 description = "aa-player 的 GPUI 图形界面应用"
 version.workspace = true
 edition.workspace = true

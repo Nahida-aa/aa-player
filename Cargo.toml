@@ -6,7 +6,7 @@
 #
 # 成员说明：
 #   - packages/player-core : 库包，无 GUI 的播放/解码逻辑，未来可被 ocr-lab 等复用
-#   - packages/player-app  : GPUI GUI 应用包，依赖 player-core，计划发布到 AUR
+#   - packages/aa-player   : GPUI GUI 应用包，依赖 player-core，计划发布到 AUR
 
 [workspace]
 resolver = "3"
@@ -17,7 +17,7 @@ members = [
 
 # 默认只构建 app（二进制），库本身没有 main，`cargo run` 才有意义。
 default-members = [
-    "packages/player-app",
+    "packages/aa-player",
 ]
 
 [workspace.package]

@@ -1,4 +1,4 @@
-//! player-app —— aa-player 的 GPUI 图形界面入口。
+//! aa-player —— aa-player 的 GPUI 图形界面入口。
 //!
 //! 本二进制只做窗口/资源/命令行装配，真正的播放（解码线程、音频主时钟、
 //! 视频上屏、控制条）全部交给可复用组件 `gpui_video::Player`。组件内部已自带

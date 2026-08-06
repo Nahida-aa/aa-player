@@ -45,7 +45,7 @@ build:
 
 # 只检查 app 包（日常起窗口用）
 app:
-    cargo run -p player-app
+    cargo run -p aa-player
 
 # 只检查 core 库包
 core:
