@@ -6371,6 +6371,7 @@ dependencies = [
 [[package]]
 name = "ui-gpui"
 version = "0.1.0"
+source = "git+https://github.com/Nahida-aa/gpui_learn?rev=128d011#128d011781bc3f0bcbd649b97b96f21ba3503fad"
 dependencies = [
  "anyhow",
  "gpui",
