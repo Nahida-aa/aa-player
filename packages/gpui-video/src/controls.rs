@@ -140,7 +140,7 @@ impl RenderOnce for PlaybackControls {
             let menu = div()
                 .id("more-menu")
                 .absolute()
-                .bottom(px(28.0)) // 菜单底边=按钮顶边，紧贴正上方
+                .bottom(px(30.0)) // 菜单底边距按钮顶边 2px 间隔（按钮约 28px 高）
                 .right(px(0.0)) // 右对齐按钮
                 .flex()
                 .flex_col()
@@ -217,7 +217,8 @@ impl RenderOnce for PlaybackControls {
                     .child(
                         Slider::new(&self.progress)
                             .thumb_size(px(12.0))
-                            .track_size(px(4.0)),
+                            .track_size(px(4.0))
+                            .track_color(rgba(0x55555533)),
                     ),
             )
             // info 信息面板：点更多菜单里的 info 项展开，显示当前能分析到的视频信息。
