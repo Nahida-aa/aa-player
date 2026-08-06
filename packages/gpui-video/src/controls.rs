@@ -223,8 +223,6 @@ impl RenderOnce for PlaybackControls {
             // info 信息面板：点更多菜单里的 info 项展开，显示当前能分析到的视频信息。
             .when(ctrl.is_info_open(), |this| {
                 let (vw, vh) = ctrl.video_size();
-                let dur = ctrl.duration();
-                let pos = ctrl.position();
                 let speed = ctrl.speed();
                 this.child(
                     div()
@@ -241,8 +239,7 @@ impl RenderOnce for PlaybackControls {
                         .text_color(white())
                         .text_size(px(12.0))
                         .child(info_line(format!("分辨率: {}x{}", vw, vh)))
-                        .child(info_line(format!("时长: {}", timecode(dur, fps))))
-                        .child(info_line(format!("位置: {}", timecode(pos, fps))))
+                        .child(info_line(format!("帧率: {:.2} fps", fps)))
                         .child(info_line(format!("倍速: {}x", speed))),
                 )
             })
