@@ -7,7 +7,10 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, size};
+use gpui::{
+    App, AppContext, Bounds, FocusHandle, Focusable, MouseButton, Render, Window, WindowBounds,
+    WindowOptions, div, prelude::*, rgba, size, white,
+};
 use gpui_platform::application;
 use tracing::info;
 
@@ -19,7 +22,7 @@ use gpui_video::{Player, TimeFormat};
 #[command(name = "aa-player", about = "用 Rust + GPUI 写的视频播放器")]
 struct Cli {
     /// 要播放的视频路径（绝对或相对路径）。
-    /// 不传时播放内置样本 `player-core/tests/assets/sample.mp4`。
+    /// 不传则在应用内点击选择视频文件（系统文件选择器）。
     #[arg(value_name = "VIDEO")]
     video: Option<PathBuf>,
 }
@@ -45,21 +48,7 @@ fn main() {
     init_tracing();
 
     let cli = Cli::parse();
-    // 解析视频路径：优先命令行参数；未传时用内置样本。
-    let path: PathBuf = match cli.video {
-        Some(v) => v,
-        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../player-core/tests/assets/sample.mp4"),
-    };
-    // 绝对路径直接用；相对路径相对当前工作目录解析（clap 已按字面保留）。
-    let path = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(&path))
-            .unwrap_or(path)
-    };
-    info!(path = %path.display(), "播放");
+    info!(has_cli_path = cli.video.is_some(), "启动");
 
     application()
         // 提供内嵌资源（图标/字体），供组件的 svg().path("icons/…") 与文本渲染。
@@ -69,26 +58,118 @@ fn main() {
             let _ = Assets.load_fonts(cx);
 
             let bounds = Bounds::centered(None, size(1280.0.into(), 720.0.into()), cx);
-            let window_handle = cx
-                .open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(bounds)),
-                        ..Default::default()
-                    },
-                    |window, cx| {
-                    cx.new(|cx| {
-                        Player::new(path.clone(), window, cx)
-                            .time_format(TimeFormat::FrameMillis)
+
+            match cli.video {
+                // 传了路径：直接打开播放器（相对路径相对当前工作目录解析）。
+                Some(raw) => {
+                    let path = if raw.is_absolute() {
+                        raw
+                    } else {
+                        std::env::current_dir()
+                            .map(|cwd| cwd.join(&raw))
+                            .unwrap_or(raw)
+                    };
+                    info!(path = %path.display(), "播放");
+                    let window_handle = cx
+                        .open_window(
+                            WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                                ..Default::default()
+                            },
+                            |window, cx| {
+                                cx.new(|cx| {
+                                    Player::new(path.clone(), window, cx)
+                                        .time_format(TimeFormat::FrameMillis)
+                                })
+                            },
+                        )
+                        .unwrap();
+                    // 订阅播放结束（EOF）事件，便于外部感知（如自动下一集/提示）。
+                    let player = window_handle.entity(cx).unwrap();
+                    cx.subscribe(&player, |_player, _event, _cx| {
+                        info!("播放结束（EOF）");
                     })
-                },
-                )
-                .unwrap();
-            // 订阅播放结束（EOF）事件，便于外部感知（如自动下一集/提示）。
-            let player = window_handle.entity(cx).unwrap();
-            cx.subscribe(&player, |_player, _event, _cx| {
-                info!("播放结束（EOF）");
-            })
-            .detach();
+                    .detach();
+                }
+                // 没传路径：显示欢迎层，点击任意处用系统选择器选视频。
+                None => {
+                    cx.open_window(
+                        WindowOptions {
+                            window_bounds: Some(WindowBounds::Windowed(bounds)),
+                            ..Default::default()
+                        },
+                        |_window, cx| cx.new(|cx| Launcher::new(cx)),
+                    )
+                    .unwrap();
+                }
+            }
+
             cx.activate(true);
         });
+}
+
+/// 无参启动时的欢迎层：点击任意处弹出系统文件选择器，选中的视频再交给 `Player`。
+struct Launcher {
+    focus_handle: FocusHandle,
+}
+
+impl Focusable for Launcher {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Launcher {
+    fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
+impl Render for Launcher {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .bg(rgba(0x000000ff))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .track_focus(&self.focus_handle)
+            .text_color(white())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, window, cx| {
+                    // 异步开系统文件选择器，避免阻塞 GPUI executor。
+                    cx.spawn_in(window, async move |_this, cx| {
+                        let picked = rfd::AsyncFileDialog::new()
+                            .set_title("选择视频文件")
+                            .pick_file()
+                            .await;
+                        if let Some(file) = picked {
+                            // 选完即用该路径替换根视图为播放器，并订阅 EOF。
+                            let path = file.path().to_path_buf();
+                            let player = cx
+                                .replace_root_view(|window, cx| {
+                                    Player::new(path, window, cx)
+                                        .time_format(TimeFormat::FrameMillis)
+                                })
+                                .expect("替换根视图为 Player 失败");
+                            cx.subscribe(&player, |_player, _event, _cx| {
+                                info!("播放结束（EOF）");
+                            })
+                            .detach();
+                        }
+                    })
+                    .detach();
+                    let _ = &this;
+                }),
+            )
+            .child(
+                div()
+                    .text_xl()
+                    .child("点击任意位置选择视频文件"),
+            )
+    }
 }

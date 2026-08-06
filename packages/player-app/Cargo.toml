@@ -21,6 +21,9 @@ tracing-subscriber.workspace = true
 # 命令行参数解析（视频路径）。用 derive + 最小 feature，只为单个可选参数。
 clap = { version = "4", features = ["derive"] }
 
+# 系统文件选择器（无参打开时点击选择视频）。开 OS 原生对话框。
+rfd = "0.15"
+
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 
