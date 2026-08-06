@@ -285,15 +285,21 @@ fn info_line(text: String) -> Div {
         .child(text)
 }
 
-/// 把时长格式化为 `mm:ss:ff`（ff = 帧，基于 `fps`）。
+/// 把时长格式化为 `mm:ss:ff,mmm,mmm`。
 ///
-/// 帧数 = 小数部分 × fps，clamp 到 `[0, fps-1]`（进位到 fps 整时归零）。
-/// `fps <= 0`（帧率未知）时 fallback 到 30，避免无意义/除零。
+/// - `ff` = 帧，基于 `fps`：帧数 = 小数部分 × fps，clamp 到 `[0, fps-1]`
+///   （进位到 fps 整时归零）。`fps <= 0`（帧率未知）时 fallback 到 30。
+/// - 第一个 `mmm` = 秒内的毫秒（`total_ms % 1000`）。
+/// - 第二个 `mmm` = 当前原始毫秒（总时长/位置，单位毫秒）。
 fn timecode(d: Duration, fps: f64) -> String {
     let total = d.as_secs_f64();
+    let total_ms = d.as_millis();
     let mm = total as u64 / 60;
     let ss = total as u64 % 60;
     let fps = if fps > 0.0 { fps } else { 30.0 };
     let ff = ((total.fract() * fps).round() as i64).clamp(0, fps as i64 - 1) as u64;
-    format!("{mm:02}:{ss:02}:{ff:02}")
+    let ms_in_sec = total_ms % 1000;
+    format!(
+        "{mm:02}:{ss:02}:{ff:02},{ms_in_sec:03},{total_ms}",
+    )
 }
