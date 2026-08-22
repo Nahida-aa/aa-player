@@ -5,7 +5,6 @@
 # 动态链接与官方仓库一致的 ffmpeg），不想本地编 GPUI 的用户用这个。
 # 源码构建请用 aa-player。
 #
-# 上传 AUR 前用 `updpkgsums` 填真实校验值。
 
 pkgname=aa-player-bin
 pkgver=0.1.0
@@ -21,14 +20,16 @@ depends=('alsa-lib' 'ffmpeg' 'fontconfig' 'freetype2' 'libxkbcommon' 'libxkbcomm
 optdepends=('mesa-vulkan-drivers: Intel/AMD 显卡的 Vulkan 驱动'
             'nvidia-utils: NVIDIA 显卡的 Vulkan 驱动')
 source_x86_64=("$pkgname-v$pkgver-linux-x86_64.tar.gz::$url/releases/download/v$pkgver/aa-player-linux-x86_64.tar.gz")
-sha256sums_x86_64=('SKIP')
+sha256sums_x86_64=('65933486ad429fbd124b331efb0f03a208032d5642acde6790026c2de8471b73')
 
 # Release tarball 布局（由 .github/workflows/release.yml 组装）：
-#   aa-player                        二进制
-#   resources/icons/hicolor/**       图标
-#   resources/aa-player.desktop
-#   README.md / LICENSE
+#   aa-player-linux-x86_64/
+#   ├─ aa-player                     二进制
+#   ├─ resources/icons/hicolor/**    图标
+#   ├─ resources/aa-player.desktop
+#   └─ README.md / LICENSE
 package() {
+  cd "aa-player-linux-x86_64"
   install -Dm755 aa-player "$pkgdir/usr/bin/aa-player"
   # cp 不创建中间目录，父目录要先 install -d 建好。
   install -d "$pkgdir/usr/share/icons"
