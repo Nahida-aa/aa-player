@@ -93,6 +93,9 @@ fn main() {
             let bounds = Bounds::centered(None, size(1280.0.into(), 720.0.into()), cx);
             // 窗口图标（X11 用栅格 PNG；Wayland 由 .desktop 提供）。每个窗口创建时都设。
             let window_icon = load_window_icon(cx);
+            // Wayland app_id / X11 WM_CLASS：KWin 等靠它把窗口关联到 aa-player.desktop
+            // （任务栏图标、分组）。不设则任务栏显示默认图标。须与 desktop 文件名一致。
+            let app_id = Some("aa-player".to_string());
 
             match cli.video {
                 // 传了路径：直接打开播放器（相对路径相对当前工作目录解析）。
@@ -110,6 +113,7 @@ fn main() {
                             WindowOptions {
                                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                                 icon: window_icon.clone(),
+                                app_id: app_id.clone(),
                                 ..Default::default()
                             },
                             |window, cx| {
@@ -133,6 +137,7 @@ fn main() {
                         WindowOptions {
                             window_bounds: Some(WindowBounds::Windowed(bounds)),
                             icon: window_icon.clone(),
+                            app_id: app_id.clone(),
                             ..Default::default()
                         },
                         |_window, cx| cx.new(|cx| Launcher::new(cx)),

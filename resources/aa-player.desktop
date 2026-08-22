@@ -9,6 +9,8 @@ Exec=aa-player %f
 Icon=aa-player
 Terminal=false
 StartupNotify=true
+# X11 下启动器按 WM_CLASS 关联窗口；Wayland 用 app_id（代码里已设同名值）。
+StartupWMClass=aa-player
 Categories=AudioVideo;Video;Player;
 Keywords=video;player;media;
 MimeType=video/mp4;video/x-matroska;video/webm;video/mpeg;video/ogg;video/x-msvideo;video/quicktime;video/x-flv;video/x-theora+ogg;
