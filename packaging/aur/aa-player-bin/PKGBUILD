@@ -30,7 +30,9 @@ sha256sums_x86_64=('SKIP')
 #   README.md / LICENSE
 package() {
   install -Dm755 aa-player "$pkgdir/usr/bin/aa-player"
-  cp -r resources/icons/hicolor/. "$pkgdir/usr/share/icons/hicolor/"
+  # cp 不创建中间目录，父目录要先 install -d 建好。
+  install -d "$pkgdir/usr/share/icons"
+  cp -r resources/icons/hicolor "$pkgdir/usr/share/icons/"
   install -Dm644 resources/aa-player.desktop \
     "$pkgdir/usr/share/applications/aa-player.desktop"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"

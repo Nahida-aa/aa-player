@@ -14,3 +14,10 @@ tmp
 
 # 图标生成脚本（bun）的依赖目录；产物在 resources/icons 下随仓库提交。
 scripts/node_modules
+
+# makepkg 构建产物（AUR 打包的本地验证），只提交 PKGBUILD 本身。
+packaging/aur/*/src/
+packaging/aur/*/pkg/
+packaging/aur/*/*.pkg.tar.*
+packaging/aur/*/*.tar.gz
+packaging/aur/*/v0.*
