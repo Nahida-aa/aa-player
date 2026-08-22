@@ -1,0 +1,4 @@
+# Windows（MSVC）静态链接 CRT：便携 exe 不再要求用户装 VC++ Redistributable。
+# ffmpeg 仍动态链接 vcpkg DLL（LGPL 合规），不受影响。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
