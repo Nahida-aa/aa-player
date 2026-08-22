@@ -23,7 +23,7 @@ gpui = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 # 用于识别可恢复的解码错误（坏帧跳过）；player-core 已传递依赖，不额外编译。
-ffmpeg-next = "8"
+ffmpeg-next = "9"
 
 # 解码帧 → RenderImage 转换，与 player-app 相同的 image/smallvec 版本。
 image = "0.25"

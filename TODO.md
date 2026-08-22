@@ -72,6 +72,20 @@
        `finished=true` 继续轮询命令；seek 清 draining 后重新出帧。新增
        `seek_after_eof_resumes_playback` 集成测试（需真实音频设备，`#[ignore]`）。
 
+## 已完成
+
+- [x] **桌面集成（AUR 前置）** — 参考 zed 的 bundle-linux：
+  - `scripts/gen-icons.mjs`（bun + @resvg/resvg-js）从 logo.svg 生成 hicolor 多尺寸
+    PNG（512/256/128/64/48/32），产物在 `resources/icons/hicolor/` 随仓库提交，
+    打包无需 node/bun；`just icons` 可重新生成。
+  - `resources/aa-player.desktop`（Icon=aa-player、MimeType 常见视频类型，
+    已过 `desktop-file-validate`）。
+  - `just install [PREFIX]`：本地真实安装（默认 ~/.local），布局与 PKGBUILD 一致
+    （bin + share/icons/hicolor + share/applications），装完刷新 desktop/icon 缓存。
+  - **依赖升级 ffmpeg-next 8→9**：系统 FFmpeg 升到 9（libavcodec 63）后 8.x 的
+    绑定编译失败（AVCodec 公开字段被移除等）；release 全新构建暴露了此问题
+    （debug 靠旧缓存一直没触发）。9.0.0 编译通过，测试全绿。
+
 ## 待办（未排期）
 
 - [ ] **AUR PKGBUILD** — 便于在 Arch 上安装；注意动态链接系统 ffmpeg，

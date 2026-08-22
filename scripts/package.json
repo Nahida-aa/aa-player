@@ -1,0 +1,11 @@
+{
+  "name": "aa-player-scripts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "gen:icons": "bun gen-icons.mjs"
+  },
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2"
+  }
+}

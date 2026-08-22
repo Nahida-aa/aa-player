@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=AA Player
+GenericName=Video Player
+Comment=A video player built with Rust and GPUI
+TryExec=aa-player
+Exec=aa-player %f
+Icon=aa-player
+Terminal=false
+StartupNotify=true
+Categories=AudioVideo;Video;Player;
+Keywords=video;player;media;
+MimeType=video/mp4;video/x-matroska;video/webm;video/mpeg;video/ogg;video/x-msvideo;video/quicktime;video/x-flv;video/x-theora+ogg;

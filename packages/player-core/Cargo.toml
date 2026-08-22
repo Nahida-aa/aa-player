@@ -10,10 +10,11 @@ publish.workspace = true
 anyhow.workspace = true
 
 # ffmpeg-next：ffmpeg 的 Rust 薄封装（GitHub 仓库名 rust-ffmpeg）。
-# 动态链接系统 ffmpeg（本机为 n8.1.2），AUR 打包只需 depends=('ffmpeg')。
+# 动态链接系统 ffmpeg（本机为 FFmpeg 9，libavcodec 63；8.x API 已被系统头文件移除），
+# AUR 打包只需 depends=('ffmpeg')。
 # 提供 send_packet/receive_frame 逐帧控制 + seek + input_with_interrupt，
 # 是播放器所需的粒度（ez-ffmpeg 偏转码框架，不适合做播放底座）。
-ffmpeg-next = "8"
+ffmpeg-next = "9"
 
 cpal.workspace = true
 
@@ -22,4 +23,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 # 集成测试是独立 crate，要直接探查样本的流信息（如是否含音轨）需自己引入。
-ffmpeg-next = "8"
+ffmpeg-next = "9"
