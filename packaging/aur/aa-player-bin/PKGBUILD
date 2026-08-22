@@ -16,7 +16,7 @@ url='https://github.com/Nahida-aa/aa-player'
 license=('Apache-2.0')
 provides=("aa-player=$pkgver")
 conflicts=('aa-player')
-depends=('alsa-lib' 'ffmpeg' 'fontconfig' 'freetype2' 'libxkbcommon' 'wayland'
+depends=('alsa-lib' 'ffmpeg' 'fontconfig' 'freetype2' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
          'vulkan-icd-loader')
 optdepends=('mesa-vulkan-drivers: Intel/AMD 显卡的 Vulkan 驱动'
             'nvidia-utils: NVIDIA 显卡的 Vulkan 驱动')

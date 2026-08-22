@@ -1,0 +1,23 @@
+pkgbase = aa-player-bin
+	pkgdesc = Video player built with Rust and GPUI (prebuilt binary)
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/Nahida-aa/aa-player
+	arch = x86_64
+	license = Apache-2.0
+	depends = alsa-lib
+	depends = ffmpeg
+	depends = fontconfig
+	depends = freetype2
+	depends = libxkbcommon
+	depends = libxkbcommon-x11
+	depends = wayland
+	depends = vulkan-icd-loader
+	optdepends = mesa-vulkan-drivers: Intel/AMD 显卡的 Vulkan 驱动
+	optdepends = nvidia-utils: NVIDIA 显卡的 Vulkan 驱动
+	provides = aa-player=0.1.0
+	conflicts = aa-player
+	source_x86_64 = aa-player-bin-v0.1.0-linux-x86_64.tar.gz::https://github.com/Nahida-aa/aa-player/releases/download/v0.1.0/aa-player-linux-x86_64.tar.gz
+	sha256sums_x86_64 = SKIP
+
+pkgname = aa-player-bin

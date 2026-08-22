@@ -13,9 +13,11 @@ arch=('x86_64')
 url='https://github.com/Nahida-aa/aa-player'
 license=('Apache-2.0')
 # 直接 NEEDED：alsa-lib(cpal 音频) / ffmpeg(解码) / libxkbcommon(gpui 输入)。
+# 运行时 dlopen：fontconfig、freetype2、wayland、vulkan-icd-loader，
+# 以及 X11 会话下的 gpui 后端所需的 libxkbcommon-x11。
 # gpui 运行时 dlopen 的库也必须列全：fontconfig/freetype2(字体)、
 # wayland(Wayland 后端)、vulkan-icd-loader(GPU 渲染入口)，缺了启动即崩。
-depends=('alsa-lib' 'ffmpeg' 'fontconfig' 'freetype2' 'libxkbcommon' 'wayland'
+depends=('alsa-lib' 'ffmpeg' 'fontconfig' 'freetype2' 'libxkbcommon' 'libxkbcommon-x11' 'wayland'
          'vulkan-icd-loader')
 makedepends=('cargo' 'clang')
 optdepends=('mesa-vulkan-drivers: Intel/AMD 显卡的 Vulkan 驱动'

@@ -29,7 +29,8 @@ jobs:
         run: |
           pacman -Syu --noconfirm \
             git rust clang pkgconf \
-            alsa-lib ffmpeg fontconfig freetype2 libxkbcommon wayland vulkan-icd-loader
+            alsa-lib ffmpeg fontconfig freetype2 \
+            libxkbcommon libxkbcommon-x11 wayland vulkan-icd-loader
 
       - uses: actions/checkout@v4
 
