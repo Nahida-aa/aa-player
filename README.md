@@ -23,14 +23,21 @@
 
 ## 安装
 
-### Arch Linux（AUR）
+### Arch Linux
+
+> AUR 包已备好（`packaging/aur/`，实测构建通过），但 AUR 新账号注册
+> 目前对所有人关闭（官方清理恶意包中），恢复后即上架。期间用下面任一方式：
+
+**预编译二进制（推荐，免编 GPUI）**——仓库内 PKGBUILD 直接装，
+从 GitHub Release 拉取二进制并交给 pacman 管理：
 
 ```bash
-# 预编译二进制（推荐，免编 GPUI）
-yay -S aa-player-bin
-# 或源码构建
-yay -S aa-player
+git clone https://github.com/Nahida-aa/aa-player
+cd aa-player/packaging/aur/aa-player-bin
+makepkg -si
 ```
+
+或源码构建：同上但进 `packaging/aur/aa-player/` 目录。
 
 动态链接系统 ffmpeg——ffmpeg 大版本升级后请重编/升级包。
 
