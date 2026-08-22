@@ -28,6 +28,42 @@ use crate::audio_output::AudioFormat;
 use crate::error::Result;
 use crate::frame::{AudioChunk, DecodedFrame, VideoInfo};
 
+/// next_event 行为探针：观察包读取节奏与音频事件产出，配合 controller
+/// 侧的「解码线程时间去向」日志定位音频欠载类问题。每 2s 汇总一次。
+mod probe {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    static PACKETS: AtomicU32 = AtomicU32::new(0);
+    static AUDIO_EVENTS: AtomicU32 = AtomicU32::new(0);
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+
+    pub fn packet() {
+        PACKETS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn audio_event() {
+        AUDIO_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn maybe_report() {
+        let mut last = LAST.lock().unwrap();
+        let now = Instant::now();
+        match *last {
+            Some(t) if now.duration_since(t) < Duration::from_secs(2) => return,
+            _ => *last = Some(now),
+        }
+        let packets = PACKETS.swap(0, Ordering::Relaxed);
+        let audio_events = AUDIO_EVENTS.swap(0, Ordering::Relaxed);
+        tracing::info!(
+            packets,
+            audio_events,
+            "next_event 2s 统计"
+        );
+    }
+}
+
 /// 从媒体里解出来的一个单元。
 ///
 /// 音频和视频**共享同一条 demux 流**，谁的包先到就先产出谁，
@@ -44,6 +80,11 @@ pub enum MediaEvent {
     /// 一块音频（已重采样到打开时指定的设备格式）。
     Audio(AudioChunk),
 }
+
+/// [`try_next_audio`](MediaSource::try_next_audio) 单次调用最多跳过（暂存）
+/// 的视频包数。30fps 下 32 包 ≈ 1s 的流；压缩包每包几 KB，内存可忽略。
+/// 到限即返回，调用方下轮再来——蓄水是持续行为，不必一口气抽完。
+const MAX_PUMP_VIDEO_HELD: usize = 32;
 
 /// 媒体源：一个可打开、可逐单元解码、可 seek 的媒体。
 pub trait MediaSource {
@@ -68,6 +109,15 @@ pub trait MediaSource {
 
     /// 拉取下一个单元。到文件末尾返回 `Ok(None)`。
     fn next_event(&mut self) -> Result<Option<MediaEvent>>;
+
+    /// 只窥探音频路：立即交付已就绪的音频块，没有则返回 `None`（不阻塞）。
+    ///
+    /// 与 [`next_event`](Self::next_event) 的区别：完全不碰视频解码器，
+    /// 也不读新 packet——只收音频解码器**已经**解出的东西。
+    /// 给播放器的「音频续杯」用：视频帧投递被渲染节奏背压时（通道满、
+    /// 每帧要等一个显示周期），解码线程不能干等，得把现成音频先推给声卡，
+    /// 否则音频产出会被挤到贴着实时线跑，稍有抖动就欠载。
+    fn try_next_audio(&mut self) -> Result<Option<AudioChunk>>;
 
     /// 拉取下一帧视频，丢弃途中遇到的音频。
     ///
@@ -123,6 +173,12 @@ pub struct FfmpegSource {
     rgba_frame: Video,
     /// 上次 send_packet 因解码器输入缓冲满(EAGAIN)而未送出的 packet，暂存待重试。
     pending: Option<Packet>,
+    /// 音频续杯时被跳过、尚未送进视频解码器的压缩包（FIFO）。
+    ///
+    /// [`try_next_audio`](Self::try_next_audio) 为了给音频蓄水要向前读包；
+    /// 途中的视频包若照常解码，帧就得有地方放（内存大），于是压在队列里
+    /// （每包几 KB，有界）。正常读取流程会先排空这里再读新包，顺序不乱。
+    video_backlog: std::collections::VecDeque<Packet>,
     width: u32,
     height: u32,
     duration: Duration,
@@ -190,9 +246,13 @@ impl MediaSource for FfmpegSource {
         // 若放任会无限循环、解码线程挂死、画面冻结。这里限次后按 EOF 结束本次
         // 调用，让调用方能重新 seek 驱动，而不是永久卡住。
         let mut stalled = 0u32;
+        probe::maybe_report();
         loop {
             // 1) 优先把已解出的东西交出去，不必等下一个 packet。
             if let Some(ev) = self.take_ready()? {
+                if matches!(ev, MediaEvent::Audio(_)) {
+                    probe::audio_event();
+                }
                 return Ok(Some(ev));
             }
 
@@ -207,14 +267,22 @@ impl MediaSource for FfmpegSource {
                 return Ok(None); // 真正结束
             }
 
-            // 2) 喂一个 packet 进去。
+            // 2) 喂一个 packet 进去。优先级：EAGAIN 重试 > 续杯攒下的视频包
+            //    > 正常读盘——保证包序不乱（backlog 里的包比后续读出的都旧）。
             let packet = match self.pending.take() {
                 Some(p) => Some(p),
-                None => self.read_packet()?,
+                None => match self.video_backlog.pop_front() {
+                    Some(p) => {
+                        probe::packet();
+                        Some(p)
+                    }
+                    None => self.read_packet()?,
+                },
             };
 
             match packet {
                 Some(packet) => {
+                    probe::packet();
                     self.dispatch(packet)?;
                     // 若 dispatch 又 EAGAIN 存回 pending（没能送进解码器），且本轮
                     // 也没解出帧，说明没进展。累计到阈值即视为卡死，提前结束。
@@ -239,6 +307,61 @@ impl MediaSource for FfmpegSource {
                 }
             }
         }
+    }
+
+    fn try_next_audio(&mut self) -> Result<Option<AudioChunk>> {
+        if self.audio.is_none() {
+            return Ok(None);
+        }
+
+        // 1) 解码器里有现成的先交出去。借用即用即还，后面还要碰 self 其他字段。
+        if let Some(c) = self.audio.as_mut().unwrap().decoder.receive()? {
+            return Ok(Some(c));
+        }
+
+        // 2) 解码器见底：继续读包喂它，把解复用位置向前推。
+        //    途中的视频包**不解码**（帧没地方放），压进 backlog 等正常流程
+        //    处理；有界防失控。这样反复调用就能把音频从「解码位置」一直
+        //    抽到「播放位置 + 数百 ms」，而不是被视频帧的就绪节奏锁死在实时线。
+        for _ in 0..MAX_PUMP_VIDEO_HELD {
+            if self.draining {
+                return Ok(None);
+            }
+            let packet = match self.read_packet() {
+                Ok(Some(p)) => p,
+                // EOF：不在这里置 draining（那是 next_event/EOF 流程的职责），
+                // 泵只管抽，抽不动就返回。
+                _ => return Ok(None),
+            };
+            let index = packet.stream();
+            if index == self.stream_index {
+                probe::packet();
+                self.video_backlog.push_back(packet);
+                continue;
+            }
+            let is_audio = self.audio.as_ref().is_some_and(|a| a.index == index);
+            if !is_audio {
+                // 字幕等无人认领的流，与 dispatch 的处理一致：丢弃。
+                probe::packet();
+                continue;
+            }
+            let accepted = self
+                .audio
+                .as_mut()
+                .unwrap()
+                .decoder
+                .send(&packet)?;
+            probe::packet();
+            if !accepted {
+                // 音频解码器输入满：包按规矩存 pending，下次先排它。
+                self.pending = Some(packet);
+                break;
+            }
+            if let Some(c) = self.audio.as_mut().unwrap().decoder.receive()? {
+                return Ok(Some(c));
+            }
+        }
+        Ok(None)
     }
 
     fn seek(&mut self, ts: Duration) -> Result<()> {
@@ -266,6 +389,8 @@ impl MediaSource for FfmpegSource {
         }
         // 暂存的 packet 属于 seek 前的位置，留着会在新位置插进一段旧内容。
         self.pending = None;
+        // 续杯攒下的视频包同理：全是旧位置的压缩包，必须丢弃。
+        self.video_backlog.clear();
         // seek 到文件中间后又能继续读了，draining 状态必须撤销，
         // 否则播到过结尾再 seek 回去会立刻又报 EOF。
         self.draining = false;
@@ -345,6 +470,7 @@ impl FfmpegSource {
             raw_frame: Video::empty(),
             rgba_frame: Video::empty(),
             pending: None,
+            video_backlog: std::collections::VecDeque::new(),
             width,
             height,
             duration,

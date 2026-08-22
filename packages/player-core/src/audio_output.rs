@@ -53,6 +53,9 @@ pub struct AudioOutput {
     /// 实现持久静音（与拖动时的临时 `pause()` 静音正交）。
     /// 用 `AtomicU32` 存 `f32` bits（稳定 Rust 无 `AtomicF32`）。
     volume: Arc<AtomicU32>,
+    /// 解码侧累计推入的**帧数**。与 [`Self::frames_played`](Self::position)
+    /// 对照即可算出净产出速率，用于诊断欠载是产不足还是消费异常。
+    pushed_frames: Arc<AtomicU64>,
 }
 
 /// 播放是否真正开始过（收到过非空采样）。
@@ -126,6 +129,7 @@ impl AudioOutput {
         let started: StartedFlag = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let pushed_frames = Arc::new(AtomicU64::new(0));
 
         let stream = Self::build_stream(
             &device,
@@ -150,6 +154,7 @@ impl AudioOutput {
             started,
             paused,
             volume,
+            pushed_frames,
         })
     }
 
@@ -237,6 +242,15 @@ impl AudioOutput {
     pub fn push_samples(&self, samples: &[f32]) {
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.extend(samples.iter().copied());
+        drop(q);
+        self.pushed_frames
+            .fetch_add((samples.len() / self.format.channels.max(1) as usize) as u64, Ordering::Relaxed);
+    }
+
+    /// 解码侧累计推入的播放时长。
+    pub fn pushed_position(&self) -> Duration {
+        let frames = self.pushed_frames.load(Ordering::Relaxed);
+        Duration::from_secs_f64(frames as f64 / self.format.sample_rate as f64)
     }
 
     /// 清空待播放队列（并丢弃）。用于拖动静音时把已推入但未播出的采样丢掉，
