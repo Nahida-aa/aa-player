@@ -74,6 +74,22 @@
 
 ## 已完成
 
+- [x] **音频续杯：根治 FFmpeg 9 下的持续欠载** — ffmpeg-next 8→9 后 h264
+  多线程解码让视频帧就绪节奏更碎，单解码线程按显示节奏拉事件 + 视频优先交付，
+  音频产出被锁死在贴实时线（0.92x），队列从启动峰值一路衰减到反复欠载。
+  三层修复（commit `6e4c134`）：
+  1. `MediaSource::try_next_audio`：解码器见底时继续读包喂它，途中视频包
+     压缩态暂存有界 `video_backlog`，把解复用位置推到播放位置前方；
+  2. controller 投递视频帧前先「续杯」到 AUDIO_BUFFER 水位——水位检查放
+     **泵循环条件**而非推送路径（推送带背压睡眠会把主循环拖成声卡节奏，
+     实测视频掉到 1 帧/2s）；
+  3. FRAME_QUEUE_CAP 3→12：通道容量=解复用领先度上限，3 帧(~100ms)撑不起
+     400ms 音频缓冲。
+  复测 60.mp4：14s 全程零欠载、队列稳定蓄满 416ms。探针保留：
+  「解码线程 2s 时间去向」「next_event 统计」+ pump_bench 隔离基准。
+
+## 已完成
+
 - [x] **桌面集成（AUR 前置）** — 参考 zed 的 bundle-linux：
   - `scripts/gen-icons.mjs`（bun + @resvg/resvg-js）从 logo.svg 生成 hicolor 多尺寸
     PNG（512/256/128/64/48/32），产物在 `resources/icons/hicolor/` 随仓库提交，
@@ -88,8 +104,16 @@
 
 ## 待办（未排期）
 
-- [ ] **AUR PKGBUILD** — 便于在 Arch 上安装；注意动态链接系统 ffmpeg，
-  运行时依赖要在 `depends` 里列全。
+- [ ] **AUR 上架** — PKGBUILD 双包模板已就绪（`packaging/aur/`，源码包 +
+  bin 包，makepkg 校验通过）；剩：打首个 tag 触发 Release 流水线 →
+  `updpkgsums` 填校验和 → 发布到 AUR。bin 包由
+  `.github/workflows/release.yml` 在 Arch 容器里构建（与用户系统 ffmpeg 同源）。
+- [ ] **Windows 移植** — gpui Windows 后端 + vcpkg LGPL 共享 ffmpeg +
+  exe 资源嵌入（build.rs 已就位）。实验工作流
+  `windows-experimental.yml`（手动触发）待跑通；预计要修平台差异 bug
+  （音频设备枚举、字体加载、文件对话框等）。
+- [ ] **帧通道容量按分辨率自适应** — FRAME_QUEUE_CAP 现固定 12（1080p 约
+  100MB 内存），4K 下偏大；需要把通道创建挪进解码线程按视频尺寸收窄。
 - [ ] **音视频首帧对齐** — 当前音频时钟从首个采样开始计、视频从首帧校准原点，
   二者起点可能有小偏差，必要时在 `PlaybackClock` 引入 offset 校正。
 - [ ] **真实设备上的 A/V 同步端到端测试** — 考虑用固定测试素材 + 录制，
