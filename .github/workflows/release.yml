@@ -23,13 +23,15 @@ jobs:
     container:
       image: archlinux:base-devel
     steps:
-      - uses: actions/checkout@v4
-
+      # 先装依赖再 checkout：base-devel 不含 git，checkout@v4 虽有 REST API
+      # 兜底，但依赖它没必要——而且 cargo 的 git 依赖（ui-gpui）反正也需要 git。
       - name: 安装构建依赖
         run: |
           pacman -Syu --noconfirm \
             git rust clang pkgconf \
             alsa-lib ffmpeg fontconfig freetype2 libxkbcommon wayland vulkan-icd-loader
+
+      - uses: actions/checkout@v4
 
       - uses: Swatinem/rust-cache@v2
 
