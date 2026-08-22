@@ -30,6 +30,12 @@ rfd = "0.15"
 # 否则 WindowOptions.icon 的 RgbaImage 类型不匹配无法编译。
 image = "0.25"
 
+# Windows 下把图标/版本信息嵌进 exe（资源管理器/任务栏/快捷方式用）。
+# 不能按 target 门控：build.rs 里引用的 crate 必须始终可解析；
+# 该 crate 纯 Rust 且只在目标是 Windows 时才被调用，无平台负担。
+[build-dependencies]
+winresource = "0.1"
+
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 

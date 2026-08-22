@@ -1,0 +1,37 @@
+# Maintainer: Nahida-aa <nahida.aa@outlook.com>
+# 项目仓库：https://github.com/Nahida-aa/aa-player
+#
+# 预编译二进制包：安装 GitHub Release 上的产物（在 Arch 容器里构建、
+# 动态链接与官方仓库一致的 ffmpeg），不想本地编 GPUI 的用户用这个。
+# 源码构建请用 aa-player。
+#
+# 上传 AUR 前用 `updpkgsums` 填真实校验值。
+
+pkgname=aa-player-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Video player built with Rust and GPUI (prebuilt binary)'
+arch=('x86_64')
+url='https://github.com/Nahida-aa/aa-player'
+license=('Apache-2.0')
+provides=("aa-player=$pkgver")
+conflicts=('aa-player')
+depends=('alsa-lib' 'ffmpeg' 'fontconfig' 'freetype2' 'libxkbcommon' 'wayland'
+         'vulkan-icd-loader')
+optdepends=('mesa-vulkan-drivers: Intel/AMD 显卡的 Vulkan 驱动'
+            'nvidia-utils: NVIDIA 显卡的 Vulkan 驱动')
+source_x86_64=("$pkgname-v$pkgver-linux-x86_64.tar.gz::$url/releases/download/v$pkgver/aa-player-linux-x86_64.tar.gz")
+sha256sums_x86_64=('SKIP')
+
+# Release tarball 布局（由 .github/workflows/release.yml 组装）：
+#   aa-player                        二进制
+#   resources/icons/hicolor/**       图标
+#   resources/aa-player.desktop
+#   README.md / LICENSE
+package() {
+  install -Dm755 aa-player "$pkgdir/usr/bin/aa-player"
+  cp -r resources/icons/hicolor/. "$pkgdir/usr/share/icons/hicolor/"
+  install -Dm644 resources/aa-player.desktop \
+    "$pkgdir/usr/share/applications/aa-player.desktop"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

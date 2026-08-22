@@ -1,0 +1,52 @@
+# Windows 构建（实验性）：手动触发（workflow_dispatch），先跑通再挂进 tag 发布。
+#
+# 已知前提：
+# - gpui 的 Windows 后端可用但较新，平台差异 bug 要逐个修；
+# - ffmpeg 走 vcpkg（runner 预装了 vcpkg，VCPKG_INSTALLATION_ROOT 指向它），
+#   x64-windows 三元组 = LGPL 共享库（我们只解码不编码，不背 GPL）；
+#   ffmpeg-sys-next 在 MSVC 目标上会经 vcpkg crate 自动发现依赖；
+# - exe 图标/版本信息由 packages/aa-player/build.rs 嵌入
+#   （resources/icons/aa-player.ico，`just icons` 生成）。
+#
+# 产物只作为 CI artifact 上传，验证能出可运行 zip 后再并入 release.yml。
+name: Windows (experimental)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 ffmpeg (vcpkg)
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          & "$env:VCPKG_ROOT\vcpkg.exe" install ffmpeg:x64-windows
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 构建
+        run: cargo build --release --locked -p aa-player
+
+      - name: 组装便携 zip
+        shell: pwsh
+        run: |
+          $stage = "stage"
+          New-Item -ItemType Directory -Force -Path "$stage" | Out-Null
+          Copy-Item target/release/aa-player.exe "$stage/"
+          # vcpkg 共享构建：ffmpeg 全家桶 + 其传递依赖都在 installed/x64-windows/bin。
+          Copy-Item "$env:VCPKG_ROOT\installed\x64-windows\bin\*.dll" "$stage/"
+          Compress-Archive -Path "$stage/*" -DestinationPath aa-player-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aa-player-windows-x86_64
+          path: aa-player-windows-x86_64.zip

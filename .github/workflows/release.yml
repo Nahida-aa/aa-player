@@ -1,0 +1,55 @@
+# 发布流水线：push tag v* 触发。
+#
+# Linux 在 **Arch 容器**里构建——不是炫技：aa-player 动态链接系统 ffmpeg，
+# 用与 AUR 用户一致的库版本构建，产物才能直接被 aa-player-bin 分发
+# （ubuntu runner 的 ffmpeg 是 6.x，连 ffmpeg-next 9 的头文件都过不了编译）。
+#
+# 产物（挂到 GitHub Release，供 AUR aa-player-bin 拉取）：
+#   aa-player-linux-x86_64.tar.gz   布局见下方 assemble 步骤，须与
+#                                   packaging/aur/aa-player-bin/PKGBUILD 一致
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # 创建 Release、上传产物
+
+jobs:
+  linux:
+    name: Linux (Arch 容器)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          pacman -Syu --noconfirm \
+            git rust clang pkgconf \
+            alsa-lib ffmpeg fontconfig freetype2 libxkbcommon wayland vulkan-icd-loader
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 构建
+        run: cargo build --release --locked -p aa-player
+
+      - name: 组装发布包
+        run: |
+          STAGE=stage/aa-player-linux-x86_64
+          mkdir -p "$STAGE/resources/icons"
+          cp target/release/aa-player "$STAGE/"
+          cp resources/aa-player.desktop "$STAGE/resources/"
+          cp -r resources/icons/hicolor "$STAGE/resources/icons/"
+          cp README.md LICENSE "$STAGE/"
+          tar -C stage -czf "aa-player-linux-x86_64.tar.gz" aa-player-linux-x86_64
+          sha256sum aa-player-linux-x86_64.tar.gz > aa-player-linux-x86_64.tar.gz.sha256
+
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            aa-player-linux-x86_64.tar.gz
+            aa-player-linux-x86_64.tar.gz.sha256

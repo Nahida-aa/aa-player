@@ -1,0 +1,43 @@
+# Maintainer: Nahida-aa <nahida.aa@outlook.com>
+# 项目仓库：https://github.com/Nahida-aa/aa-player
+#
+# 源码构建包。动态链接系统 ffmpeg——ffmpeg 大版本升级（soname 变更，
+# 如 libavcodec.so.63→64）后需要 bump pkgrel 重编；这是所有链系统
+# ffmpeg 的包的常态。不想本地编译的用户用 aa-player-bin。
+#
+# 上传 AUR 前把 sha256sums 换成真实校验值（tag 打好后
+# `updpkgsums` 或 curl tarball | sha256sum）。
+
+pkgname=aa-player
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Video player built with Rust and GPUI'
+arch=('x86_64')
+url='https://github.com/Nahida-aa/aa-player'
+license=('Apache-2.0')
+# 直接 NEEDED：alsa-lib(cpal 音频) / ffmpeg(解码) / libxkbcommon(gpui 输入)。
+# gpui 运行时 dlopen 的库也必须列全：fontconfig/freetype2(字体)、
+# wayland(Wayland 后端)、vulkan-icd-loader(GPU 渲染入口)，缺了启动即崩。
+depends=('alsa-lib' 'ffmpeg' 'fontconfig' 'freetype2' 'libxkbcommon' 'wayland'
+         'vulkan-icd-loader')
+makedepends=('cargo' 'clang')
+optdepends=('mesa-vulkan-drivers: Intel/AMD 显卡的 Vulkan 驱动'
+            'nvidia-utils: NVIDIA 显卡的 Vulkan 驱动')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  # --locked：以仓库里的 Cargo.lock 为准，保证依赖与发布时一致可复现。
+  export CARGO_TARGET_DIR=target
+  cargo build --release --locked -p aa-player
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/aa-player "$pkgdir/usr/bin/aa-player"
+  cp -r resources/icons/hicolor/. "$pkgdir/usr/share/icons/hicolor/"
+  install -Dm644 resources/aa-player.desktop \
+    "$pkgdir/usr/share/applications/aa-player.desktop"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
