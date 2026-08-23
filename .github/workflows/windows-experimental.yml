@@ -55,8 +55,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # 排查 vcpkg-rs「FFmpeg not found」：打印它依赖的关键路径。
+      - name: 诊断 vcpkg 树
+        shell: pwsh
+        run: |
+          Write-Host ".vcpkg-root 存在: $(Test-Path "$env:VCPKG_ROOT\.vcpkg-root")"
+          Write-Host "--- installed/vcpkg/ 内容:"
+          Get-ChildItem "$env:VCPKG_ROOT\installed\vcpkg" -Force | Select-Object Name,Length | Format-Table
+          Write-Host "--- status 前 12 行:"
+          if (Test-Path "$env:VCPKG_ROOT\installed\vcpkg\status") {
+            Get-Content "$env:VCPKG_ROOT\installed\vcpkg\status" -TotalCount 12
+          } else { Write-Host "(无 status 文件)" }
+          Write-Host "--- x64-windows 顶层:"
+          Get-ChildItem "$env:VCPKG_ROOT\installed\x64-windows" | Select-Object Name
+
+      # -vv：ffmpeg-sys 的 build.rs 会用 println! 打出 vcpkg 发现失败的具体原因，
+      # 只有 verbose 模式可见。
       - name: 构建
-        run: cargo build --release --locked -p aa-player
+        run: cargo build --release --locked -vv -p aa-player
 
       - name: 组装便携 zip
         shell: pwsh
