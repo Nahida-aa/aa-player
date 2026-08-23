@@ -71,11 +71,12 @@ sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
 cargo run --release -- path/to/video.mp4
 ```
 
-### Windows（实验性）
+### Windows
 
-GitHub Actions 手动触发 `.github/workflows/windows-experimental.yml`
-可产出便携 zip（exe + vcpkg 的 LGPL 共享 ffmpeg DLL）。尚在跑通阶段，
-平台问题见 [TODO.md](TODO.md)。
+从 [Release](https://github.com/Nahida-aa/aa-player/releases/latest) 下载
+`aa-player-windows-x86_64.zip` 解压即用：exe 静态链接 CRT、ffmpeg 为
+vcpkg 的 LGPL 共享 DLL（/MT 自包含），无需安装任何运行库。
+平台差异问题见 [TODO.md](TODO.md)。
 
 ## 结构
 
