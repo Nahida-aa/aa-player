@@ -37,6 +37,13 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          # 自定义三元组：DLL 动态链接（LGPL 合规）+ /MT 静态 CRT（DLL 自包含，
+          # 用户机器免装 VC++ Redist，与 exe 的 crt-static 呼应）。
+          @'
+          set(VCPKG_TARGET_ARCHITECTURE x64)
+          set(VCPKG_CRT_LINKAGE static)
+          set(VCPKG_LIBRARY_LINKAGE dynamic)
+          '@ | Set-Content "$env:VCPKG_ROOT\triplets\x64-windows-dsc.cmake"
 
       # 缓存 installed/（头文件+lib+dll）：cargo 的 vcpkg crate 只读这个目录，
       # 恢复后 vcpkg install 会秒过；迭代编译错误时省掉每次 ~1h 的源码编译。
@@ -44,35 +51,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}\vcpkg\installed
-          key: vcpkg-ffmpeg-x64-windows-v1
+          key: vcpkg-ffmpeg-x64-windows-dsc-v2
 
       - name: 安装 ffmpeg (vcpkg)
         run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" install ffmpeg:x64-windows
+          & "$env:VCPKG_ROOT\vcpkg.exe" install ffmpeg:x64-windows-dsc
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      # 排查 vcpkg-rs「FFmpeg not found」：打印它依赖的关键路径。
-      - name: 诊断 vcpkg 树
-        shell: pwsh
-        run: |
-          Write-Host ".vcpkg-root 存在: $(Test-Path "$env:VCPKG_ROOT\.vcpkg-root")"
-          Write-Host "--- installed/vcpkg/ 内容:"
-          Get-ChildItem "$env:VCPKG_ROOT\installed\vcpkg" -Force | Select-Object Name,Length | Format-Table
-          Write-Host "--- status 前 12 行:"
-          if (Test-Path "$env:VCPKG_ROOT\installed\vcpkg\status") {
-            Get-Content "$env:VCPKG_ROOT\installed\vcpkg\status" -TotalCount 12
-          } else { Write-Host "(无 status 文件)" }
-          Write-Host "--- x64-windows 顶层:"
-          Get-ChildItem "$env:VCPKG_ROOT\installed\x64-windows" | Select-Object Name
-
-      # -vv：ffmpeg-sys 的 build.rs 会用 println! 打出 vcpkg 发现失败的具体原因，
-      # 只有 verbose 模式可见。
+      # VCPKGRS_TRIPLET 优先级最高：让 vcpkg crate 找我们自定义的三元组
+      # （exe 是 crt-static，crate 默认会去找 x64-windows-static 全静态库，不匹配）。
       - name: 构建
-        run: cargo build --release --locked -vv -p aa-player
+        env:
+          VCPKGRS_TRIPLET: x64-windows-dsc
+        run: cargo build --release --locked -p aa-player
 
       - name: 组装便携 zip
         shell: pwsh
@@ -80,8 +75,8 @@ jobs:
           $stage = "stage"
           New-Item -ItemType Directory -Force -Path "$stage" | Out-Null
           Copy-Item target/release/aa-player.exe "$stage/"
-          # vcpkg 共享构建：ffmpeg 全家桶 + 其传递依赖都在 installed/x64-windows/bin。
-          Copy-Item "$env:VCPKG_ROOT\installed\x64-windows\bin\*.dll" "$stage/"
+          # vcpkg 共享构建：ffmpeg 全家桶 + 其传递依赖都在 installed/<triplet>/bin。
+          Copy-Item "$env:VCPKG_ROOT\installed\x64-windows-dsc\bin\*.dll" "$stage/"
           # pkgconf 是构建期宿主工具，混进了 bin，不属于运行时依赖。
           Remove-Item "$stage/pkgconf-8.dll" -ErrorAction SilentlyContinue
           Compress-Archive -Path "$stage/*" -DestinationPath aa-player-windows-x86_64.zip
