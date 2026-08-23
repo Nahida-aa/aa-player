@@ -4,9 +4,14 @@
 # 用与 AUR 用户一致的库版本构建，产物才能直接被 aa-player-bin 分发
 # （ubuntu runner 的 ffmpeg 是 6.x，连 ffmpeg-next 9 的头文件都过不了编译）。
 #
-# 产物（挂到 GitHub Release，供 AUR aa-player-bin 拉取）：
-#   aa-player-linux-x86_64.tar.gz   布局见下方 assemble 步骤，须与
-#                                   packaging/aur/aa-player-bin/PKGBUILD 一致
+# Windows 用 vcpkg 的自定义三元组 x64-windows-dsc（见 windows-experimental.yml
+# 的演进记录）：ffmpeg DLL 动态链接保 LGPL 合规，CRT 全线静态免装 VC++ Redist。
+#
+# 结构：两个构建 job 各自上传 artifact → release job 汇总挂到 GitHub Release，
+# 避免两个 job 并发写同一个 Release 的竞态。
+# 产物（供 AUR aa-player-bin 拉取的 tar.gz 布局须与 PKGBUILD 一致）：
+#   aa-player-linux-x86_64.tar.gz / .sha256
+#   aa-player-windows-x86_64.zip  / .sha256
 name: Release
 
 on:
@@ -50,9 +55,95 @@ jobs:
           tar -C stage -czf "aa-player-linux-x86_64.tar.gz" aa-player-linux-x86_64
           sha256sum aa-player-linux-x86_64.tar.gz > aa-player-linux-x86_64.tar.gz.sha256
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-dist
+          path: |
+            aa-player-linux-x86_64.tar.gz
+            aa-player-linux-x86_64.tar.gz.sha256
+
+  windows:
+    name: Windows (MSVC + vcpkg)
+    runs-on: windows-latest
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+    steps:
+      - uses: actions/checkout@v4
+
+      # 先克隆再恢复缓存：actions/cache 会预创建 vcpkg\installed，
+      # 若它先跑，git clone 进非空目录会失败。
+      - name: 克隆并初始化 vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          # 自定义三元组：DLL 动态链接（LGPL 合规）+ /MT 静态 CRT（DLL 自包含，
+          # 用户机器免装 VC++ Redist，与 exe 的 crt-static 呼应）。
+          @'
+          set(VCPKG_TARGET_ARCHITECTURE x64)
+          set(VCPKG_CRT_LINKAGE static)
+          set(VCPKG_LIBRARY_LINKAGE dynamic)
+          '@ | Set-Content "$env:VCPKG_ROOT\triplets\x64-windows-dsc.cmake"
+
+      # 缓存 installed/（头文件+lib+dll）：cargo 的 vcpkg crate 只读这个目录，
+      # 恢复后 vcpkg install 会秒过；迭代编译错误时省掉每次 ~1h 的源码编译。
+      - name: 缓存 vcpkg 二进制产物
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg\installed
+          key: vcpkg-ffmpeg-x64-windows-dsc-v2
+
+      - name: 安装 ffmpeg (vcpkg)
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install ffmpeg:x64-windows-dsc
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # VCPKGRS_TRIPLET 优先级最高：让 vcpkg crate 找我们自定义的三元组
+      # （exe 是 crt-static，crate 默认会去找 x64-windows-static 全静态库，不匹配）。
+      - name: 构建
+        env:
+          VCPKGRS_TRIPLET: x64-windows-dsc
+        run: cargo build --release --locked -p aa-player
+
+      - name: 组装便携 zip
+        shell: pwsh
+        run: |
+          $stage = "stage"
+          New-Item -ItemType Directory -Force -Path "$stage" | Out-Null
+          Copy-Item target/release/aa-player.exe "$stage/"
+          # vcpkg 共享构建：ffmpeg 全家桶 + 其传递依赖都在 installed/<triplet>/bin。
+          Copy-Item "$env:VCPKG_ROOT\installed\x64-windows-dsc\bin\*.dll" "$stage/"
+          # pkgconf 是构建期宿主工具，混进了 bin，不属于运行时依赖。
+          Remove-Item "$stage/pkgconf-8.dll" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$stage/*" -DestinationPath aa-player-windows-x86_64.zip
+          $hash = (Get-FileHash aa-player-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  aa-player-windows-x86_64.zip" > aa-player-windows-x86_64.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-dist
+          path: |
+            aa-player-windows-x86_64.zip
+            aa-player-windows-x86_64.zip.sha256
+
+  release:
+    name: 汇总发布到 GitHub Release
+    runs-on: ubuntu-latest
+    needs: [linux, windows]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-dist'
+          merge-multiple: true
+
       - name: 发布到 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             aa-player-linux-x86_64.tar.gz
             aa-player-linux-x86_64.tar.gz.sha256
+            aa-player-windows-x86_64.zip
+            aa-player-windows-x86_64.zip.sha256
