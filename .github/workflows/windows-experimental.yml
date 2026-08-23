@@ -31,6 +31,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 先克隆再恢复缓存：actions/cache 会预创建 vcpkg\installed，
+      # 若它先跑，git clone 进非空目录会失败。
+      - name: 克隆并初始化 vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+
       # 缓存 installed/（头文件+lib+dll）：cargo 的 vcpkg crate 只读这个目录，
       # 恢复后 vcpkg install 会秒过；迭代编译错误时省掉每次 ~1h 的源码编译。
       - name: 缓存 vcpkg 二进制产物
@@ -41,8 +48,6 @@ jobs:
 
       - name: 安装 ffmpeg (vcpkg)
         run: |
-          git clone --depth 1 https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
-          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
           & "$env:VCPKG_ROOT\vcpkg.exe" install ffmpeg:x64-windows
 
       - name: 安装 Rust 工具链
