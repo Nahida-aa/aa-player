@@ -2,12 +2,13 @@
 //! 守护用户可感知的行为不变量。区别于 src 内白盒单元测试：
 //! 这里只走公开 API（黑盒），允许整体搬迁、重排而不破坏封装。
 //!
-//! 测试素材：
-//! - 默认用 player-core 自带样本（10s，含音轨）。
-//! - 环境变量 `AA_PLAYER_SMOKE_VIDEO` 可指向任意本地视频覆盖默认
-//!   （对齐 vlc 的 VLC_* 测试环境变量惯例）。绝对时间目标在素材较短时
-//!   由解码侧 seek_clamped 兜底；「向过去跳转」场景要求素材 ≥1s，
-//!   过短自动跳过。
+//! 测试素材（按优先级）：
+//! 1. 仓库根目录 `.env` 的 `VIDEO=`（与 justfile 惯例同款，本地大视频
+//!    不进仓库；改这一个文件即可让全部冒烟跑在真实素材上）
+//! 2. 环境变量 `AA_PLAYER_SMOKE_VIDEO`（CI/临时覆盖）
+//! 3. player-core 自带样本（10s，含音轨）
+//! 绝对时间目标在素材较短时由解码侧 seek_clamped 兜底；
+//! 「向过去跳转」场景要求素材 ≥1s，过短自动跳过。
 //!
 //! 日志：init_tracing 装订阅者后，解码线程的 WARN（欠载/流错误）
 //! 才能浮出——红绿之外还要看病情。
@@ -33,19 +34,46 @@ fn init_tracing() {
     });
 }
 
-/// 冒烟素材路径：`AA_PLAYER_SMOKE_VIDEO` 优先，缺省回落到内置样本。
+/// 冒烟素材路径（优先级见模块文档）：`.env` 的 VIDEO >
+/// `AA_PLAYER_SMOKE_VIDEO` > 内置样本。
+///
+/// 手写解析而非引 dotenv 依赖：只读一个键，不值得为此加 dev-dep。
 fn sample_path() -> PathBuf {
-    let p = match std::env::var_os("AA_PLAYER_SMOKE_VIDEO") {
-        Some(v) => PathBuf::from(v),
-        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../player-core/tests/assets/sample.mp4"),
-    };
+    let p = dotenv_video()
+        .or_else(|| std::env::var_os("AA_PLAYER_SMOKE_VIDEO").map(PathBuf::from))
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../player-core/tests/assets/sample.mp4")
+        });
     assert!(
         p.exists(),
-        "冒烟素材不存在：{}（可用 AA_PLAYER_SMOKE_VIDEO 指定其他视频）",
+        "冒烟素材不存在：{}（可在仓库根目录 .env 写 VIDEO=/path/to/video.mp4）",
         p.display()
     );
     p
+}
+
+/// 读仓库根 `.env` 的 `VIDEO=` 键（存在且非空才生效）。
+fn dotenv_video() -> Option<PathBuf> {
+    // CARGO_MANIFEST_DIR = packages/gpui-video，仓库根在两级之上。
+    let env_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.env")
+        .canonicalize()
+        .ok()?;
+    let content = std::fs::read_to_string(env_file).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(v) = line.strip_prefix("VIDEO=") {
+            let v = v.trim().trim_matches('"').trim_matches('\'');
+            if !v.is_empty() {
+                return Some(PathBuf::from(v));
+            }
+        }
+    }
+    None
 }
 
 /// 轮询读一帧，直到拿到一帧或超时。返回是否拿到。
@@ -57,6 +85,27 @@ fn try_recv_frame(rx: &mut mpsc::Receiver<FrameMsg>, timeout: Duration) -> bool 
             _ => {
                 if Instant::now() >= deadline {
                     return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// 从帧流里读出素材时长（FrameMsg 第 3 元素）。
+///
+/// 黑盒测试**不能信 `controller.duration()`**：它由控制器的帧消费路径
+/// （真实 UI 的渲染循环）更新，这里直接抽通道原始帧，控制器侧恒为 0。
+fn observed_duration(rx: &mut mpsc::Receiver<FrameMsg>) -> Duration {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match rx.try_recv() {
+            Ok(Some((_, _, dur_us, _, _))) => {
+                return Duration::from_micros(dur_us);
+            }
+            _ => {
+                if Instant::now() >= deadline {
+                    panic!("5s 内没收到任何帧，无法得知素材时长");
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -96,8 +145,12 @@ fn seek_preview_release_keeps_frames_flowing() {
     let got = consume_frames(&mut rx, 30, Duration::from_secs(5));
     assert!(got >= 30, "应解出至少 30 帧，实际 {got}");
 
-    // 2) 拖动 seek（preview 拖动中 + release 提交）。
+    // 2) 拖动 seek（preview 拖动中 + release 提交）。中间 sleep 模拟
+    //    **真人按压窗**（~120ms）：此前背靠背发送会被解码线程合并成
+    //    一次，测不到真实点击的断续窗口——设备在预览清队后会饿十几个
+    //    回调，宽限逻辑必须全程吞掉（否则每次点击都误报欠载 WARN）。
     controller.seek_preview(Duration::from_secs(2));
+    std::thread::sleep(Duration::from_millis(120));
     controller.seek_release(Duration::from_secs(2));
 
     // 3) seek 后继续产帧（解码不卡死）。
@@ -123,7 +176,7 @@ fn rapid_drag_does_not_stall_decode() {
     // 2) 快速拖动：50 次 seek_preview 目标递增（模拟快速向右拖），紧接着
     //    seek_release 提交到最终位置。目标上限取素材可容纳的范围
     //    （自定义短素材时由解码侧 seek_clamped 再兜一层底）。
-    let max_t = controller.duration().min(Duration::from_millis(2500));
+    let max_t = observed_duration(&mut rx).min(Duration::from_millis(2500));
     for i in 0..50 {
         let t = max_t.mul_f64(i as f64 / 50.0);
         controller.seek_preview(t);
@@ -156,7 +209,8 @@ fn preview_holds_still_freezes_not_fast_forward() {
 
     // 2) 进入拖动预览：拖动开始（静音）+ 一个 Preview seek 到目标位置，然后
     //    **停住**，模拟"点住 thumb 不松手不滑动"。目标取素材中段。
-    let target = (controller.duration().min(Duration::from_secs(4)) / 2).max(Duration::from_secs(1));
+    let target = (observed_duration(&mut rx).min(Duration::from_secs(4)) / 2)
+        .max(Duration::from_secs(1));
     controller.mute_audio();
     controller.seek_preview(target);
 
@@ -265,10 +319,11 @@ fn paused_seek_backward_then_play_keeps_audio_clock_running() {
     assert!(attached, "音频时钟未 attach：无声卡或解码线程卡住");
 
     // 播一会儿，让位置离开文件头部（向后跳才成立）。素材过短则没有
-    // 「过去」可跳，跳过本场景。
+    // 「过去」可跳，跳过本场景。时长从帧流读（黑盒不信 controller.duration，
+    // 它由真实 UI 的帧消费路径更新，这里恒为 0）。
     let got = consume_frames(&mut rx, 30, Duration::from_secs(5));
     assert!(got >= 30, "应解出至少 30 帧，实际 {got}");
-    if controller.duration() < Duration::from_secs(1) {
+    if observed_duration(&mut rx) < Duration::from_secs(1) {
         eprintln!("素材不足 1s，无法构造向后跳转，跳过");
         return;
     }

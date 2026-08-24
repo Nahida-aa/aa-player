@@ -430,11 +430,22 @@ impl FfmpegSource {
             Flags::BILINEAR,
         )?;
 
-        // 时长：优先流时长，回退到容器时长（均基于 time_base，转秒）。
-        let duration = Duration::from_secs_f64(
-            stream.duration().unsigned_abs() as f64 * f64::from(time_base.numerator())
-                / f64::from(time_base.denominator()),
-        );
+        // 时长：优先流时长，**真的回退到容器时长**（此前只有前半句——
+        // 不少 mp4 的流级 duration 不写，时长只在容器头 mvhd 里，导致
+        // video_info().duration == 0，seek_clamped 把一切目标钳到起点：
+        // 冒烟测试全部退化成"seek 到 0"还不自知）。
+        let duration = {
+            let tb_secs =
+                f64::from(time_base.numerator()) / f64::from(time_base.denominator());
+            let stream_secs = stream.duration().unsigned_abs() as f64 * tb_secs;
+            if stream_secs > 0.0 {
+                Duration::from_secs_f64(stream_secs)
+            } else {
+                // 容器级时长，ffmpeg 的 AVFormatContext.duration 以
+                // AV_TIME_BASE（微秒）计。
+                Duration::from_micros(input.duration().max(0) as u64)
+            }
+        };
         let fps = {
             let r = stream.avg_frame_rate();
             if r.denominator() != 0 {

@@ -75,7 +75,7 @@ pub(crate) fn spawn_decode_thread(
         };
 
         // 只有确实有音轨时才让时钟切到音频主时钟。
-        let mut audio = audio.filter(|_| source.audio_info().is_some());
+        let audio = audio.filter(|_| source.audio_info().is_some());
         if let Some(a) = audio.as_ref() {
             clock_source.attach(a.clock());
             tracing::info!("音频主时钟已启用");
@@ -84,6 +84,7 @@ pub(crate) fn spawn_decode_thread(
         }
 
         let duration_us = source.video_info().duration.as_micros() as u64;
+        tracing::debug!(duration_ms = duration_us / 1000, "解码侧探测时长");
         // 记录视频原始分辨率，供组件按视频比例定尺寸。
         let vinfo = source.video_info();
         *video_size.lock().unwrap_or_else(|e| e.into_inner()) = (vinfo.width, vinfo.height);
@@ -194,6 +195,7 @@ pub(crate) fn spawn_decode_thread(
             // 执行合并后的最新 seek（有则优先于暂停态处理）。
             if let Some((target, cmd)) = latest_seek {
                 let t = seek_clamped(target, duration_us);
+                tracing::debug!(raw=?target, clamped=?t, dur_ms=duration_us/1000, "seek 目标换算");
                 // **点击去重**（对齐 vlc SliderBar：press seek 一次，release 只切
                 // 状态）：Release 若与刚完成的 Preview 同目标，解码位置已在目标
                 // 附近（关键帧 ≤ 目标 ≤ 已前滚处），跳过二次 ffmpeg seek——
@@ -441,7 +443,12 @@ pub(crate) fn spawn_decode_thread(
 }
 
 /// seek (jump) 目标夹到 [0, duration-1s]，避 ffmpeg 末尾阻塞。
+/// 时长未知（0，如直播流/探测失败）时**不夹**——否则一切目标都被
+/// 钳到起点，表现为"点哪都回开头"。
 fn seek_clamped(t: Duration, duration_us: u64) -> Duration {
+    if duration_us == 0 {
+        return t;
+    }
     let margin = SEEK_END_MARGIN_US;
     let max_us = duration_us.saturating_sub(margin);
     let us = (t.as_micros() as u64).min(max_us);

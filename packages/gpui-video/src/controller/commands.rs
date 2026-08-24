@@ -179,7 +179,7 @@ impl PlayerController {
     /// 预测的 position 被 seek 前投递进帧通道的旧帧覆盖（thumb 闪回）的问题，由
     /// 渲染循环在 seek 时（检测到音频时钟换代）丢弃在途旧帧来兜底。
     pub fn seek_to(&mut self, target: Duration) {
-        let target = target.min(self.duration);
+        let target = self.clamp_target(target);
         self.position = target;
         self.dragging = false;
         // 每发一次正式 seek 就推进 seek 代次：seek 前在途的旧帧（代次更小）会在
@@ -196,7 +196,7 @@ impl PlayerController {
     /// 拖动中预览 seek：置取消标志中断旧 seek，本地 position 跟手。
     /// 不再静音（静音由拖动开始的 [`mute_audio`](Self::mute_audio) 负责）。
     pub fn seek_preview(&mut self, target: Duration) {
-        let target = target.min(self.duration);
+        let target = self.clamp_target(target);
         self.position = target;
         self.dragging = true;
         self.cancel_seek.store(true, Ordering::Relaxed);
@@ -210,6 +210,17 @@ impl PlayerController {
     pub fn seek_release(&mut self, target: Duration) {
         self.dragging = false;
         self.seek_to(target);
+    }
+
+    /// 目标夹到 [0, duration]。**时长未知（0）时不夹**——直接钳会把一切
+    /// seek 打回起点（首帧未消费前的启动窗口、以及绕过控制器消费帧的
+    /// 测试环境都会踩中）；解码侧 seek_clamped 拿真实时长兜底。
+    fn clamp_target(&self, target: Duration) -> Duration {
+        if self.duration == Duration::ZERO {
+            target
+        } else {
+            target.min(self.duration)
+        }
     }
 
     /// 相对当前位置 seek（快进/快退）。`delta_ns` 为相对偏移（纳秒），正向前、

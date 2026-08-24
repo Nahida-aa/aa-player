@@ -15,8 +15,9 @@ fn main() {
     // 解析视频路径：优先命令行参数，否则用 player-core 的样本。
     let path: PathBuf = match std::env::args().nth(1) {
         Some(p) => PathBuf::from(p),
-        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../player-core/tests/assets/sample.mp4"),
+        None => {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../player-core/tests/assets/sample.mp4")
+        }
     };
 
     application()
@@ -36,5 +37,5 @@ fn main() {
             )
             .unwrap();
             cx.activate(true);
-        });
+        })
 }

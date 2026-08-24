@@ -85,6 +85,33 @@ fn account(requested: usize, filled: usize, started: bool) -> (usize, bool, bool
     (advance, started, underrun)
 }
 
+/// 断续窗口内的断供不计欠载（vlc 式 discontinuity 消化）。
+///
+/// 窗口语义：`clear()` / `mark_discontinuity()` **置位**开启窗口；
+/// 第一次成功供数（starved=false 的回调）**关闭**窗口。窗口内的
+/// 连续断供——seek/拖动清队后，新数据到达前设备会饿几十个回调——
+/// 全部吞掉；窗口外的断供（真正的解码跟不上）照常上报欠载。
+///
+/// 单独抽出来是为了能脱离声卡测：此前只宽限一次，真实点击在
+/// Change(预览) 与 Release(commit) 之间有 ~100ms 按压窗，设备
+/// 断供十几个回调，第二次起就误报 WARN。
+#[inline]
+fn note_starvation(
+    underrun: &AtomicBool,
+    grace: &AtomicBool,
+    starved: bool,
+) {
+    if starved {
+        // 窗口开着：保持置位（后续回调继续吞），不报欠载。
+        if !grace.load(Ordering::Relaxed) {
+            underrun.store(true, Ordering::Relaxed);
+        }
+    } else {
+        // 有数据流出：断续结束，关闭窗口。此后断供即真欠载。
+        grace.store(false, Ordering::Relaxed);
+    }
+}
+
 /// f32(-1.0..=1.0) → i16。超范围先钳位，否则回绕会变成刺耳爆音。
 #[inline]
 fn f32_to_i16(v: f32) -> i16 {
@@ -134,7 +161,11 @@ impl AudioOutput {
         let paused = Arc::new(AtomicBool::new(false));
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let pushed_frames = Arc::new(AtomicU64::new(0));
-        let grace = Arc::new(AtomicBool::new(false));
+        // 初始即置宽限：设备先于数据启动（probe/解码器预热期间），
+        // 首批数据到达前的断供同样是"预期断续"，不该报欠载——
+        // HE-AAC 素材首窗 queued_ms≈42 的瞬态 WARN 即此来源。
+        // 第一次成功供数会关闭窗口（note_starvation）。
+        let grace = Arc::new(AtomicBool::new(true));
 
         let stream = Self::build_stream(
             &device,
@@ -217,14 +248,7 @@ impl AudioOutput {
                         let (advance, now_started, starved) =
                             account(out.len(), filled, started.load(Ordering::Relaxed));
                         started.store(now_started, Ordering::Relaxed);
-                        if starved {
-                            // 断续宽限：清队（seek/拖动静音）后的第一次断供是
-                            // 预期的——吞掉，别让欠载告警误报。真正的解码
-                            // 跟不上会连续断供，第二次起照常上报。
-                            if !grace.swap(false, Ordering::Relaxed) {
-                                underrun.store(true, Ordering::Relaxed);
-                            }
-                        }
+                        note_starvation(&underrun, &grace, starved);
                         frames_played.fetch_add(
                             (advance / channels as usize) as u64,
                             Ordering::Relaxed,
@@ -427,6 +451,40 @@ mod tests {
         // 不钳位的话整数回绕会把过冲变成反相的最大值——爆音。
         assert_eq!(f32_to_i16(5.0), i16::MAX);
         assert_eq!(f32_to_i16(-5.0), -i16::MAX);
+    }
+
+    // 断续宽限：窗口内连续断供全吞，首次供数关窗，窗外断供照报。
+    // 对应真实点击场景：clear() 后设备断供 ~10 个回调（按压窗），
+    // commit 补数后恢复——任何一次误报都是用户可见的 WARN。
+
+    #[test]
+    fn grace_swallows_whole_starvation_window() {
+        let underrun = AtomicBool::new(false);
+        let grace = AtomicBool::new(true); // clear()/mark_discontinuity() 置位
+        for _ in 0..20 {
+            note_starvation(&underrun, &grace, true);
+            assert!(!underrun.load(Ordering::Relaxed));
+            assert!(grace.load(Ordering::Relaxed), "窗口应保持开启");
+        }
+    }
+
+    #[test]
+    fn first_successful_fill_closes_grace_window() {
+        let underrun = AtomicBool::new(false);
+        let grace = AtomicBool::new(true);
+        note_starvation(&underrun, &grace, true);
+        note_starvation(&underrun, &grace, false); // 新数据落地
+        assert!(!grace.load(Ordering::Relaxed), "供数后窗口应关闭");
+        note_starvation(&underrun, &grace, true); // 窗外再饿 = 真欠载
+        assert!(underrun.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn starvation_outside_window_reports_underrun() {
+        let underrun = AtomicBool::new(false);
+        let grace = AtomicBool::new(false);
+        note_starvation(&underrun, &grace, true);
+        assert!(underrun.load(Ordering::Relaxed));
     }
 
     #[test]
