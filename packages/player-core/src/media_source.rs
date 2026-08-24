@@ -135,6 +135,20 @@ pub trait MediaSource {
 
     /// 跳转到指定时间点（最近关键帧）。已解码的残帧需注意在调用方处理。
     fn seek(&mut self, ts: Duration) -> Result<()>;
+
+    /// 只设置「精确交付丢弃线」，不做 demux seek。
+    ///
+    /// 供「commit 复用预览 seek」时补挂：预览（关键帧快照）已把解码位置
+    /// 带到目标附近，二次 demux seek 纯浪费，但精确交付所需的丢弃线
+    /// （低于线的视频帧不转换、过线前的音频包不解码）仍需设置——否则
+    /// 复用路径的前滚会退回全价转换。普通 seek 路径由调用方在 seek 后
+    /// 显式调用本方法（预览不需要丢弃线：它就是要立刻显示关键帧）。
+    fn arm_discards(&mut self, ts: Duration);
+
+    /// 解除精确交付丢弃线。预览路径用：预览要**立刻**显示落点关键帧，
+    /// 不能被上一次没走完的 commit 前滚遗留的丢弃线挡住（向后拖会先
+    /// 落在旧线之下，帧被静默吞掉、画面跳到旧线之后）。
+    fn clear_discards(&mut self);
 }
 
 /// seek 被「取消信号」中断（对应 Chromium 的 `CancelPendingSeek`）。
@@ -195,12 +209,22 @@ pub struct FfmpegSource {
     /// 每次 `seek` 调用前先清 `false`：这样「当前正在执行的 seek」不会被自己这次
     /// 的取消打断，只有「之后更新的 Preview」置位才会打断它。
     cancel: Arc<AtomicBool>,
+    /// 视频「精确交付丢弃线」（chromium 式输出级丢弃）：低于线的解码帧
+    /// **不做 scaler 转换和像素拷贝**直接扔——精确 seek 前滚路上的帧只付
+    /// 解码钱（~2ms），不付转换钱（~10ms）。大 GOP 向后跳转的冻结时间
+    /// 由此从 GOP 帧数×10ms 降到 ×2ms。由 [`MediaSource::arm_discards`] 设置。
+    video_skip_before: Option<Duration>,
+    /// 音频「包级丢弃线」（vlc es_out 式）：完全位于目标之前的压缩包不送
+    /// 解码器/重采样器。跨线包保留，恢复点前不留空洞。
+    audio_skip_before: Option<Duration>,
 }
 
 /// 音频那一路的状态。
 struct AudioTrack {
     index: usize,
     decoder: AudioDecoder,
+    /// 音频流的时间基（包 PTS → Duration 换算）。
+    time_base: Rational,
     /// 解码器已 drain 完，接下来该把重采样器里的残留也吐出来。
     flushing_resampler: bool,
 }
@@ -211,7 +235,7 @@ impl MediaSource for FfmpegSource {
     }
 
     fn open_with(path: &Path, audio: Option<AudioFormat>) -> Result<Self> {
-        ffmpeg_next::init()?;
+        Self::init_ffmpeg()?;
 
         if !path.exists() {
             return Err(anyhow::anyhow!("source not found: {}", path.display()));
@@ -345,6 +369,11 @@ impl MediaSource for FfmpegSource {
                 probe::packet();
                 continue;
             }
+            // 包级丢弃线：与 dispatch 同规则（完全过线才丢）。
+            if self.audio_drop_packet(&packet) {
+                tracing::debug!(pts = ?packet.pts(), "音频包低于丢弃线，整包跳过");
+                continue;
+            }
             let accepted = self
                 .audio
                 .as_mut()
@@ -396,9 +425,35 @@ impl MediaSource for FfmpegSource {
         self.draining = false;
         Ok(())
     }
+
+    fn arm_discards(&mut self, ts: Duration) {
+        self.video_skip_before = Some(ts);
+        self.audio_skip_before = Some(ts);
+    }
+
+    fn clear_discards(&mut self) {
+        self.video_skip_before = None;
+        self.audio_skip_before = None;
+    }
 }
 
 impl FfmpegSource {
+    /// 进程级 ffmpeg 初始化 + C 层日志静音（幂等，两个打开入口共用）。
+    ///
+    /// libavcodec 的 per-frame 提示（`[aac] Could not update timestamps…`、
+    /// `[hevc] Invalid NAL unit size…`、`env_facs_q invalid`）直写 stderr、
+    /// 绕过 tracing，HE-AAC seek 后成串刷屏且绝大多数是良性噪声。可行动
+    /// 信号（读包错误、取消中断）已由 Rust 层的 Result 与 probe 统计覆盖，
+    /// 故压到 Fatal——真正的崩溃级信息仍会浮出。
+    fn init_ffmpeg() -> Result<()> {
+        static LOG_ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ffmpeg_next::init()?;
+        LOG_ONCE.get_or_init(|| {
+            ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Fatal);
+        });
+        Ok(())
+    }
+
     /// 从一个已打开的输入上下文构造。
     ///
     /// 与 [`MediaSource::open`] 的区别只在于「怎么拿到 `Input`」：
@@ -461,9 +516,11 @@ impl FfmpegSource {
             Some(fmt) => match input.streams().best(ffmpeg_next::media::Type::Audio) {
                 Some(s) => {
                     let index = s.index();
+                    let audio_time_base = s.time_base();
                     Some(AudioTrack {
                         index,
                         decoder: AudioDecoder::new(&s, fmt)?,
+                        time_base: audio_time_base,
                         flushing_resampler: false,
                     })
                 }
@@ -489,6 +546,8 @@ impl FfmpegSource {
             audio,
             draining: false,
             cancel: Arc::new(AtomicBool::new(false)),
+            video_skip_before: None,
+            audio_skip_before: None,
         })
     }
 
@@ -504,7 +563,7 @@ impl FfmpegSource {
         audio_format: Option<AudioFormat>,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self> {
-        ffmpeg_next::init()?;
+        Self::init_ffmpeg()?;
 
         if !path.exists() {
             return Err(anyhow::anyhow!("source not found: {}", path.display()));
@@ -542,7 +601,23 @@ impl FfmpegSource {
     /// 且调用方本来就要按 PTS 自行调度，谁先出来不影响正确性。
     fn take_ready(&mut self) -> Result<Option<MediaEvent>> {
         match self.decoder.receive_frame(&mut self.raw_frame) {
-            Ok(()) => return Ok(Some(MediaEvent::Video(self.frame_to_decoded()?))),
+            Ok(()) => {
+                // 丢弃线：raw pts 在转换前就可知，低于线的帧**绝不走
+                // scaler + 像素拷贝**（chromium VideoRendererImpl 同款：
+                // 被丢弃的解码帧不转换不上传）。返回 None 让外层循环
+                // 继续 receive——帧已消费进 raw_frame，下一帧覆盖它。
+                if let Some(before) = self.video_skip_before {
+                    let pts = match self.raw_frame.timestamp() {
+                        Some(ts) => crate::frame::pts_to_duration(ts, self.time_base),
+                        None => Duration::ZERO,
+                    };
+                    if pts < before {
+                        return Ok(None);
+                    }
+                    self.video_skip_before = None;
+                }
+                return Ok(Some(MediaEvent::Video(self.frame_to_decoded()?)));
+            }
             Err(Error::Other { errno }) if errno == ffmpeg_next::error::EAGAIN => {}
             // Eof 只说明**这一路**吐完了，另一路可能还有货，所以不能就此返回 None。
             Err(Error::Eof) => {}
@@ -580,14 +655,46 @@ impl FfmpegSource {
             return Ok(());
         }
 
-        if let Some(a) = self.audio.as_mut()
-            && index == a.index
-            && !a.decoder.send(&packet)?
-        {
-            self.pending = Some(packet);
+        let is_audio = self.audio.as_ref().is_some_and(|a| a.index == index);
+        if is_audio {
+            // 包级丢弃线（vlc es_out 式）：完全过线的包不进解码器，
+            // 省 AAC 解码 + 重采样的全套开销。
+            if self.audio_drop_packet(&packet) {
+                tracing::debug!(pts = ?packet.pts(), "音频包低于丢弃线，整包跳过");
+                return Ok(());
+            }
+            if let Some(a) = self.audio.as_mut()
+                && !a.decoder.send(&packet)?
+            {
+                self.pending = Some(packet);
+            }
         }
         // 其余流（字幕等）无人认领，丢弃。
         Ok(())
+    }
+
+    /// 音频包是否应按丢弃线整包丢弃。**完全位于目标之前才丢**
+    /// （跨线包保留，恢复点前不留一个块宽的空洞）；保留即视为已到线，
+    /// 顺手清掉丢弃状态。
+    fn audio_drop_packet(&mut self, packet: &Packet) -> bool {
+        let Some(before) = self.audio_skip_before else {
+            return false;
+        };
+        let Some(a) = self.audio.as_ref() else {
+            return false;
+        };
+        let Some(pts) = packet.pts() else {
+            return false;
+        };
+        let start = crate::frame::pts_to_duration(pts, a.time_base);
+        let dur_tb = packet.duration().max(0);
+        let end = start + crate::frame::pts_to_duration(dur_tb, a.time_base);
+        if end <= before {
+            true
+        } else {
+            self.audio_skip_before = None;
+            false
+        }
     }
 
     /// 读出下一个 packet（不分流）；返回 `Ok(None)` 表示文件真正读完。

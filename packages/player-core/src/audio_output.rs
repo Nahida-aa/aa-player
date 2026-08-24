@@ -56,10 +56,12 @@ pub struct AudioOutput {
     /// 解码侧累计推入的**帧数**。与 [`Self::frames_played`](Self::position)
     /// 对照即可算出净产出速率，用于诊断欠载是产不足还是消费异常。
     pushed_frames: Arc<AtomicU64>,
-    /// 断续宽限：seek/清队后到新数据到达之间，回调必然短暂断供——这是
-    /// 预期行为而非解码跟不上。置位时下一次欠载被吞掉（对齐 vlc 的
-    /// discontinuity 处理：设备不断重建，断供由核心层消化）。
-    grace: Arc<AtomicBool>,
+    /// 断续窗口：seek/清队后到稳定供流之间，回调必然断供——这是预期
+    /// 行为而非解码跟不上。开启期间欠载被吞（对齐 vlc 的 discontinuity
+    /// 处理）；连续成功填充 [`GRACE_CLOSE_STREAK`] 次后关闭。
+    grace_open: Arc<AtomicBool>,
+    /// 连续成功填充计数（断供清零），见 `grace_open`。
+    fill_streak: Arc<AtomicU32>,
     /// 是否官方 `start()` 过。开播前的饿回调全是预热期预期断续
     /// （设备先于数据运行），连宽限窗口都不用看。
     ever_started: Arc<AtomicBool>,
@@ -90,34 +92,35 @@ fn account(requested: usize, filled: usize, started: bool) -> (usize, bool, bool
 
 /// 断续窗口内的断供不计欠载（vlc 式 discontinuity 消化）。
 ///
-/// 窗口语义：`clear()` / `mark_discontinuity()` **置位**开启窗口；
-/// 第一次成功供数（starved=false 的回调）**关闭**窗口。窗口内的
-/// 连续断供——seek/拖动清队后，新数据到达前设备会饿几十个回调——
-/// 全部吞掉；窗口外的断供（真正的解码跟不上）照常上报欠载。
+/// 窗口语义：`clear()` / `mark_discontinuity()` / 初始**开启**窗口；
+/// 连续 [`GRACE_CLOSE_STREAK`] 次**成功供数**才关闭——不能一次填充就关：
+/// HE-AAC seek 后的恢复模式是「涓流一帧(42ms)→顿一下→稳定流」，首帧
+/// 填充即关窗会让随后的顿挫误报欠载。断供重置连击计数。窗口内断供
+/// 全吞；窗外断供（真正的解码跟不上）照常上报。
 ///
-/// 单独抽出来是为了能脱离声卡测：此前只宽限一次，真实点击在
-/// Change(预览) 与 Release(commit) 之间有 ~100ms 按压窗，设备
-/// 断供十几个回调，第二次起就误报 WARN。
+/// 单独抽出来是为了能脱离声卡测：此前"首次填充即关窗"在真实点击的
+/// ~100ms 按压窗、以及 HE-AAC 涓流恢复下都会误报 WARN。
 #[inline]
 fn note_starvation(
     underrun: &AtomicBool,
-    grace: &AtomicBool,
+    grace_open: &AtomicBool,
+    fill_streak: &AtomicU32,
     ever_started: bool,
     starved: bool,
 ) {
+    const GRACE_CLOSE_STREAK: u32 = 8;
     if starved {
+        fill_streak.store(0, Ordering::Relaxed);
         // 未官方开播：预热期饿回调全是预期，直接吞（HE-AAC 首窗
         // queued_ms≈42 的瞬态 WARN 即此来源）。
-        if !ever_started {
-            return;
-        }
-        // 窗口开着：保持置位（后续回调继续吞），不报欠载。
-        if !grace.load(Ordering::Relaxed) {
+        if ever_started && !grace_open.load(Ordering::Relaxed) {
             underrun.store(true, Ordering::Relaxed);
         }
     } else {
-        // 有数据流出：断续结束，关闭窗口。此后断供即真欠载。
-        grace.store(false, Ordering::Relaxed);
+        let n = fill_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= GRACE_CLOSE_STREAK {
+            grace_open.store(false, Ordering::Relaxed);
+        }
     }
 }
 
@@ -170,11 +173,12 @@ impl AudioOutput {
         let paused = Arc::new(AtomicBool::new(false));
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let pushed_frames = Arc::new(AtomicU64::new(0));
-        // 初始即置宽限：设备先于数据启动（probe/解码器预热期间），
+        // 初始即开窗：设备先于数据启动（probe/解码器预热期间），
         // 首批数据到达前的断供同样是"预期断续"，不该报欠载——
         // HE-AAC 素材首窗 queued_ms≈42 的瞬态 WARN 即此来源。
-        // 第一次成功供数会关闭窗口（note_starvation）。
-        let grace = Arc::new(AtomicBool::new(true));
+        // 连续稳定填充后会关闭窗口（note_starvation）。
+        let grace_open = Arc::new(AtomicBool::new(true));
+        let fill_streak = Arc::new(AtomicU32::new(0));
         let ever_started = Arc::new(AtomicBool::new(false));
 
         let stream = Self::build_stream(
@@ -186,7 +190,8 @@ impl AudioOutput {
             started.clone(),
             format.channels,
             volume.clone(),
-            grace.clone(),
+            grace_open.clone(),
+            fill_streak.clone(),
             ever_started.clone(),
         )?;
         if play {
@@ -204,7 +209,8 @@ impl AudioOutput {
             paused,
             volume,
             pushed_frames,
-            grace,
+            grace_open,
+            fill_streak,
             ever_started,
         })
     }
@@ -230,7 +236,8 @@ impl AudioOutput {
         started: StartedFlag,
         channels: u16,
         volume: Arc<AtomicU32>,
-        grace: Arc<AtomicBool>,
+        grace_open: Arc<AtomicBool>,
+        fill_streak: Arc<AtomicU32>,
         ever_started: Arc<AtomicBool>,
     ) -> Result<cpal::Stream> {
         let cfg = config.config();
@@ -244,6 +251,8 @@ impl AudioOutput {
                 let underrun = underrun.clone();
                 let started = started.clone();
                 let volume = volume.clone();
+                let grace_open = grace_open.clone();
+                let fill_streak = fill_streak.clone();
                 let ever_started = ever_started.clone();
                 device.build_output_stream(
                     cfg.clone(),
@@ -268,7 +277,8 @@ impl AudioOutput {
                         started.store(now_started, Ordering::Relaxed);
                         note_starvation(
                             &underrun,
-                            &grace,
+                            &grace_open,
+                            &fill_streak,
                             ever_started.load(Ordering::Relaxed),
                             starved,
                         );
@@ -319,7 +329,7 @@ impl AudioOutput {
     /// 同时置断续宽限：清队到新数据到达之间回调必然断供，属预期，
     /// 不该触发欠载告警。
     pub fn clear(&self) {
-        self.grace.store(true, Ordering::Relaxed);
+        self.arm_grace();
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.clear();
     }
@@ -328,7 +338,13 @@ impl AudioOutput {
     /// 区别：只吞欠载误报，不动队列——seek 后旧位置采样由调用方决定
     /// 丢弃时机，断续本身只改变「断供是否算故障」的语义。
     pub fn mark_discontinuity(&self) {
-        self.grace.store(true, Ordering::Relaxed);
+        self.arm_grace();
+    }
+
+    /// 开启断续窗口（清零连击）。clear/mark_discontinuity/构造 共用。
+    fn arm_grace(&self) {
+        self.fill_streak.store(0, Ordering::Relaxed);
+        self.grace_open.store(true, Ordering::Relaxed);
     }
 
     /// 队列中尚未播放的帧数。用于背压：太多就别再解了。
@@ -483,30 +499,56 @@ mod tests {
     #[test]
     fn grace_swallows_whole_starvation_window() {
         let underrun = AtomicBool::new(false);
-        let grace = AtomicBool::new(true); // clear()/mark_discontinuity() 置位
+        let open = AtomicBool::new(true); // clear()/mark_discontinuity()/初始
+        let streak = AtomicU32::new(0);
         for _ in 0..20 {
-            note_starvation(&underrun, &grace, true, true);
+            note_starvation(&underrun, &open, &streak, true, true);
             assert!(!underrun.load(Ordering::Relaxed));
-            assert!(grace.load(Ordering::Relaxed), "窗口应保持开启");
+            assert!(open.load(Ordering::Relaxed), "窗口应保持开启");
         }
     }
 
     #[test]
-    fn first_successful_fill_closes_grace_window() {
+    fn steady_fills_close_grace_window() {
         let underrun = AtomicBool::new(false);
-        let grace = AtomicBool::new(true);
-        note_starvation(&underrun, &grace, true, true);
-        note_starvation(&underrun, &grace, true, false); // 新数据落地
-        assert!(!grace.load(Ordering::Relaxed), "供数后窗口应关闭");
-        note_starvation(&underrun, &grace, true, true); // 窗外再饿 = 真欠载
+        let open = AtomicBool::new(true);
+        let streak = AtomicU32::new(0);
+        // 连续 8 次成功填充才关窗（GRACE_CLOSE_STREAK）。
+        for i in 1..=8u32 {
+            note_starvation(&underrun, &open, &streak, true, false);
+            assert_eq!(
+                open.load(Ordering::Relaxed),
+                i < 8,
+                "第 {i} 次填充后窗口状态错误"
+            );
+        }
+        note_starvation(&underrun, &open, &streak, true, true); // 窗外再饿 = 真欠载
         assert!(underrun.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn trickle_then_stall_stays_silent() {
+        // HE-AAC seek 后的真实恢复模式：涓流一帧(42ms)→顿一下→稳定流。
+        // 「首次填充即关窗」的旧语义在这里误报；连击语义全程静默。
+        let underrun = AtomicBool::new(false);
+        let open = AtomicBool::new(true);
+        let streak = AtomicU32::new(0);
+        for _ in 0..20 {
+            note_starvation(&underrun, &open, &streak, true, false); // 涓流
+            note_starvation(&underrun, &open, &streak, true, false);
+            note_starvation(&underrun, &open, &streak, true, false);
+            note_starvation(&underrun, &open, &streak, true, true); // 顿挫
+            assert!(!underrun.load(Ordering::Relaxed), "涓流+顿挫不应报欠载");
+            assert!(open.load(Ordering::Relaxed));
+        }
     }
 
     #[test]
     fn starvation_outside_window_reports_underrun() {
         let underrun = AtomicBool::new(false);
-        let grace = AtomicBool::new(false);
-        note_starvation(&underrun, &grace, true, true);
+        let open = AtomicBool::new(false);
+        let streak = AtomicU32::new(99);
+        note_starvation(&underrun, &open, &streak, true, true);
         assert!(underrun.load(Ordering::Relaxed));
     }
 
@@ -515,13 +557,14 @@ mod tests {
         // 官方 start() 之前（ever_started=false），设备先于数据运行的
         // 预热期断供连宽限窗口都不用看——HE-AAC 首窗瞬态 WARN 的根源。
         let underrun = AtomicBool::new(false);
-        let grace = AtomicBool::new(false); // 连窗口都没开
+        let open = AtomicBool::new(false); // 连窗口都没开
+        let streak = AtomicU32::new(0);
         for _ in 0..50 {
-            note_starvation(&underrun, &grace, false, true);
+            note_starvation(&underrun, &open, &streak, false, true);
             assert!(!underrun.load(Ordering::Relaxed));
         }
         // 开播后同样的断供立刻如实上报。
-        note_starvation(&underrun, &grace, true, true);
+        note_starvation(&underrun, &open, &streak, true, true);
         assert!(underrun.load(Ordering::Relaxed));
     }
 

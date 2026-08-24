@@ -96,7 +96,18 @@ pub(super) fn deliver_audio(
     running: &AtomicBool,
 ) {
     if let Some(target) = *audio_seek_target {
-        if chunk.pts < target {
+        // 只丢「完全在目标之前」的块（vlc es_out 同款）：跨线块保留——
+        // 起点可略早于目标 ≤ 一个块，但恢复点前不留空洞。与包级丢弃线
+        // （media_source::audio_drop_packet）同一语义。
+        let fully_before = audio.as_ref().is_some_and(|a| {
+            let f = a.format();
+            let end = chunk.pts
+                + Duration::from_secs_f64(
+                    chunk.samples.len() as f64 / f.channels as f64 / f.sample_rate as f64,
+                );
+            end <= target
+        });
+        if fully_before {
             probe::audio_dropped("seek_target");
             return;
         }

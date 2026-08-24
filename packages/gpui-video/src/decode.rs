@@ -214,6 +214,18 @@ pub(crate) fn spawn_decode_thread(
                 } else {
                     tracing::debug!(target = ?t, "commit 与预览同目标，复用预览 seek");
                 }
+                // Commit = 精确交付：挂丢弃线，前滚路上低于线的视频帧不做
+                // scaler/像素拷贝、完全过线的音频包不进解码器（chromium/
+                // vlc 同款）。fresh seek 与复用预览两条路都要挂——预览本身
+                // 不挂（它就是要立刻显示关键帧），还要**解除**可能残留的
+                // 旧线（拖动打断未走完的 commit 前滚时，向后拖的落点关键帧
+                // 会低于旧线而被静默吞掉）。SeekCancelled 分支上面已
+                // continue，到这里 seek 必然已落地。
+                if matches!(cmd, PlayerCommand::SeekCommit(..)) {
+                    source.arm_discards(t);
+                } else {
+                    source.clear_discards();
+                }
                 if matches!(cmd, PlayerCommand::SeekPreview(..)) {
                     // 预览 seek 落地：记录目标，紧随的同目标 Commit 可复用。
                     preview_seek_done = Some(t);
