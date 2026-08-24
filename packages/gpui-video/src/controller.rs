@@ -284,6 +284,3 @@ impl PlayerController {
 }
 
 mod commands;
-
-#[cfg(test)]
-mod tests;
