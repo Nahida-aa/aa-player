@@ -93,7 +93,33 @@ impl Player {
             let mut clock = PlaybackClock::new();
             // 记住音频时钟代次，换代才换时钟柄（保留墙钟 origin）。
             let mut audio_generation: u64 = 0;
+            // 暂停闸门丢弃的在途帧计数（恢复播放后一次性上报）。
+            let mut paused_dropped: u64 = 0;
             while let Some(item) = rx.next().await {
+                // 预览帧或拖动中：直接显示，不走音频时钟调度。
+                // （拖动时声卡静音、音频时钟冻结，正常帧会被 Wait/Drop 卡住；
+                //  拖动中所有帧直接显示，避免残留正常帧用冻结时钟卡住画面。）
+                let is_preview = matches!(&item, Some((_, _, _, true, _)));
+
+                // 暂停闸门：声卡已冻结、解码线程已停，但通道里还躺着最多
+                // FRAME_QUEUE_CAP ≈ 400ms 的在途积压帧。它们 pts 全在暂停点之后，
+                // 照常调度会逐帧 Wait 到点并显示——画面和时间都会"再跑一小段"
+                // 越过暂停点。这里按暂停态静默丢弃（schedule 之前拦下，连
+                // Wait 计时器都省掉）。预览帧放行（暂停中拖动靠它出画面）；
+                // EOF(None) 放行（position 要推到片尾）。
+                let paused_now = this
+                    .update(cx, |p, cx| p.controller.read(cx).paused())
+                    .unwrap_or(true);
+                if paused_now && item.is_some() && !is_preview && !dragging_render.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    paused_dropped += 1;
+                    continue;
+                }
+                if !paused_now && paused_dropped > 0 {
+                    tracing::debug!(paused_dropped, "暂停期间丢弃的在途积压帧");
+                    paused_dropped = 0;
+                }
+
                 // 从音频时钟交接点取 (代次, seek偏移, 时钟)，调度视频帧。
                 let (generation, offset_us, audio) = clock_source.get_with_generation();
                 if generation != audio_generation {
@@ -111,10 +137,8 @@ impl Player {
                 }
                 clock.set_audio_offset(offset_us);
 
-                // 预览帧或拖动中：直接显示，不走音频时钟调度。
-                // （拖动时声卡静音、音频时钟冻结，正常帧会被 Wait/Drop 卡住；
-                //  拖动中所有帧直接显示，避免残留正常帧用冻结时钟卡住画面。）
-                let is_preview = matches!(&item, Some((_, _, _, true, _)));
+                // 预览帧或拖动中：直接显示，不走音频时钟调度（is_preview 已在
+                // 循环入口计算，供暂停闸门与这里共用）。
                 let show = if is_preview || dragging_render.load(std::sync::atomic::Ordering::Relaxed) {
                     true
                 } else {
