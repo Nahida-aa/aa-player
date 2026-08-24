@@ -107,16 +107,12 @@ pub(crate) fn spawn_decode_thread(
         // 暂停中 scrub（拖动/跳转）临时允许解码：解出目标帧显示画面，
         // 但保持暂停（不 start 音频、不推进播放）。
         let mut scrub_paused = false;
-        // 拖动预览「定格」：preview 模式下解过目标帧（+快进余量）后**停住**，
-        // 不再继续往解码。完全不许前进会让拖动画面一跳一跳（每次 seek 只出
-        // 一帧，中间全冻着）；vlc/mpv 的顺滑感来自预览期间画面持续流动。
-        // 折中：越过目标后允许再解 PREVIEW_CREEP 的帧——拖动时表现为跟手的
-        // 连续小段运动；按住不动时最多多走 350ms 就停（不可感知），不会
-        // 变成无限快播。
-        const PREVIEW_CREEP_US: u64 = 350_000;
+        // 拖动预览「定格」：preview 模式下**送出第一帧就停**（vlc 默认拖动
+        // = 关键帧快照：avformat BACKWARD seek 直接落在目标前最近关键帧，
+        // 画面毫秒级更新；Shift 拖才做精确前滚）。此前"精确到点击处 +350ms
+        // 快进余量"在大 GOP 素材（HEVC 常见 250 帧 GOP ≈ 8s）上每次拖动
+        // 要白解几百帧，是拖动迟滞的根源。松手 Commit 才做精确 seek。
         let mut preview_stall = false;
-        // 最近一次 Preview 的目标（微秒）；定格判定 = pts 越过 target+creep。
-        let mut preview_target_us: u64 = 0;
         // 刚落地成功的 Preview seek 目标：同目标的紧随 Commit 复用它，
         // 不再二次 seek（点击 = Change+Release，去重后只 seek 一次）。
         let mut preview_seek_done: Option<Duration> = None;
@@ -243,10 +239,9 @@ pub(crate) fn spawn_decode_thread(
                             a.clear();
                         }
                         previewing = true;
-                        // 新的预览目标：解除上一帧的定格，重新 seek 出目标帧。
+                        // 新的预览目标：解除上一帧的定格，重新 seek 出目标关键帧。
                         preview_stall = false;
                         video_seek_target = None;
-                        preview_target_us = t.as_micros() as u64;
                         // 暂停中拖动：临时允许解码出预览帧显示画面。
                         if paused {
                             scrub_paused = true;
@@ -350,10 +345,11 @@ pub(crate) fn spawn_decode_thread(
                     return;
                 }
                 probe::send_blocked(t_send.elapsed());
-                // 预览帧持续送出直到越过目标 + 快进余量，然后「定格」：
-                // 不再继续往后解码。下一个命令（新 Preview / Commit）会解除定格。
-                // （此前是送出第一帧就定格——拖动画面一跳一跳的根源。）
-                if preview && previewing && pts_us >= preview_target_us + PREVIEW_CREEP_US {
+                // 预览 = 关键帧快照：送出 seek 后第一帧立即「定格」。
+                // 快速拖动时每次 move 都触发新 Preview（latest-wins 合并），
+                // 画面以 demux seek 的速度（毫秒级）持续刷新——vlc 同款
+                // 跟手感；按住不动自然冻结，无快进风险。
+                if preview && previewing {
                     preview_stall = true;
                 }
                 // 暂停中 scrub 已解出目标帧（画面更新），恢复暂停。

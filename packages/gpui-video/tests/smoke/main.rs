@@ -220,20 +220,18 @@ fn preview_holds_still_freezes_not_fast_forward() {
         "Preview 应解出目标帧"
     );
 
-    // 4) **关键**：不再发任何命令（继续"按住不松"）。预览允许越过目标再快进
-    //    PREVIEW_CREEP(350ms) 的帧——这是拖动顺滑感的来源——然后必须定格。
-    //    断言两点：(a) 快进有界：泄漏帧的 pts 不超过目标 + 余量 + 容差；
+    // 4) **关键**：不再发任何命令（继续"按住不松"）。预览 = 关键帧快照
+    //    （vlc 默认拖动）：送出 seek 后第一帧立即定格。断言两点：
+    //    (a) 泄漏有界：定格前最多再漏几帧（在途/已解码的）；
     //    (b) 最终定格：静默窗口内不再有新帧（否则就是无限快播 bug）。
+    //    注意关键帧 pts 允许落在目标**之前**（BACKWARD seek 语义，
+    //    大 GOP 素材可差数秒）——精确落点由松手后的 Commit 负责。
     let mut leaked = 0u32;
-    let mut last_pts_us = 0u64;
     let mut quiet = false;
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         match rx.try_recv() {
-            Ok(Some((_, pts_us, _, _, _))) => {
-                leaked += 1;
-                last_pts_us = last_pts_us.max(pts_us);
-            }
+            Ok(Some(_)) => leaked += 1,
             _ => {
                 if try_recv_frame(&mut rx, Duration::from_millis(400)) {
                     continue;
@@ -244,14 +242,12 @@ fn preview_holds_still_freezes_not_fast_forward() {
         }
     }
     assert!(quiet, "预览必须最终定格，不应无限快进");
-    let overshoot_ms = last_pts_us.saturating_sub(target.as_micros() as u64) / 1000;
     assert!(
-        overshoot_ms <= 600,
-        "按住不动时预览快进应有界（≤目标+350ms+容差），实际越过目标 {overshoot_ms}ms"
+        leaked <= 5,
+        "关键帧快照模式下按住不动只应再漏在途的几帧，实际 {leaked}"
     );
-    assert!(leaked > 0 || target.as_millis() < 100, "应观察到有界的预览流动");
 
-    // 5) 松开（Commit）：恢复正常播放，应重新持续产帧。
+    // 5) 松开（Commit）：精确 seek，恢复正常播放，应重新持续产帧。
     controller.seek_release(target);
     let got_after = consume_frames(&mut rx, 5, Duration::from_secs(5));
     assert!(got_after >= 5, "松开后应恢复产帧，实际 {got_after}");

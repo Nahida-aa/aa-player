@@ -4,7 +4,7 @@
 //! impl。子模块天然可见父级私有字段，拆分不需要任何可见性调整。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use super::{FrameMsg, PlayerCommand, PlayerController, SeekStep};
@@ -195,11 +195,16 @@ impl PlayerController {
 
     /// 拖动中预览 seek：置取消标志中断旧 seek，本地 position 跟手。
     /// 不再静音（静音由拖动开始的 [`mute_audio`](Self::mute_audio) 负责）。
+    /// 拖动中预览 seek：本地位置跟手。**不再置取消标志**——chromium 的
+    /// ffmpeg_glue 从不装 interrupt_callback（取消发生在读调用方层面，
+    /// chunk_demuxer.cc 的 AbortReads 也是在两次 demux 操作之间），中途
+    /// 掐断 avio 会把内部缓冲留在半包状态，后续反复吐出同一个"损坏"
+    /// 包（Invalid NAL unit size 风暴的元凶）。本地文件 avformat_seek_file
+    /// 本就毫秒级，无需中断。
     pub fn seek_preview(&mut self, target: Duration) {
         let target = self.clamp_target(target);
         self.position = target;
         self.dragging = true;
-        self.cancel_seek.store(true, Ordering::Relaxed);
         self.seek_gen += 1;
         let _ = self
             .cmd
