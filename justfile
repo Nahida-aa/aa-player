@@ -4,15 +4,15 @@
 # 不带参数时默认执行 `default`。
 
 # 加载项目根目录的 .env（可写 VIDEO=path/to/video.mp4，供 `just video` 用）。
-# 见 .gitignore：.env 被忽略，不会把本地视频路径提交到仓库。
+# 见 .gitignore: .env 被忽略，不会把本地视频路径提交到仓库。
 set dotenv-load
 
-# 默认 recipe：启动 GUI 应用
+# 默认 recipe
 default:
     @just --list
 
 # 启动播放器 GUI（首次会从 zed git 源编译 GPUI，较慢）
-# 可选传视频路径：`just run path/to/video.mp4`；不传则播放内置样本。
+# 可选传视频路径：`just run path/to/video.mp4`
 run *video:
     cargo run -- {{video}}
 
