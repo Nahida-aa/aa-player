@@ -98,6 +98,8 @@ pub(crate) fn spawn_decode_thread(
         let mut audio_seek_target: Option<Duration> = None;
         // seek 后首帧锚定偏移。
         let mut pending_anchor = false;
+        // Commit 落地时刻：首个精确帧送达时打点（流畅度量化）。
+        let mut commit_t0: Option<Instant> = None;
         // seek 后音频是否已满足起播条件。
         let mut start_audio = false;
         // 待发帧（seek 后避免发 seek 前帧，先在下一轮发）。
@@ -266,6 +268,7 @@ pub(crate) fn spawn_decode_thread(
                         previewing = false;
                         preview_stall = false;
                         pending_anchor = true;
+                        commit_t0 = Some(Instant::now());
                         video_seek_target = Some(t);
                         // 音频也丢弃目标前内容，避免旧位置声音/时钟超前。
                         audio_seek_target = Some(t);
@@ -386,6 +389,15 @@ pub(crate) fn spawn_decode_thread(
                     // seek 后首帧：用实际 pts − 当时音频位置作锚定偏移。
                     if pending_anchor {
                         pending_anchor = false;
+                        // 流畅度观测点：commit 落地 → 精确首帧送达的耗时。
+                        // 停顿时长的直接量化（∝ 落点到前关键帧距离 ÷ 解码速度）。
+                        if let Some(t0) = commit_t0 {
+                            tracing::debug!(
+                                elapsed_ms = t0.elapsed().as_millis() as u64,
+                                "commit→精确首帧"
+                            );
+                            commit_t0 = None;
+                        }
                         let audio_pos_us = audio
                             .as_ref()
                             .map(|a| a.position().as_micros() as i64)
@@ -418,6 +430,12 @@ pub(crate) fn spawn_decode_thread(
                     );
                 }
                 Ok(None) => {
+                    // 前滚分片让出：丢弃线未走完，**不是 EOF**。回循环顶部
+                    // 轮询最新命令（走帧中途的拖动/点击立即接管，不用等
+                    // 整个 GOP 走完）后继续调用。
+                    if source.discards_active() {
+                        continue;
+                    }
                     // EOF：等声卡缓冲播完，然后通知渲染侧，但线程不退出（可再 seek）。
                     if let Some(a) = audio.as_ref() {
                         drain_audio(a, &running);

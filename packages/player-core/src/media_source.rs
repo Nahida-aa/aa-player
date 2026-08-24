@@ -149,6 +149,14 @@ pub trait MediaSource {
     /// 不能被上一次没走完的 commit 前滚遗留的丢弃线挡住（向后拖会先
     /// 落在旧线之下，帧被静默吞掉、画面跳到旧线之后）。
     fn clear_discards(&mut self);
+
+    /// 丢弃线是否仍在生效中。
+    ///
+    /// 给调用方区分 [`next_event`](Self::next_event) 返回 `Ok(None)` 的
+    /// 两种含义：`false` = 真 EOF；`true` = 前滚分片让出（见下），不是
+    /// 结束——回命令循环处理新请求后继续调用即可，线会在越过目标时
+    /// 自动解除。
+    fn discards_active(&self) -> bool;
 }
 
 /// seek 被「取消信号」中断（对应 Chromium 的 `CancelPendingSeek`）。
@@ -270,6 +278,13 @@ impl MediaSource for FfmpegSource {
         // 若放任会无限循环、解码线程挂死、画面冻结。这里限次后按 EOF 结束本次
         // 调用，让调用方能重新 seek 驱动，而不是永久卡住。
         let mut stalled = 0u32;
+        // 前滚分片预算：丢弃线生效时，单次 next_event 最多跳这么多帧就
+        // 返回 Ok(None)（线保持 armed，调用方用 discards_active 区分 EOF）。
+        // 否则整个 GOP 的走帧都在一次调用里完成，解码线程期间无法轮询
+        // 命令——点击后想改目标也得干等走完。分片让出后命令延迟 ≤ 分片
+        // 解码时间（~几十 ms），vlc 同级的接管感。
+        const SKIP_SLICE: u32 = 16;
+        let mut skipped = 0u32;
         probe::maybe_report();
         loop {
             // 1) 优先把已解出的东西交出去，不必等下一个 packet。
@@ -278,6 +293,15 @@ impl MediaSource for FfmpegSource {
                     probe::audio_event();
                 }
                 return Ok(Some(ev));
+            }
+
+            // 丢弃线生效中且本分片跳帧预算用尽：让出。线保持 armed，
+            // 调用方轮询命令后继续调用即可（discards_active 区分 EOF）。
+            if self.video_skip_before.is_some() {
+                skipped += 1;
+                if skipped >= SKIP_SLICE {
+                    return Ok(None);
+                }
             }
 
             if self.draining {
@@ -435,6 +459,10 @@ impl MediaSource for FfmpegSource {
         self.video_skip_before = None;
         self.audio_skip_before = None;
     }
+
+    fn discards_active(&self) -> bool {
+        self.video_skip_before.is_some()
+    }
 }
 
 impl FfmpegSource {
@@ -471,7 +499,23 @@ impl FfmpegSource {
         let stream_index = stream.index();
         let time_base = stream.time_base();
 
-        let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
+        let mut ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
+        // Frame 级多线程解码（vlc/ffmpeg CLI 同款默认）：单线程 HEVC
+        // 1080p ≈ 6ms/帧，精确 seek 前滚一整个 250 帧 GOP 就是 ~1.5s——
+        // "点击跳转有时停顿长有时停顿短"的主因（时长 ∝ 落点到前关键帧
+        // 的距离）。多线程后 ~3-5×，正常播放的 CPU 余量同步受益。
+        // count=0 让 ffmpeg 自定；Frame 模式要求解码器整体延迟 count 帧，
+        // 对播放器吞吐场景无碍。音频解码本身够快，不开。
+        // count 上限 8：Frame 线程超过这个数收益基本饱和（解码吞吐不再
+        // 线性涨），而管线深度=线程数——越深，起播/seek 后首帧越晚出，
+        // 内存也按 count×帧大小涨。8 是 vlc/ffmpeg CLI 的常用档位。
+        ctx.set_threading(ffmpeg_next::codec::threading::Config {
+            kind: ffmpeg_next::codec::threading::Type::Frame,
+            count: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(8),
+        });
         let decoder = ctx.decoder().video()?;
 
         let (width, height) = (decoder.width(), decoder.height());
