@@ -59,6 +59,21 @@ pub struct VideoInfo {
     pub fps: f64,
 }
 
+/// ffmpeg 时间戳（time_base 单位）→ [`Duration`]，负值钳 0。
+///
+/// 音频、视频两路共用的转换点。必须钳 0 而不能裸转：HE-AAC 等格式带
+/// 编码器延迟（priming samples），解码器跳过这些样本时首帧时间戳会变
+/// **负**（伴随警告 "Could not update timestamps for skipped samples"），
+/// `Duration::from_secs_f64` 对负数直接 panic——曾把整个解码线程炸掉、
+/// 播放器瞬间假 EOF。音频/视频时钟都从首个样本起算，负偏移没有意义。
+pub(crate) fn pts_to_duration(ts: i64, time_base: ffmpeg_next::Rational) -> Duration {
+    Duration::from_secs_f64(
+        (ts as f64 * f64::from(time_base.numerator())
+            / f64::from(time_base.denominator()))
+        .max(0.0),
+    )
+}
+
 /// 解码并重采样后的一段音频。
 ///
 /// 与视频「一次一帧」不同，音频天然是连续流：一个 AAC packet 解出 1024 个采样，
@@ -89,5 +104,37 @@ impl AudioChunk {
     #[inline]
     pub fn duration(&self) -> Duration {
         Duration::from_secs_f64(self.frames() as f64 / self.sample_rate.max(1) as f64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：负 PTS 必须钳 0 而不是 panic。
+    ///
+    /// 真实触发场景是 HE-AAC（priming samples 被解码器跳过，首帧时间戳为
+    /// 负），但构造那种素材要专门的编码器；转换逻辑集中在 pts_to_duration，
+    /// 这里对它做穷举即可守住两路调用点。旧实现
+    /// `Duration::from_secs_f64(-x)` 会直接 panic 炸掉解码线程。
+    #[test]
+    fn negative_pts_clamps_to_zero_instead_of_panicking() {
+        let tb = ffmpeg_next::Rational(1, 44100);
+        // 负值：HE-AAC 首帧的实际形态。
+        assert_eq!(pts_to_duration(-1024, tb), Duration::ZERO);
+        assert_eq!(pts_to_duration(-1, tb), Duration::ZERO);
+        // 边界与正常值不受影响。
+        assert_eq!(pts_to_duration(0, tb), Duration::ZERO);
+        assert_eq!(
+            pts_to_duration(1024, tb),
+            Duration::from_secs_f64(1024.0 / 44100.0)
+        );
+        // 毫秒级 time_base 的视频流同样成立。
+        let ms = ffmpeg_next::Rational(1, 1000);
+        assert_eq!(pts_to_duration(-33, ms), Duration::ZERO);
+        assert_eq!(pts_to_duration(500, ms), Duration::from_millis(500));
+        // 大时间戳不溢出/不失真到离谱（f64 秒在播放器尺度下精度足够）。
+        let one_hour_ms = 3_600_000i64;
+        assert_eq!(pts_to_duration(one_hour_ms, ms), Duration::from_secs(3600));
     }
 }
