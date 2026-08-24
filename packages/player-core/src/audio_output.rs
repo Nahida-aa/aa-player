@@ -56,6 +56,10 @@ pub struct AudioOutput {
     /// 解码侧累计推入的**帧数**。与 [`Self::frames_played`](Self::position)
     /// 对照即可算出净产出速率，用于诊断欠载是产不足还是消费异常。
     pushed_frames: Arc<AtomicU64>,
+    /// 断续宽限：seek/清队后到新数据到达之间，回调必然短暂断供——这是
+    /// 预期行为而非解码跟不上。置位时下一次欠载被吞掉（对齐 vlc 的
+    /// discontinuity 处理：设备不断重建，断供由核心层消化）。
+    grace: Arc<AtomicBool>,
 }
 
 /// 播放是否真正开始过（收到过非空采样）。
@@ -130,6 +134,7 @@ impl AudioOutput {
         let paused = Arc::new(AtomicBool::new(false));
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let pushed_frames = Arc::new(AtomicU64::new(0));
+        let grace = Arc::new(AtomicBool::new(false));
 
         let stream = Self::build_stream(
             &device,
@@ -140,6 +145,7 @@ impl AudioOutput {
             started.clone(),
             format.channels,
             volume.clone(),
+            grace.clone(),
         )?;
         if play {
             stream.play()?;
@@ -155,6 +161,7 @@ impl AudioOutput {
             paused,
             volume,
             pushed_frames,
+            grace,
         })
     }
 
@@ -176,6 +183,7 @@ impl AudioOutput {
         started: StartedFlag,
         channels: u16,
         volume: Arc<AtomicU32>,
+        grace: Arc<AtomicBool>,
     ) -> Result<cpal::Stream> {
         let cfg = config.config();
         let err_fn = |e| tracing::error!(error = %e, "音频流错误");
@@ -210,7 +218,12 @@ impl AudioOutput {
                             account(out.len(), filled, started.load(Ordering::Relaxed));
                         started.store(now_started, Ordering::Relaxed);
                         if starved {
-                            underrun.store(true, Ordering::Relaxed);
+                            // 断续宽限：清队（seek/拖动静音）后的第一次断供是
+                            // 预期的——吞掉，别让欠载告警误报。真正的解码
+                            // 跟不上会连续断供，第二次起照常上报。
+                            if !grace.swap(false, Ordering::Relaxed) {
+                                underrun.store(true, Ordering::Relaxed);
+                            }
                         }
                         frames_played.fetch_add(
                             (advance / channels as usize) as u64,
@@ -255,9 +268,20 @@ impl AudioOutput {
 
     /// 清空待播放队列（并丢弃）。用于拖动静音时把已推入但未播出的采样丢掉，
     /// 否则声卡 pause 前队列里已有的音频会继续播完（拖动中听到旧声音）。
+    ///
+    /// 同时置断续宽限：清队到新数据到达之间回调必然断供，属预期，
+    /// 不该触发欠载告警。
     pub fn clear(&self) {
+        self.grace.store(true, Ordering::Relaxed);
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.clear();
+    }
+
+    /// 标记一次**时间轴断续**（seek 跳变）。与 [`clear`](Self::clear) 的
+    /// 区别：只吞欠载误报，不动队列——seek 后旧位置采样由调用方决定
+    /// 丢弃时机，断续本身只改变「断供是否算故障」的语义。
+    pub fn mark_discontinuity(&self) {
+        self.grace.store(true, Ordering::Relaxed);
     }
 
     /// 队列中尚未播放的帧数。用于背压：太多就别再解了。

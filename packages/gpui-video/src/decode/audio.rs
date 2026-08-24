@@ -35,19 +35,25 @@ pub(super) fn try_start_audio(audio: &Option<AudioOutput>, start_audio: &mut boo
         a.start();
     }
 }
-/// 声卡硬件时钟不能倒带：seek 后重建流（计数器归零、先不启动），
-/// 等缓冲填够再 start，再把新时钟句柄交回渲染侧。
-pub(super) fn seek_rebuild_audio(audio: &mut Option<AudioOutput>, clock_source: &Arc<AudioClockSource>) {
-    *audio = match AudioOutput::new_paused() {
-        Ok(o) => Some(o),
-        Err(e) => {
-            tracing::warn!(?e, "seek 后重开音频设备失败，将以无声模式播放");
-            None
-        }
-    };
-    if let Some(a) = audio.as_ref() {
-        clock_source.attach(a.clock());
-    }
+/// seek 后音频善后（vlc 式设计：**设备生命周期与 seek 解耦**）。
+///
+/// vlc 的 aout 在 PTS 断续时从不关闭/重建设备——核心层 drain 旧流、
+/// FIFO 暂存新块、flush 残留、继续播（src/audio_output/dec.c 的
+/// discontinuity 协议）。重建设备是可听见的咔哒声 + 数十毫秒重开延迟，
+/// 是拖动/跳转不流畅的最大单点。
+///
+/// 我们此前每次 commit 都 `new_paused` 重建，理由是"硬件时钟不能倒带"；
+/// 实际上内容时间由渲染侧 anchor 偏移换算（首帧 pts − 当时设备读数），
+/// 设备读数单调递增完全无碍。现在改为：
+/// - 丢弃旧位置残留采样；
+/// - 置断续宽限：清队到新数据到达之间的回调断供不报欠载；
+/// - 时钟换代照旧（渲染侧靠 generation 丢弃在途旧帧），句柄指向同一
+///   存活设备的计数器。
+pub(super) fn seek_reset_audio(audio: &Option<AudioOutput>, clock_source: &Arc<AudioClockSource>) {
+    let Some(a) = audio.as_ref() else { return };
+    a.clear();
+    a.mark_discontinuity();
+    clock_source.attach(a.clock());
 }
 /// 等声卡把缓冲里剩下的采样播完（结尾不掐音）。
 pub(super) fn drain_audio(audio: &AudioOutput, running: &AtomicBool) {

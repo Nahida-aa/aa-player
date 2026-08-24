@@ -22,7 +22,7 @@ mod audio;
 mod probe;
 mod video;
 
-use audio::{AUDIO_BUFFER, deliver_audio, drain_audio, seek_rebuild_audio, try_start_audio};
+use audio::{AUDIO_BUFFER, deliver_audio, drain_audio, seek_reset_audio, try_start_audio};
 use video::{decoded_to_render_image, send_blocking};
 
 /// 帧队列容量。
@@ -106,11 +106,16 @@ pub(crate) fn spawn_decode_thread(
         // 暂停中 scrub（拖动/跳转）临时允许解码：解出目标帧显示画面，
         // 但保持暂停（不 start 音频、不推进播放）。
         let mut scrub_paused = false;
-        // 拖动预览「定格」：preview 模式下解出目标帧后**停住**，不再继续往解码
-        // （否则按住 thumb 不松手时，预览会以解码速度一帧帧快进 —— 用户实测的
-        // "点 thumb 不滑动画面自动快播"）。等到下一个命令（新的 Preview 或 Commit）
-        // 才解除定格、seek 到新目标。
+        // 拖动预览「定格」：preview 模式下解过目标帧（+快进余量）后**停住**，
+        // 不再继续往解码。完全不许前进会让拖动画面一跳一跳（每次 seek 只出
+        // 一帧，中间全冻着）；vlc/mpv 的顺滑感来自预览期间画面持续流动。
+        // 折中：越过目标后允许再解 PREVIEW_CREEP 的帧——拖动时表现为跟手的
+        // 连续小段运动；按住不动时最多多走 350ms 就停（不可感知），不会
+        // 变成无限快播。
+        const PREVIEW_CREEP_US: u64 = 350_000;
         let mut preview_stall = false;
+        // 最近一次 Preview 的目标（微秒）；定格判定 = pts 越过 target+creep。
+        let mut preview_target_us: u64 = 0;
         // 最近一次执行 seek 的代次；投递的每一帧都打上它，供渲染侧丢弃 seek 前
         // 在途的旧帧（代次更小）——它们会覆盖预测的 position 造成进度条闪回。
         let mut current_gen: u64 = 0;
@@ -139,13 +144,13 @@ pub(crate) fn spawn_decode_thread(
                         scrub_paused = false;
                         if let Some(a) = audio.as_ref() {
                             a.resume();
-                            // 重整旗鼓：暂停中做过 seek 的流是 new_paused 建的
-                            // （未开播、时钟零），resume() 只解冻设备。起播必须
-                            // 走统一协议——置 start_audio，让 try_start_audio 在
-                            // 缓冲攒够 AUDIO_START_MIN 后才真正放行。否则这条
-                            // 路径绕过起播协议，曾致「暂停→向后跳转→播放」
-                            // 静音到追上暂停点。拖动预览除外：拖动静音语义
-                            // 优先（队列被 preview 反复 clear，不该出声）。
+                            // 暂停中 commit 过的流：设备被 Pause 冻结、队列被
+                            // 清空，resume() 只解冻设备。起播必须走统一协议——
+                            // 置 start_audio，让 try_start_audio 在缓冲攒够
+                            // AUDIO_START_MIN 后才真正出声。否则这条路径绕过
+                            // 起播协议，曾致「暂停→向后跳转→播放」静音。
+                            // 拖动预览除外：拖动静音语义优先（队列被 preview
+                            // 反复 clear，不该出声）。
                             if !previewing {
                                 start_audio = true;
                             }
@@ -209,7 +214,7 @@ pub(crate) fn spawn_decode_thread(
                 next_frame = None;
                 match cmd {
                     PlayerCommand::SeekPreview(..) => {
-                        // 拖动中预览：seek 视频出预览帧，不重建音频流。
+                        // 拖动中预览：seek 视频出预览帧，不动音频设备。
                         // 静音由拖动开始的 MuteAudio 负责；这里每次 clear 清空
                         // 队列，防止拖动中（声卡已 pause 冻结）解码线程推的音频堆积。
                         if let Some(a) = audio.as_ref() {
@@ -219,13 +224,14 @@ pub(crate) fn spawn_decode_thread(
                         // 新的预览目标：解除上一帧的定格，重新 seek 出目标帧。
                         preview_stall = false;
                         video_seek_target = None;
+                        preview_target_us = t.as_micros() as u64;
                         // 暂停中拖动：临时允许解码出预览帧显示画面。
                         if paused {
                             scrub_paused = true;
                         }
                     }
                     PlayerCommand::SeekCommit(..) => {
-                        // 完整 seek：重建声卡流 + 重锚。
+                        // 完整 seek：善后音频 + 重锚。
                         // **不改变 paused**：暂停时 seek 应保持暂停（只跳位置，
                         // 不自动播放）。播放时 seek 正常恢复（start_audio）。
                         previewing = false;
@@ -234,7 +240,7 @@ pub(crate) fn spawn_decode_thread(
                         video_seek_target = Some(t);
                         // 音频也丢弃目标前内容，避免旧位置声音/时钟超前。
                         audio_seek_target = Some(t);
-                        seek_rebuild_audio(&mut audio, &clock_source);
+                        seek_reset_audio(&audio, &clock_source);
                         if paused {
                             // 暂停中跳转：保持暂停，但临时解码出目标帧显示画面。
                             scrub_paused = true;
@@ -244,7 +250,7 @@ pub(crate) fn spawn_decode_thread(
                         }
                         // 音频流状态转换观测点：静音类 bug（起播协议被绕过、
                         // commit 目标值异常）靠这条日志定罪。
-                        tracing::debug!(target = ?t, paused, start_audio, "seek 重建音频流");
+                        tracing::debug!(target = ?t, paused, start_audio, "seek 音频善后");
                     }
                     _ => unreachable!(),
                 }
@@ -322,9 +328,10 @@ pub(crate) fn spawn_decode_thread(
                     return;
                 }
                 probe::send_blocked(t_send.elapsed());
-                // 预览帧已送出：进入「定格」，不再继续往后解码，画面停在目标帧。
-                // 下一个命令（新 Preview / Commit）会解除定格。
-                if preview && previewing {
+                // 预览帧持续送出直到越过目标 + 快进余量，然后「定格」：
+                // 不再继续往后解码。下一个命令（新 Preview / Commit）会解除定格。
+                // （此前是送出第一帧就定格——拖动画面一跳一跳的根源。）
+                if preview && previewing && pts_us >= preview_target_us + PREVIEW_CREEP_US {
                     preview_stall = true;
                 }
                 // 暂停中 scrub 已解出目标帧（画面更新），恢复暂停。

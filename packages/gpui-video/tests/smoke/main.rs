@@ -151,7 +151,7 @@ fn preview_holds_still_freezes_not_fast_forward() {
     let (mut controller, mut rx) = PlayerController::open(sample_path());
 
     // 1) 消费若干帧（解码线程在跑）。
-    let mut got = consume_frames(&mut rx, 30, Duration::from_secs(5)) as u32;
+    let got = consume_frames(&mut rx, 30, Duration::from_secs(5));
     assert!(got >= 30, "应解出至少 30 帧，实际 {got}");
 
     // 2) 进入拖动预览：拖动开始（静音）+ 一个 Preview seek 到目标位置，然后
@@ -165,22 +165,37 @@ fn preview_holds_still_freezes_not_fast_forward() {
         try_recv_frame(&mut rx, Duration::from_secs(5)),
         "Preview 应解出目标帧"
     );
-    // 再消费掉紧随的 1~2 帧（seek 落点可能先送关键帧前的帧）。
-    got += drain_frames(&mut rx);
 
-    // 4) **关键**：此后不再发任何命令（继续"按住不松"），短窗口内不应再有
-    //    新帧 —— 画面必须定格，否则就是快进 bug。
-    let mut leaked = 0;
-    let window = Duration::from_millis(300);
-    let deadline = Instant::now() + window;
+    // 4) **关键**：不再发任何命令（继续"按住不松"）。预览允许越过目标再快进
+    //    PREVIEW_CREEP(350ms) 的帧——这是拖动顺滑感的来源——然后必须定格。
+    //    断言两点：(a) 快进有界：泄漏帧的 pts 不超过目标 + 余量 + 容差；
+    //    (b) 最终定格：静默窗口内不再有新帧（否则就是无限快播 bug）。
+    let mut leaked = 0u32;
+    let mut last_pts_us = 0u64;
+    let mut quiet = false;
+    let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        leaked += drain_frames(&mut rx);
-        std::thread::sleep(Duration::from_millis(50));
+        match rx.try_recv() {
+            Ok(Some((_, pts_us, _, _, _))) => {
+                leaked += 1;
+                last_pts_us = last_pts_us.max(pts_us);
+            }
+            _ => {
+                if try_recv_frame(&mut rx, Duration::from_millis(400)) {
+                    continue;
+                }
+                quiet = true;
+                break;
+            }
+        }
     }
+    assert!(quiet, "预览必须最终定格，不应无限快进");
+    let overshoot_ms = last_pts_us.saturating_sub(target.as_micros() as u64) / 1000;
     assert!(
-        leaked == 0,
-        "按住不滑动时预览应定格（不应再产帧/快进），300ms 内泄漏了 {leaked} 帧"
+        overshoot_ms <= 600,
+        "按住不动时预览快进应有界（≤目标+350ms+容差），实际越过目标 {overshoot_ms}ms"
     );
+    assert!(leaked > 0 || target.as_millis() < 100, "应观察到有界的预览流动");
 
     // 5) 松开（Commit）：恢复正常播放，应重新持续产帧。
     controller.seek_release(target);
