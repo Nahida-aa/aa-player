@@ -202,10 +202,16 @@ impl AudioDecoder {
             Err(e) => return Err(e.into()),
         }
 
+        // HE-AAC 等格式带编码器延迟（priming samples），解码器跳过这些样本时
+        // 会打警告 "Could not update timestamps for skipped samples"，首帧
+        // 时间戳随之变**负**。Duration 不能为负（from_secs_f64 直接 panic，
+        // 曾把整个解码线程炸掉、播放器瞬间假 EOF）；音频时钟本就从首个
+        // 采样起算，负偏移没有意义，钳到 0。
         let pts = match self.raw.timestamp() {
             Some(ts) => Duration::from_secs_f64(
-                ts as f64 * f64::from(self.time_base.numerator())
-                    / f64::from(self.time_base.denominator()),
+                (ts as f64 * f64::from(self.time_base.numerator())
+                    / f64::from(self.time_base.denominator()))
+                .max(0.0),
             ),
             // 少数容器不给音频帧打 PTS。用「上一块的结束时间」续上，
             // 比塞 ZERO 好：塞 ZERO 会让同步逻辑以为音频一直卡在开头。

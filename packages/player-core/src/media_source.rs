@@ -628,10 +628,12 @@ impl FfmpegSource {
         let stride = self.rgba_frame.stride(0);
         // 注意：PTS 必须取自解码出的原始帧 raw_frame，而非 scaler 输出帧 rgba_frame。
         // swscale 生成的输出帧不带时间戳，rgba_frame.timestamp() 恒为 None。
+        // 负值钳 0：B 帧开头的流首帧 best-effort PTS 可能为负，Duration 不接受。
         let pts = match self.raw_frame.timestamp() {
             Some(ts) => Duration::from_secs_f64(
-                ts as f64 * f64::from(self.time_base.numerator())
-                    / f64::from(self.time_base.denominator()),
+                (ts as f64 * f64::from(self.time_base.numerator())
+                    / f64::from(self.time_base.denominator()))
+                .max(0.0),
             ),
             None => Duration::ZERO,
         };
