@@ -100,6 +100,8 @@ pub(crate) fn spawn_decode_thread(
         let mut pending_anchor = false;
         // Commit 落地时刻：首个精确帧送达时打点（流畅度量化）。
         let mut commit_t0: Option<Instant> = None;
+        // 预览命令发出时刻：首个视频帧送达时打点（拖动第一响应延迟）。
+        let mut preview_t0: Option<Instant> = None;
         // seek 后音频是否已满足起播条件。
         let mut start_audio = false;
         // 待发帧（seek 后避免发 seek 前帧，先在下一轮发）。
@@ -253,6 +255,7 @@ pub(crate) fn spawn_decode_thread(
                             a.clear();
                         }
                         previewing = true;
+                        preview_t0 = Some(Instant::now());
                         // 新的预览目标：解除上一帧的定格，重新 seek 出目标关键帧。
                         preview_stall = false;
                         video_seek_target = None;
@@ -379,6 +382,13 @@ pub(crate) fn spawn_decode_thread(
             let t0 = Instant::now();
             match source.next_event() {
                 Ok(Some(MediaEvent::Video(f))) => {
+                    // 预览第一响应打点：命令发出 → 关键帧出帧。
+                    if let Some(t0) = preview_t0.take() {
+                        tracing::debug!(
+                            elapsed_ms = t0.elapsed().as_millis() as u64,
+                            "预览关键帧出帧"
+                        );
+                    }
                     // seek 后丢弃目标前帧。
                     if let Some(target) = video_seek_target {
                         if f.pts < target {
