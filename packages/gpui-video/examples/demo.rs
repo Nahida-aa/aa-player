@@ -20,7 +20,7 @@ fn main() {
     };
 
     application()
-        // 提供内嵌资源（图标/字体），供 svg().path("icons/…") 加载。
+        // 提供内嵌资源（图标/字体），供 svg().path("icons/…") 加载
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
             // 加载内置字体，保证时间文本正常渲染。
