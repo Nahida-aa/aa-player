@@ -223,15 +223,16 @@ impl Player {
         // 进度条事件 → 控制器 seek：Change=拖动预览，Release=提交。
         // 单位：Slider 值 = 毫秒（step=1 → 1ms 步进），seek 精确到毫秒。
         // 拖动标志用原子量同步给渲染循环（独立 async task 读）。
-        let dragging_change = dragging.clone();
         let dragging_release = dragging.clone();
         cx.subscribe(&progress, move |this, _slider, event, cx| {
             match event {
                 SliderEvent::Change(v) => {
-                    // 拖动开始（第一次 Change）：静音一次（对齐 player-app 的 MuteAudio）。
-                    if !dragging_change.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        this.controller.update(cx, |c, _| c.mute_audio());
-                    }
+                    // 拖动/点击预览。**不再 mute_audio**（vlc：拖动中不停设备）：
+                    // 静音由解码侧天然保证——每次 Preview 清空队列 + previewing
+                    // 闸门丢弃新块，设备播的只是短暂静音；而保持设备"热"着，
+                    // Release 后第一块数据即刻出声（免 80ms 攒缓冲冷启动）。
+                    // 此前 Change 先 pause 设备，是点击延迟明显大于 vlc 的
+                    // 原因之一。
                     this.controller.update(cx, |c, _| {
                         c.seek_preview(Duration::from_millis(v.end() as u64))
                     });

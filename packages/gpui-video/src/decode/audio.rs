@@ -26,6 +26,15 @@ pub(super) fn try_start_audio(audio: &Option<AudioOutput>, start_audio: &mut boo
         return;
     }
     let Some(a) = audio.as_ref() else { return };
+    // 热流快速通道：设备本来就在播放（seek 复用流，从不停设备），
+    // 不存在"空队列开播即爆欠载"的风险，无需攒缓冲——第一块新数据
+    // 落地即可出声（vlc 的 aout 同样不为此设门槛）。冷流/暂停恢复
+    // （started=false 或 paused）仍走 80ms 门槛。
+    if a.started() && !a.is_paused() {
+        *start_audio = false;
+        tracing::debug!("热流已在播放，跳过攒缓冲直接续声");
+        return;
+    }
     if a.queued_duration() >= AUDIO_START_MIN {
         *start_audio = false;
         tracing::debug!(

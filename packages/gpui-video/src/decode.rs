@@ -116,6 +116,9 @@ pub(crate) fn spawn_decode_thread(
         let mut preview_stall = false;
         // 最近一次 Preview 的目标（微秒）；定格判定 = pts 越过 target+creep。
         let mut preview_target_us: u64 = 0;
+        // 刚落地成功的 Preview seek 目标：同目标的紧随 Commit 复用它，
+        // 不再二次 seek（点击 = Change+Release，去重后只 seek 一次）。
+        let mut preview_seek_done: Option<Duration> = None;
         // 最近一次执行 seek 的代次；投递的每一帧都打上它，供渲染侧丢弃 seek 前
         // 在途的旧帧（代次更小）——它们会覆盖预测的 position 造成进度条闪回。
         let mut current_gen: u64 = 0;
@@ -191,16 +194,33 @@ pub(crate) fn spawn_decode_thread(
             // 执行合并后的最新 seek（有则优先于暂停态处理）。
             if let Some((target, cmd)) = latest_seek {
                 let t = seek_clamped(target, duration_us);
-                // 先执行 seek。被更新的 Preview 抢占取消（SeekCancelled）时，
-                // **放弃本次状态设置**，回循环顶部读最新命令重新 seek（对齐
-                // player-app playback.rs:341-354）——否则带着半途 seek 的解码器
-                // 状态继续读，会解出坏帧（快速拖动时高频抢占尤其明显）。
-                if let Err(e) = source.seek(t) {
-                    if e.root_cause().downcast_ref::<SeekCancelled>().is_some() {
-                        tracing::debug!("seek 被抢占取消，重读最新命令");
-                        continue;
+                // **点击去重**（对齐 vlc SliderBar：press seek 一次，release 只切
+                // 状态）：Release 若与刚完成的 Preview 同目标，解码位置已在目标
+                // 附近（关键帧 ≤ 目标 ≤ 已前滚处），跳过二次 ffmpeg seek——
+                // 否则每次点击都要付两遍 seek+前滚延迟，明显比 vlc 慢。
+                let reuse_preview_seek = matches!(cmd, PlayerCommand::SeekCommit(..))
+                    && preview_seek_done.is_some_and(|p| p == t);
+                if !reuse_preview_seek {
+                    // 先执行 seek。被更新的 Preview 抢占取消（SeekCancelled）时，
+                    // **放弃本次状态设置**，回循环顶部读最新命令重新 seek（对齐
+                    // player-app playback.rs:341-354）——否则带着半途 seek 的解码器
+                    // 状态继续读，会解出坏帧（快速拖动时高频抢占尤其明显）。
+                    if let Err(e) = source.seek(t) {
+                        if e.root_cause().downcast_ref::<SeekCancelled>().is_some() {
+                            tracing::debug!("seek 被抢占取消，重读最新命令");
+                            preview_seek_done = None;
+                            continue;
+                        }
+                        tracing::debug!(?e, "seek 失败，继续");
                     }
-                    tracing::debug!(?e, "seek 失败，继续");
+                } else {
+                    tracing::debug!(target = ?t, "commit 与预览同目标，复用预览 seek");
+                }
+                if matches!(cmd, PlayerCommand::SeekPreview(..)) {
+                    // 预览 seek 落地：记录目标，紧随的同目标 Commit 可复用。
+                    preview_seek_done = Some(t);
+                } else {
+                    preview_seek_done = None;
                 }
                 // 记住本次 seek 的代次：此后投递的帧都打上它，渲染侧据此丢弃更旧帧。
                 match cmd {
