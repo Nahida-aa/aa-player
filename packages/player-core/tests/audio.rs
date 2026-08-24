@@ -405,3 +405,47 @@ fn seek_resets_both_streams() {
         "seek 到 2s 后，首个单元应在附近，实际 video={v:?} audio={a:?}"
     );
 }
+
+/// 回归：**seek 到 0 之后音频必须继续产出**。
+///
+/// 实测症状链：暂停→点击进度条向过去跳（目标被钳到 0）→恢复播放，
+/// 音频时钟冻死在 0、永远静音；FFmpeg 打印「Could not update timestamps
+/// for discarded samples」。本测试在媒体源层隔离该场景：播放一段后
+/// seek(0)，后续事件流里必须还有音频块。
+#[test]
+fn seek_to_zero_keeps_audio_flowing() {
+    let mut src =
+        FfmpegSource::open_with(&sample_path(), Some(device_format())).expect("open_with");
+
+    // 播一小段，离开文件头部。
+    for i in 0..60 {
+        if src.next_event().expect("next_event").is_none() {
+            break;
+        }
+        let _ = i;
+    }
+
+    src.seek(Duration::ZERO).expect("seek(0)");
+
+    // seek 后拉一大批事件，统计音频块。
+    let mut audio_chunks = 0usize;
+    let mut first_audio_pts = None;
+    let mut video_frames = 0usize;
+    for _ in 0..600 {
+        match src.next_event().expect("next_event") {
+            Some(MediaEvent::Video(_)) => video_frames += 1,
+            Some(MediaEvent::Audio(c)) => {
+                audio_chunks += 1;
+                first_audio_pts = first_audio_pts.or(Some(c.pts));
+            }
+            None => break,
+        }
+    }
+
+    assert!(video_frames > 0, "seek(0) 后应继续解出视频帧");
+    assert!(
+        audio_chunks > 0,
+        "seek(0) 后 {video_frames} 帧视频里一块音频都没有——解码器干涸"
+    );
+    eprintln!("seek(0) 后：视频 {video_frames} 帧，音频 {audio_chunks} 块，首块 pts={first_audio_pts:?}");
+}

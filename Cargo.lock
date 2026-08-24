@@ -2527,6 +2527,7 @@ dependencies = [
  "player-core",
  "smallvec",
  "tracing",
+ "tracing-subscriber",
  "ui-gpui",
  "wasm-bindgen",
 ]

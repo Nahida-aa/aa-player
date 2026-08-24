@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use futures::channel::mpsc;
 use ffmpeg_next::Error as FfmpegError;
+use futures::channel::mpsc;
 use gpui::RenderImage;
 use player_core::{AudioOutput, FfmpegSource, MediaEvent, MediaSource, SeekCancelled};
 
@@ -22,7 +22,7 @@ mod audio;
 mod probe;
 mod video;
 
-use audio::{deliver_audio, drain_audio, seek_rebuild_audio, try_start_audio, AUDIO_BUFFER};
+use audio::{AUDIO_BUFFER, deliver_audio, drain_audio, seek_rebuild_audio, try_start_audio};
 use video::{decoded_to_render_image, send_blocking};
 
 /// 帧队列容量。
@@ -53,7 +53,8 @@ pub(crate) fn spawn_decode_thread(
     stats: Arc<ProfileStats>,
     video_size: Arc<std::sync::Mutex<(u32, u32)>>,
     video_fps: Arc<std::sync::Mutex<f64>>,
-) {    std::thread::spawn(move || {
+) {
+    std::thread::spawn(move || {
         // 声卡打不开不该让整个播放失败——没有声音总比放不了强。
         let audio = match AudioOutput::new() {
             Ok(o) => Some(o),
@@ -170,11 +171,14 @@ pub(crate) fn spawn_decode_thread(
                         source.set_speed(s);
                     }
                     PlayerCommand::SeekPreview(_, _) | PlayerCommand::SeekCommit(_, _) => {
-                        latest_seek = Some((match cmd {
-                            PlayerCommand::SeekPreview(t, _) => t,
-                            PlayerCommand::SeekCommit(t, _) => t,
-                            _ => unreachable!(),
-                        }, cmd));
+                        latest_seek = Some((
+                            match cmd {
+                                PlayerCommand::SeekPreview(t, _) => t,
+                                PlayerCommand::SeekCommit(t, _) => t,
+                                _ => unreachable!(),
+                            },
+                            cmd,
+                        ));
                     }
                 }
             }
@@ -275,7 +279,16 @@ pub(crate) fn spawn_decode_thread(
                 // 睡眠，泵会跟着声卡的消费节奏一毫秒一毫秒地磨，视频帧
                 // 就饿死了（实测 events 掉到 1 帧/2s）。这里要的是「以解码
                 // 速度灌满、立刻返回」，满与不满由条件判断，不靠睡。
+                //
+                // 门闸丢弃期（暂停 scrub / 拖动预览）必须停泵：此间每块音频
+                // 都会在 deliver_audio 入队前被丢掉，队列读数恒 0，水位条件
+                // 永不满足——泵会以解码速度把整条剩余音轨拉完丢光直到 EOF
+                // （实测 10s 样本一次窗口丢了 469 块）。用户随后恢复播放时
+                // 解码器已见底：静音直到文件尾。这就是「暂停→点击进度条向
+                // 过去跳→恢复后无声」的完整病灶。
                 while running.load(Ordering::Relaxed)
+                    && !scrub_paused
+                    && !previewing
                     && audio
                         .as_ref()
                         .is_some_and(|a| a.queued_duration() < AUDIO_BUFFER)
@@ -301,7 +314,11 @@ pub(crate) fn spawn_decode_thread(
                         }
                     }
                 }
-                if !send_blocking(&mut tx, (render, pts_us, duration_us, preview, frame_gen), &running) {
+                if !send_blocking(
+                    &mut tx,
+                    (render, pts_us, duration_us, preview, frame_gen),
+                    &running,
+                ) {
                     return;
                 }
                 probe::send_blocked(t_send.elapsed());
@@ -396,16 +413,10 @@ pub(crate) fn spawn_decode_thread(
     });
 }
 
-
-/// seek 目标夹到 [0, duration-1s]，避 ffmpeg 末尾阻塞。
+/// seek (jump) 目标夹到 [0, duration-1s]，避 ffmpeg 末尾阻塞。
 fn seek_clamped(t: Duration, duration_us: u64) -> Duration {
     let margin = SEEK_END_MARGIN_US;
     let max_us = duration_us.saturating_sub(margin);
     let us = (t.as_micros() as u64).min(max_us);
     Duration::from_micros(us)
 }
-
-
-
-
-

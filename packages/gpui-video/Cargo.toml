@@ -34,6 +34,9 @@ futures = "0.3"
 
 [dev-dependencies]
 env_logger = "0.11"
+# 测试进程默认没有 tracing 订阅者，所有 WARN/ERROR 会被静默丢弃——
+# 冒烟测试必须能看见音频欠载之类的告警才算数。
+tracing-subscriber = { workspace = true }
 # example 用 asset source 加载图标/字体。
 assets = { path = "../assets" }
 # 桌面窗口后端（example 用 application() 入口）。

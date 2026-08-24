@@ -1,6 +1,22 @@
 use super::*;
 use std::time::Instant;
 
+/// 测试进程安装一次 tracing 订阅者：没有它，解码线程/音频回调里的
+/// WARN（欠载、流错误）会被静默丢弃，冒烟测试就成了"只看红绿不看病情"。
+/// RUST_LOG 可调级别，默认 warn 起步（info 太吵）。
+fn init_tracing() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .with_test_writer()
+            .init();
+    });
+}
+
 /// player-core 的内置样本视频（含音轨）。
 fn sample_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../player-core/tests/assets/sample.mp4")
@@ -27,6 +43,7 @@ fn try_recv_frame(rx: &mut mpsc::Receiver<FrameMsg>, timeout: Duration) -> bool 
 /// 不动、声音继续"的 bug——seek 后解码必须继续，不能停）。
 #[test]
 fn seek_preview_release_keeps_frames_flowing() {
+    init_tracing();
     let (mut controller, mut rx) = PlayerController::open(sample_path());
 
     // 1) 消费若干帧（解码线程在跑）。
@@ -64,6 +81,7 @@ fn seek_preview_release_keeps_frames_flowing() {
 /// seek 下解码线程不卡死、seek 后持续产帧（对齐之前"快速拖动画面卡住"）。
 #[test]
 fn rapid_drag_does_not_stall_decode() {
+    init_tracing();
     let (mut controller, mut rx) = PlayerController::open(sample_path());
 
     // 1) 消费若干帧（解码线程在跑）。
@@ -109,6 +127,7 @@ fn rapid_drag_does_not_stall_decode() {
 /// 不继续产帧（画面停住），直到下一个命令（新 Preview 或 Release 的 Commit）。
 #[test]
 fn preview_holds_still_freezes_not_fast_forward() {
+    init_tracing();
     let (mut controller, mut rx) = PlayerController::open(sample_path());
 
     // 1) 消费若干帧（解码线程在跑）。
@@ -174,6 +193,7 @@ fn preview_holds_still_freezes_not_fast_forward() {
 /// 通道必须归于静默，Resume 后重新流动）。
 #[test]
 fn pause_stops_frame_flow_then_resume_resumes() {
+    init_tracing();
     let (mut controller, mut rx) = PlayerController::open(sample_path());
 
     // 播一会儿。
@@ -210,21 +230,33 @@ fn pause_stops_frame_flow_then_resume_resumes() {
 
 /// 回归：**暂停中向过去跳转、再恢复播放，音频时钟必须重新走起来**。
 ///
-/// 曾因 Resume 只调 resume()（解冻设备）而绕过起播协议——暂停中 seek 重建
-/// 的流是 new_paused 建的（未开播、时钟零），start_audio 又停在 false，
-/// 实测「暂停→点击进度条向后跳→空格」后静音，直到追上暂停点才有声。
-/// 修复后 Resume 统一收编进 start_audio 协议，由 try_start_audio 攒够
-/// AUDIO_START_MIN 再放行。
+/// 病灶有两层（缺一不可，都由本测试守住）：
+/// 1. 泵在门闸丢弃期失控：暂停 scrub 期间每块音频入队前就被丢，
+///    队列读数恒 0，泵的 `queued < AUDIO_BUFFER` 条件永不满足——
+///    以解码速度把整条剩余音轨拉完丢光直到 EOF（10s 样本实测 469 块）。
+///    恢复播放时解码器已见底，静音到文件尾。修法：门闸丢弃期停泵。
+/// 2. Resume 绕过起播协议：暂停中 commit 的流是 new_paused 建的
+///    （未开播、时钟零），Resume 原来只调 resume() 解冻设备，
+///    start_audio 停留在 false，永远等不到 try_start_audio 放行。
+///    修法：Resume 重置 scrub_paused 并置 start_audio（拖动预览除外）。
 #[test]
 fn paused_seek_backward_then_play_keeps_audio_clock_running() {
+    init_tracing();
     let (mut controller, mut rx) = PlayerController::open(sample_path());
 
     // 无声卡环境（容器/无设备机器）：没有音频时钟可断言，跳过。
-    let (_, _, audio0) = controller.clock.get_with_generation();
-    if audio0.is_none() {
-        eprintln!("无声卡，跳过音频起播回归");
-        return;
+    // 注意竞态：解码线程要解出第一块音频才 attach 时钟，open 后立刻查
+    // 必然 None——必须轮询等 attach，否则测试会静默空跑成假绿。
+    let mut attached = false;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if controller.clock.get_with_generation().0 > 0 {
+            attached = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(attached, "音频时钟未 attach：无声卡或解码线程卡住");
 
     // 播一会儿，让位置离开文件头部（向后跳才成立）。
     let mut got = 0;
@@ -258,7 +290,13 @@ fn paused_seek_backward_then_play_keeps_audio_clock_running() {
     controller.play();
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut progressed = false;
+    let mut frames_seen = 0u32;
     while Instant::now() < deadline {
+        // 边观察边消费视频帧：帧通道若被塞满，解码线程会阻塞在
+        // send_blocking 上，音频投递随之停摆（测试环境没有渲染循环兜底）。
+        while rx.try_recv().map(|f| f.is_some()).unwrap_or(false) {
+            frames_seen += 1;
+        }
         let (generation, _, audio) = controller.clock.get_with_generation();
         assert!(generation > gen_before_seek, "seek 后音频时钟应换代");
         if let Some(a) = audio.as_ref() {
@@ -271,6 +309,6 @@ fn paused_seek_backward_then_play_keeps_audio_clock_running() {
     }
     assert!(
         progressed,
-        "恢复播放后音频时钟应前进到 ≥150ms（起播协议收编的回归点）"
+        "恢复播放后音频时钟应前进到 ≥150ms（起播协议收编 + 泵停投回归点；期间消费了 {frames_seen} 帧）"
     );
 }

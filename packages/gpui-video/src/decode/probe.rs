@@ -113,8 +113,10 @@ pub fn audio_chunk(played: Duration, _queued: Duration) {
 }
 
 /// 记录音频块被丢弃的路径（seek 过滤 / scrub 静音）。
-pub fn audio_dropped(_why: &'static str) {
+/// 丢弃原因进 debug 日志：丢弃量异常暴涨（如整轨被丢）时可直接定位闸门。
+pub fn audio_dropped(why: &'static str) {
     ACC.dropped.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(why, "音频块被门闸丢弃");
 }
 
 pub fn pump_chunk() {
