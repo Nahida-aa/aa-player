@@ -28,6 +28,10 @@ pub(super) fn try_start_audio(audio: &Option<AudioOutput>, start_audio: &mut boo
     let Some(a) = audio.as_ref() else { return };
     if a.queued_duration() >= AUDIO_START_MIN {
         *start_audio = false;
+        tracing::debug!(
+            queued_ms = a.queued_duration().as_millis() as u64,
+            "音频攒够缓冲，正式起播"
+        );
         a.start();
     }
 }

@@ -168,3 +168,109 @@ fn preview_holds_still_freezes_not_fast_forward() {
     }
     assert!(got_after >= 5, "松开后应恢复产帧，实际 {got_after}");
 }
+
+/// 冒烟：暂停应停止产帧，恢复后应继续（解码侧语义；渲染侧的暂停闸门在
+/// GPUI 异步任务里，无法无头测试，这里守住通道层不变量：Pause 生效后
+/// 通道必须归于静默，Resume 后重新流动）。
+#[test]
+fn pause_stops_frame_flow_then_resume_resumes() {
+    let (mut controller, mut rx) = PlayerController::open(sample_path());
+
+    // 播一会儿。
+    let mut got = 0;
+    while got < 20 {
+        if try_recv_frame(&mut rx, Duration::from_secs(5)) {
+            got += 1;
+        } else {
+            break;
+        }
+    }
+    assert!(got >= 20, "应解出至少 20 帧，实际 {got}");
+
+    // 暂停：先排干命令生效前在途的最后几帧，然后确认通道静默。
+    controller.pause();
+    while try_recv_frame(&mut rx, Duration::from_millis(250)) {}
+    assert!(
+        !try_recv_frame(&mut rx, Duration::from_millis(600)),
+        "暂停生效后不应继续产帧"
+    );
+
+    // 恢复：重新流动。
+    controller.play();
+    let mut got_after = 0;
+    while got_after < 5 {
+        if try_recv_frame(&mut rx, Duration::from_secs(5)) {
+            got_after += 1;
+        } else {
+            break;
+        }
+    }
+    assert!(got_after >= 5, "恢复后应继续产帧，实际 {got_after}");
+}
+
+/// 回归：**暂停中向过去跳转、再恢复播放，音频时钟必须重新走起来**。
+///
+/// 曾因 Resume 只调 resume()（解冻设备）而绕过起播协议——暂停中 seek 重建
+/// 的流是 new_paused 建的（未开播、时钟零），start_audio 又停在 false，
+/// 实测「暂停→点击进度条向后跳→空格」后静音，直到追上暂停点才有声。
+/// 修复后 Resume 统一收编进 start_audio 协议，由 try_start_audio 攒够
+/// AUDIO_START_MIN 再放行。
+#[test]
+fn paused_seek_backward_then_play_keeps_audio_clock_running() {
+    let (mut controller, mut rx) = PlayerController::open(sample_path());
+
+    // 无声卡环境（容器/无设备机器）：没有音频时钟可断言，跳过。
+    let (_, _, audio0) = controller.clock.get_with_generation();
+    if audio0.is_none() {
+        eprintln!("无声卡，跳过音频起播回归");
+        return;
+    }
+
+    // 播一会儿，让位置离开文件头部（向后跳才成立）。
+    let mut got = 0;
+    while got < 30 {
+        if try_recv_frame(&mut rx, Duration::from_secs(5)) {
+            got += 1;
+        } else {
+            break;
+        }
+    }
+    assert!(got >= 30, "应解出至少 30 帧，实际 {got}");
+
+    // 暂停并确认静默。
+    controller.pause();
+    while try_recv_frame(&mut rx, Duration::from_millis(250)) {}
+    assert!(
+        !try_recv_frame(&mut rx, Duration::from_millis(400)),
+        "暂停生效后不应继续产帧"
+    );
+
+    // 暂停中向后跳（对齐用户操作：点击进度条 = 直接 SeekCommit）。
+    let gen_before_seek = controller.clock.get_with_generation().0;
+    controller.seek_to(Duration::from_millis(200));
+    // commit 的 scrub 目标帧应送达（本测试读通道本身，不经过渲染闸门）。
+    assert!(
+        try_recv_frame(&mut rx, Duration::from_secs(5)),
+        "暂停中 commit 应解出目标帧"
+    );
+
+    // 恢复播放：音频时钟应换代（重建流）并持续前进到可感知量。
+    controller.play();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut progressed = false;
+    while Instant::now() < deadline {
+        let (generation, _, audio) = controller.clock.get_with_generation();
+        assert!(generation > gen_before_seek, "seek 后音频时钟应换代");
+        if let Some(a) = audio.as_ref() {
+            if a.position() >= Duration::from_millis(150) {
+                progressed = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        progressed,
+        "恢复播放后音频时钟应前进到 ≥150ms（起播协议收编的回归点）"
+    );
+}

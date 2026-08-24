@@ -133,8 +133,21 @@ pub(crate) fn spawn_decode_thread(
                     }
                     PlayerCommand::Resume => {
                         paused = false;
+                        // 清理 scrub 残留：空格若按在暂停中跳转的收尾中途，
+                        // 不清理会让音频投递被 deliver_audio 持续丢弃。
+                        scrub_paused = false;
                         if let Some(a) = audio.as_ref() {
                             a.resume();
+                            // 重整旗鼓：暂停中做过 seek 的流是 new_paused 建的
+                            // （未开播、时钟零），resume() 只解冻设备。起播必须
+                            // 走统一协议——置 start_audio，让 try_start_audio 在
+                            // 缓冲攒够 AUDIO_START_MIN 后才真正放行。否则这条
+                            // 路径绕过起播协议，曾致「暂停→向后跳转→播放」
+                            // 静音到追上暂停点。拖动预览除外：拖动静音语义
+                            // 优先（队列被 preview 反复 clear，不该出声）。
+                            if !previewing {
+                                start_audio = true;
+                            }
                         }
                     }
                     PlayerCommand::MuteAudio => {
@@ -225,6 +238,9 @@ pub(crate) fn spawn_decode_thread(
                         } else {
                             start_audio = true;
                         }
+                        // 音频流状态转换观测点：静音类 bug（起播协议被绕过、
+                        // commit 目标值异常）靠这条日志定罪。
+                        tracing::debug!(target = ?t, paused, start_audio, "seek 重建音频流");
                     }
                     _ => unreachable!(),
                 }
