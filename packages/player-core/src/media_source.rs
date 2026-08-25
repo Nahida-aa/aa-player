@@ -247,11 +247,11 @@ pub struct FfmpegSource {
     audio_convergence_left: u32,
 }
 
-/// 每次 demux seek 后丢弃的音频收敛帧数。重建解码器后 SBR 状态已干净，
-/// 丢弃帧主要用于让声卡缓冲区回填（preview 模式下 pump 被禁用，音频
-/// 只靠主循环 event 推送，频率较低）。3 帧 ≈70ms 是拖动流畅性与延迟的
-/// 平衡点。
-pub const AUDIO_CONVERGENCE_FRAMES: u32 = 3;
+/// 每次 demux seek 后丢弃的音频收敛帧数。重建解码器（recreate）后
+/// SBR/IMDCT 状态已完全干净，无需丢弃收敛帧。拖动时 ~50次/秒 seek，
+/// 每次丢弃帧都会抽空声卡缓冲区（preview 模式 pump 被禁用），导致
+/// 欠载断续。设为 0 确保音频帧全部入队，维持缓冲区健康。
+pub const AUDIO_CONVERGENCE_FRAMES: u32 = 0;
 
 /// 音频那一路的状态。
 struct AudioTrack {
