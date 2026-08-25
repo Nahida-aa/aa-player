@@ -109,6 +109,24 @@ impl AudioDecoder {
         })
     }
 
+    /// 重建解码器：drop 旧 `avcodec_open2` → 全新解码器（含全新 SBR 状态）。
+    ///
+    /// ffmpeg 的 `avcodec_flush_buffers` **不重置** SBR（Spectral Band
+    /// Replication）差分编码参数——`env_facs_q` 等从旧文件位置保留，seek 后
+    /// 首帧差分溢出产生电音（`env_facs_q 254/255 is invalid`）。
+    /// 重建解码器通过 `avcodec_open2` 分配全新内部状态，彻底消除此问题。
+    ///
+    /// 成本 ~1ms/次，用户驱动 seek 完全可接受。
+    pub fn recreate(
+        &mut self,
+        stream: &ffmpeg_next::format::stream::Stream,
+    ) -> Result<()> {
+        let mut dec = Self::new(stream, self.target)?;
+        dec.set_speed(self.speed);
+        *self = dec;
+        Ok(())
+    }
+
     /// 构造一个重采样器：输入为源格式/率，输出为交错的 f32，目标设备格式，
     /// 输出采样率为 `output_rate`（= 设备率/speed）。抽出来给 `new`/`set_speed`/
     /// `flush` 共用，三处都要按当前 speed 重建重采样器。

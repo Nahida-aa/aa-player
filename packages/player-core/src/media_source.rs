@@ -247,16 +247,10 @@ pub struct FfmpegSource {
     audio_convergence_left: u32,
 }
 
-/// 每次 demux seek 后丢弃的音频收敛帧数。ffmpeg 的 `avcodec_flush_buffers`
-/// **不重置** SBR（Spectral Band Replication）状态——`env_facs_q` 等差分编码
-/// 参数保留旧位置的值，首帧差分编码会溢出（出现 `env_facs_q 254/255 is
-/// invalid` 错误），输出损坏帧。SBR 需要若干帧从实际比特流重建状态才能
-/// 收敛。2020 年 Tencent 的补丁（memset SBR context + reinit）从未合入主线。
-///
-/// HE-AACv2 一帧 ≈23ms，5 帧 ≈115ms，覆盖绝大多数 SBR/PS 收敛场景。
-/// 代价是普通 AAC-LC 每次 seek 多丢 115ms——可接受，与 vlc 的 pre-roll
-/// 丢弃策略同级。
-pub const AUDIO_CONVERGENCE_FRAMES: u32 = 5;
+/// 每次 demux seek 后丢弃的音频收敛帧数。重建解码器后 SBR 状态已干净，
+/// 此处仅保留1帧安全余量（首个输出帧的 IMDCT overlap 可能含微量残留）。
+/// HE-AACv2 一帧 ≈23ms，代价极小。
+pub const AUDIO_CONVERGENCE_FRAMES: u32 = 1;
 
 /// 音频那一路的状态。
 struct AudioTrack {
@@ -465,10 +459,17 @@ impl MediaSource for FfmpegSource {
             }
             Err(e) => return Err(e.into()),
         }
-        // seek 后必须 flush 解码器，丢弃残留守帧，否则花屏。
+        // seek 后必须重建音频解码器：ffmpeg 的 flush 不重置 SBR 状态，
+        // 差分编码从旧位置溢出产生电音。重建通过 avcodec_open2 分配全新
+        // 内部状态，彻底消除 env_facs_q 错误。
         self.decoder.flush();
         if let Some(a) = self.audio.as_mut() {
-            a.decoder.flush();
+            let stream = self
+                .input
+                .streams()
+                .best(ffmpeg_next::media::Type::Audio)
+                .ok_or_else(|| anyhow::anyhow!("no audio stream"))?;
+            a.decoder.recreate(&stream)?;
             a.flushing_resampler = false;
         }
         // 新进入点的前几帧 AAC 收敛帧（SBR/PS 上状态缺失）是劣化输出，
