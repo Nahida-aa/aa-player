@@ -252,14 +252,12 @@ pub(crate) fn spawn_decode_thread(
                 finished = false;
                 next_frame = None;
                 match cmd {
-                    PlayerCommand::SeekPreview(..) => {
-                        // 拖动中预览：seek 视频出预览帧，不动音频设备。
-                        // 静音由拖动开始的 MuteAudio 负责；这里每次 clear 清空
-                        // 队列，防止拖动中（声卡已 pause 冻结）解码线程推的音频堆积。
-                        if let Some(a) = audio.as_ref() {
-                            a.clear();
-                        }
+                    PlayerCommand::SeekPreview(t, _) => {
+                        // 拖动中预览：seek 视频出预览帧。音频不清队列（vlc
+                        // 风格：拖动中播放音频），用 audio_seek_target 按 PTS
+                        // 丢弃旧位置帧，避免每次 clear 抽空缓冲区导致欠载。
                         previewing = true;
+                        audio_seek_target = Some(t);
                         preview_t0 = Some(Instant::now());
                         // 新的预览目标：解除上一帧的定格，重新 seek 出目标关键帧。
                         preview_stall = false;
