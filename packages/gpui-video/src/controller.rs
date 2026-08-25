@@ -178,6 +178,11 @@ pub struct PlayerController {
     /// 最近一次 seek 的代次（每次 seek_preview/seek_to 自增）。帧携带自己所属
     /// 的 seek 代次，`consume_frame` 据此丢弃 seek 前在途的旧帧（不覆盖 position）。
     seek_gen: u64,
+    /// 最近一次真正下发的预览时刻（预览节流用）。拖动时鼠标移动事件可达
+    /// 60+/s，每次都 demux seek 会把音频切成 16ms 碎片——碎片里 AAC 中途
+    /// 进入的收敛帧占大头，听感就是持续的滋滋/咔咔电音。节流后每个预览
+    /// 有 ~45ms 可闻窗，碎片变成可辨识的位置采样（vlc 拖动手感）。
+    last_preview_sent: Option<std::time::Instant>,
     /// 取消标志：发新 Preview 前置 true，中断解码线程里进行中的旧 seek。
     cancel_seek: Arc<AtomicBool>,
     /// 音频主时钟交接点（供渲染侧调度视频）。
@@ -234,6 +239,7 @@ impl PlayerController {
                 i18n: I18n::default(),
                 info_open: false,
                 seek_gen: 0,
+                last_preview_sent: None,
                 cancel_seek,
                 clock,
                 stats,

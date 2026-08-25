@@ -10,6 +10,9 @@ use std::time::Duration;
 use super::{FrameMsg, PlayerCommand, PlayerController, SeekStep};
 use crate::i18n::{Lang, StrKey};
 
+/// 两次预览 seek 的最小间隔（≈22 次/s）。见 [`PlayerController::seek_preview`]。
+const PREVIEW_MIN_INTERVAL: Duration = Duration::from_millis(45);
+
 impl PlayerController {
     /// 切换静音（持久）。同时下发命令让解码线程调音量增益。
     pub fn toggle_mute(&mut self) {
@@ -193,19 +196,29 @@ impl PlayerController {
         let _ = self.cmd.unbounded_send(PlayerCommand::MuteAudio);
     }
 
-    /// 拖动中预览 seek：置取消标志中断旧 seek，本地 position 跟手。
-    /// 不再静音（静音由拖动开始的 [`mute_audio`](Self::mute_audio) 负责）。
-    /// 拖动中预览 seek：本地位置跟手。**不再置取消标志**——chromium 的
-    /// ffmpeg_glue 从不装 interrupt_callback（取消发生在读调用方层面，
-    /// chunk_demuxer.cc 的 AbortReads 也是在两次 demux 操作之间），中途
-    /// 掐断 avio 会把内部缓冲留在半包状态，后续反复吐出同一个"损坏"
-    /// 包（Invalid NAL unit size 风暴的元凶）。本地文件 avformat_seek_file
-    /// 本就毫秒级，无需中断。
+    /// 拖动中预览 seek：本地位置跟手 + 节流下发。
+    ///
+    /// **节流**：鼠标移动事件 60+/s，若每次都 demux seek，音频被切成
+    /// ~16ms 碎片且每次进入点都带 AAC 收敛噪声——拖动电音的直接来源。
+    /// 这里限制真实 seek 频率 ≤ `PREVIEW_MIN_INTERVAL`（~22/s），窗口内
+    /// 的移动只更新 UI position（跟手不变），解码侧停在上一预览位置。
+    /// 松手的 [`seek_release`](Self::seek_release) 永远全量执行，最终
+    /// 落点不受节流影响。
+    /// **不置取消标志**——chromium 的 ffmpeg_glue 从不装 interrupt_callback
+    /// （取消发生在读调用方层面），中途掐断 avio 会把内部缓冲留在半包
+    /// 状态，反复吐同一个"损坏"包。本地文件 avformat_seek_file 本就毫秒级。
     pub fn seek_preview(&mut self, target: Duration) {
         let target = self.clamp_target(target);
         self.position = target;
         self.dragging = true;
         self.seek_gen += 1;
+        let now = std::time::Instant::now();
+        if let Some(t) = self.last_preview_sent
+            && now.duration_since(t) < PREVIEW_MIN_INTERVAL
+        {
+            return;
+        }
+        self.last_preview_sent = Some(now);
         let _ = self
             .cmd
             .unbounded_send(PlayerCommand::SeekPreview(target, self.seek_gen));

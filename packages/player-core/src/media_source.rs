@@ -225,7 +225,19 @@ pub struct FfmpegSource {
     /// 音频「包级丢弃线」（vlc es_out 式）：完全位于目标之前的压缩包不送
     /// 解码器/重采样器。跨线包保留，恢复点前不留空洞。
     audio_skip_before: Option<Duration>,
+    /// 音频「收敛帧预算」：每次 demux seek 后要静默丢弃的前 N 个解码帧。
+    ///
+    /// AAC（尤其 HE-AACv2 的 SBR/PS）中途进入时，前几帧缺少上状态
+    /// （SBR 包络/PS 参数），解出来是劣化甚至噪声内容。vlc 对这类帧
+    /// 同样不播。每次 `seek()` 重置预算；`arm_discards`（commit 复用
+    /// 预览路径）**不**重置——预览那次 seek 已经丢过，再丢就是凭空挖洞。
+    audio_convergence_left: u32,
 }
+
+/// 每次 demux seek 后丢弃的音频收敛帧数。HE-AACv2 一帧 ≈23ms，
+/// 2 帧 ≈46ms，覆盖 SBR/PS 状态重建期，代价是普通 AAC-LC 每次 seek
+/// 少听 46ms——与 vlc 的同类处理一致。
+pub const AUDIO_CONVERGENCE_FRAMES: u32 = 2;
 
 /// 音频那一路的状态。
 struct AudioTrack {
@@ -440,6 +452,9 @@ impl MediaSource for FfmpegSource {
             a.decoder.flush();
             a.flushing_resampler = false;
         }
+        // 新进入点的前几帧 AAC 收敛帧（SBR/PS 上状态缺失）是劣化输出，
+        // 不播。见 `audio_convergence_left` 字段文档。
+        self.audio_convergence_left = AUDIO_CONVERGENCE_FRAMES;
         // 暂存的 packet 属于 seek 前的位置，留着会在新位置插进一段旧内容。
         self.pending = None;
         // 续杯攒下的视频包同理：全是旧位置的压缩包，必须丢弃。
@@ -466,18 +481,24 @@ impl MediaSource for FfmpegSource {
 }
 
 impl FfmpegSource {
-    /// 进程级 ffmpeg 初始化 + C 层日志静音（幂等，两个打开入口共用）。
+    /// 当前音频收敛帧预算（测试观测用）。见 `audio_convergence_left`。
+    #[doc(hidden)]
+    pub fn audio_convergence_budget(&self) -> u32 {
+        self.audio_convergence_left
+    }
+
+    /// 进程级 ffmpeg 初始化 + C 层日志桥（幂等，两个打开入口共用）。
     ///
-    /// libavcodec 的 per-frame 提示（`[aac] Could not update timestamps…`、
-    /// `[hevc] Invalid NAL unit size…`、`env_facs_q invalid`）直写 stderr、
-    /// 绕过 tracing，HE-AAC seek 后成串刷屏且绝大多数是良性噪声。可行动
-    /// 信号（读包错误、取消中断）已由 Rust 层的 Result 与 probe 统计覆盖，
-    /// 故压到 Fatal——真正的崩溃级信息仍会浮出。
+    /// libavcodec 的日志直写 stderr、绕过 tracing。曾两度走极端：全放行
+    /// 时 HE-AAC seek 后成串刷屏；ef180c3 压到 Fatal 后用户完全看不到
+    /// 警告——排查电音问题时失去了关键线索。现在由 [`crate::ffmpeg_log`]
+    /// 装自定义回调：按级别路由进 tracing + 同文 3s 窗节流聚合，
+    /// 默认 Warning 级，`AA_PLAYER_FFMPEG_LOG` 可覆盖。
     fn init_ffmpeg() -> Result<()> {
         static LOG_ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         ffmpeg_next::init()?;
         LOG_ONCE.get_or_init(|| {
-            ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Fatal);
+            crate::ffmpeg_log::install(ffmpeg_next::log::Level::Warning);
         });
         Ok(())
     }
@@ -592,6 +613,7 @@ impl FfmpegSource {
             cancel: Arc::new(AtomicBool::new(false)),
             video_skip_before: None,
             audio_skip_before: None,
+            audio_convergence_left: 0,
         })
     }
 
@@ -670,7 +692,16 @@ impl FfmpegSource {
 
         if let Some(a) = self.audio.as_mut() {
             match a.decoder.receive()? {
-                Some(c) => return Ok(Some(MediaEvent::Audio(c))),
+                Some(c) => {
+                    // 收敛帧预算：seek 后前几帧是 AAC 中途进入的劣化输出，
+                    // 静默丢弃（vlc 同款）。消费掉预算即恢复，正常播放零开销。
+                    if self.audio_convergence_left > 0 {
+                        self.audio_convergence_left -= 1;
+                        tracing::debug!(pts = ?c.pts, "丢弃 seek 后音频收敛帧");
+                        return Ok(None);
+                    }
+                    return Ok(Some(MediaEvent::Audio(c)));
+                }
                 // receive 把 EAGAIN 和 Eof 都映射成 None。draining 阶段的 None
                 // 就意味着解码器空了，该轮到重采样器交尾巴了。
                 None if self.draining => a.flushing_resampler = true,

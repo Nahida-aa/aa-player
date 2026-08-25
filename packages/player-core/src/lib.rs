@@ -10,6 +10,7 @@
 pub mod audio_decoder;
 pub mod audio_output;
 pub mod error;
+pub mod ffmpeg_log;
 pub mod frame;
 pub mod media_source;
 
