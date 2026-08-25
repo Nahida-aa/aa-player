@@ -248,9 +248,10 @@ pub struct FfmpegSource {
 }
 
 /// 每次 demux seek 后丢弃的音频收敛帧数。重建解码器后 SBR 状态已干净，
-/// 此处仅保留1帧安全余量（首个输出帧的 IMDCT overlap 可能含微量残留）。
-/// HE-AACv2 一帧 ≈23ms，代价极小。
-pub const AUDIO_CONVERGENCE_FRAMES: u32 = 1;
+/// 丢弃帧主要用于让声卡缓冲区回填（preview 模式下 pump 被禁用，音频
+/// 只靠主循环 event 推送，频率较低）。3 帧 ≈70ms 是拖动流畅性与延迟的
+/// 平衡点。
+pub const AUDIO_CONVERGENCE_FRAMES: u32 = 3;
 
 /// 音频那一路的状态。
 struct AudioTrack {
