@@ -108,6 +108,11 @@ pub(crate) fn spawn_decode_thread(
         let mut next_frame: Option<(Arc<RenderImage>, u64, bool, u64)> = None;
         // 已放完（EOF），只等 seek 命令。
         let mut finished = false;
+        // 源已进入尾部排空（draining），尚未等到 Ok(None) 真 EOF。
+        // 在 `source.is_draining()` 首次返回 true 时立即标记，不等
+        // 解码器尾巴冲洗完（实测帧线程管线冲洗 ≈2s，期间音频队列
+        // 耗尽，宽限窗关闭后全是假欠载）。
+        let mut eof_marked = false;
         // 暂停中 scrub（拖动/跳转）临时允许解码：解出目标帧显示画面，
         // 但保持暂停（不 start 音频、不推进播放）。
         let mut scrub_paused = false;
@@ -259,6 +264,7 @@ pub(crate) fn spawn_decode_thread(
                         // 新的预览目标：解除上一帧的定格，重新 seek 出目标关键帧。
                         preview_stall = false;
                         video_seek_target = None;
+                        eof_marked = false; // seek 解除 draining
                         // 暂停中拖动：临时允许解码出预览帧显示画面。
                         if paused {
                             scrub_paused = true;
@@ -273,6 +279,7 @@ pub(crate) fn spawn_decode_thread(
                         pending_anchor = true;
                         commit_t0 = Some(Instant::now());
                         video_seek_target = Some(t);
+                        eof_marked = false; // seek 解除 draining
                         // 音频也丢弃目标前内容，避免旧位置声音/时钟超前。
                         audio_seek_target = Some(t);
                         seek_reset_audio(&audio, &clock_source);
@@ -290,6 +297,16 @@ pub(crate) fn spawn_decode_thread(
                     _ => unreachable!(),
                 }
                 continue; // 刚 seek 过，回循环顶部读下一批命令
+            }
+
+            // 源已进入尾部排空：在解码器尾巴冲洗完成前（Ok(None) 还没到）
+            // 就标记 EOF，让声卡回调不误报欠载。seek 已清除 draining →
+            // 本条件自动回 false。
+            if !eof_marked && audio.is_some() && source.is_draining() {
+                if let Some(a) = audio.as_ref() {
+                    a.mark_eof();
+                }
+                eof_marked = true;
             }
 
             // 拖动预览「定格」：preview 模式下已把目标帧送出，停住等下一个命令，
@@ -446,9 +463,21 @@ pub(crate) fn spawn_decode_thread(
                     if source.discards_active() {
                         continue;
                     }
+                    // 真 EOF。解码尾部期空队列回调留下的陈旧欠载标记由
+                    // deliver_audio 的 is_eof_draining() 检查直接吞掉，
+                    // 不需要在此处显式 clear。
                     // EOF：等声卡缓冲播完，然后通知渲染侧，但线程不退出（可再 seek）。
                     if let Some(a) = audio.as_ref() {
+                        // 排空尾部的饥饿是「播到头了」的预期形态。宽限窗
+                        // 靠不住（排空期间的成功填充会把它关掉，实测报出
+                        // queued_ms=2490 的假欠载），用显式 EOF 态吞。
+                        a.mark_eof();
                         drain_audio(a, &running);
+                        // 排空完冻结设备：继续干转只会周期性饿回调、触发
+                        // ALSA XRUN 错误。后续 commit/恢复经冷路径重新攒
+                        // 缓冲 start()（热流条件含 !is_paused，自动兜住），
+                        // clear()/start() 会清掉 EOF 态。
+                        a.pause();
                     }
                     let _ = tx.try_send(None);
                     finished = true;

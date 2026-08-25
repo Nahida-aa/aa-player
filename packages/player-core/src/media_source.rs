@@ -157,6 +157,17 @@ pub trait MediaSource {
     /// 结束——回命令循环处理新请求后继续调用即可，线会在越过目标时
     /// 自动解除。
     fn discards_active(&self) -> bool;
+
+    /// 输入包已读完、正在排空解码器残留（文件自然到尾的收尾阶段）。
+    ///
+    /// 这个阶段可能持续秒级（Frame 线程视频管线要冲干净），期间音频
+    /// 队列会先耗尽——调用方需要在此刻就知道"这是收尾而非故障"，
+    /// 不能等 [`next_event`](Self::next_event) 返回真 EOF 才知道
+    /// （实测晚 ~2s，足以让声卡侧误报一整串欠载）。seek 会解除
+    /// draining，本方法随之回到 false。
+    fn is_draining(&self) -> bool {
+        false
+    }
 }
 
 /// seek 被「取消信号」中断（对应 Chromium 的 `CancelPendingSeek`）。
@@ -477,6 +488,10 @@ impl MediaSource for FfmpegSource {
 
     fn discards_active(&self) -> bool {
         self.video_skip_before.is_some()
+    }
+
+    fn is_draining(&self) -> bool {
+        self.draining
     }
 }
 

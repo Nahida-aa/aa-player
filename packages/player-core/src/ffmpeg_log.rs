@@ -95,6 +95,20 @@ unsafe extern "C" fn trampoline(
     route(level & 0xff, msg.trim_end());
 }
 
+/// 已知良性消息（子串匹配）：纯播放/正常 seek 也会周期性出现，
+/// 无可行动信息。降到 debug——保留可见性（RUST_LOG=debug 可查），
+/// 不污染默认 WARN 视野。清单来源：有头全程自动播放实测（treeptips
+/// HE-AACv2 全片零交互，两条各出现一次）。
+const BENIGN_SUBSTRINGS: &[&str] = &[
+    // aacdec.c：HE-AAC priming/skip 样本的时间戳修正提示。
+    "Could not update timestamps for skipped samples",
+    "Could not update timestamps for discarded samples",
+];
+
+fn is_benign(msg: &str) -> bool {
+    BENIGN_SUBSTRINGS.iter().any(|s| msg.contains(s))
+}
+
 /// 级别路由 + 节流后的实际输出。`level` 为已掩掉分类位的 AV_LOG 级别。
 pub(crate) fn route(level: i32, msg: &str) {
     if msg.is_empty() {
@@ -111,7 +125,9 @@ pub(crate) fn route(level: i32, msg: &str) {
     } else {
         msg.to_string()
     };
-    if level <= AV_LOG_ERROR {
+    if is_benign(msg) {
+        tracing::debug!("{text}");
+    } else if level <= AV_LOG_ERROR {
         tracing::error!("{text}");
     } else if level <= AV_LOG_WARNING {
         tracing::warn!("{text}");
@@ -202,5 +218,19 @@ mod tests {
         route(AV_LOG_ERROR, "route-test-error");
         route(AV_LOG_WARNING, "route-test-warning");
         route(AV_LOG_WARNING + 8, "route-test-info");
+    }
+
+    #[test]
+    fn benign_aac_timestamp_notices_are_classified() {
+        // 有头全程播放实测出现的两条良性消息必须命中清单；
+        // 真错误（如 NAL 损坏）不得被误伤。
+        assert!(is_benign(
+            "Could not update timestamps for skipped samples."
+        ));
+        assert!(is_benign(
+            "[aac] Could not update timestamps for discarded samples."
+        ));
+        assert!(!is_benign("[hevc] Invalid NAL unit size"));
+        assert!(!is_benign("Header missing"));
     }
 }

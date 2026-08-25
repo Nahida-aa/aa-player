@@ -137,9 +137,14 @@ pub(super) fn deliver_audio(
         a.queued_duration(),
     );
     if a.take_underrun() {
-        tracing::warn!(
-            queued_ms = a.queued_duration().as_millis() as u64,
-            "音频欠载：解码跟不上声卡消费"
-        );
+        // eof_draining 下的欠载是「排空尾部」的自然形态——队列耗尽后回调
+        // 空转、随后最后一块 resampler flush 入队、take_underrun 读到陈旧
+        // flag。此时 queued_ms 常常虚高（2490ms），不是真故障，不报。
+        if !a.is_eof_draining() {
+            tracing::warn!(
+                queued_ms = a.queued_duration().as_millis() as u64,
+                "音频欠载：解码跟不上声卡消费"
+            );
+        }
     }
 }

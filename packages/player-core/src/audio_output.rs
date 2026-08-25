@@ -65,6 +65,11 @@ pub struct AudioOutput {
     /// 是否官方 `start()` 过。开播前的饿回调全是预热期预期断续
     /// （设备先于数据运行），连宽限窗口都不用看。
     ever_started: Arc<AtomicBool>,
+    /// 文件已播到尾、正在/已经排空。排空尾部的断供是「播完了」而非
+    /// 「解码跟不上」——宽限窗靠不住（排空期间连续成功填充会把它关掉，
+    /// 实测自然播完时报 queued_ms=2490 的自相矛盾欠载），用显式状态。
+    /// `clear()` / `start()` 时清除（seek 重入 / 用户重新播放）。
+    eof_draining: Arc<AtomicBool>,
 }
 
 /// 播放是否真正开始过（收到过非空采样）。
@@ -106,11 +111,16 @@ fn note_starvation(
     grace_open: &AtomicBool,
     fill_streak: &AtomicU32,
     ever_started: bool,
+    eof_draining: bool,
     starved: bool,
 ) {
     const GRACE_CLOSE_STREAK: u32 = 8;
     if starved {
         fill_streak.store(0, Ordering::Relaxed);
+        // EOF 排空：播到头的自然断供，永不报欠载。
+        if eof_draining {
+            return;
+        }
         // 未官方开播：预热期饿回调全是预期，直接吞（HE-AAC 首窗
         // queued_ms≈42 的瞬态 WARN 即此来源）。
         if ever_started && !grace_open.load(Ordering::Relaxed) {
@@ -180,6 +190,7 @@ impl AudioOutput {
         let grace_open = Arc::new(AtomicBool::new(true));
         let fill_streak = Arc::new(AtomicU32::new(0));
         let ever_started = Arc::new(AtomicBool::new(false));
+        let eof_draining = Arc::new(AtomicBool::new(false));
 
         let stream = Self::build_stream(
             &device,
@@ -193,6 +204,7 @@ impl AudioOutput {
             grace_open.clone(),
             fill_streak.clone(),
             ever_started.clone(),
+            eof_draining.clone(),
         )?;
         if play {
             stream.play()?;
@@ -212,6 +224,7 @@ impl AudioOutput {
             grace_open,
             fill_streak,
             ever_started,
+            eof_draining,
         })
     }
 
@@ -219,6 +232,8 @@ impl AudioOutput {
     pub fn start(&self) {
         self._stream.play().ok();
         self.paused.store(false, Ordering::Relaxed);
+        // 离开 EOF 态（播完后再播放/seek 重入）。
+        self.eof_draining.store(false, Ordering::Relaxed);
         // 官方开播：此后断供才可能是"真欠载"。之前的饿回调都是
         // 设备先于数据的预热期，属预期断续（见 note_starvation）。
         self.ever_started.store(true, Ordering::Relaxed);
@@ -239,6 +254,7 @@ impl AudioOutput {
         grace_open: Arc<AtomicBool>,
         fill_streak: Arc<AtomicU32>,
         ever_started: Arc<AtomicBool>,
+        eof_draining: Arc<AtomicBool>,
     ) -> Result<cpal::Stream> {
         let cfg = config.config();
         let err_fn = |e| tracing::error!(error = %e, "音频流错误");
@@ -254,6 +270,7 @@ impl AudioOutput {
                 let grace_open = grace_open.clone();
                 let fill_streak = fill_streak.clone();
                 let ever_started = ever_started.clone();
+                let eof_draining = eof_draining.clone();
                 device.build_output_stream(
                     cfg.clone(),
                     move |out: &mut [$sample], _: &cpal::OutputCallbackInfo| {
@@ -266,7 +283,7 @@ impl AudioOutput {
                                     *slot = $convert(v * gain);
                                     filled += 1;
                                 }
-                                // 队列空：补静音而不是留脏数据（否则是刺耳噪声）。
+                            // 队列空：补静音而不是留脏数据（否则是刺耳噪声）。
                                 None => *slot = $convert(0.0f32),
                             }
                         }
@@ -280,6 +297,7 @@ impl AudioOutput {
                             &grace_open,
                             &fill_streak,
                             ever_started.load(Ordering::Relaxed),
+                            eof_draining.load(Ordering::Relaxed),
                             starved,
                         );
                         frames_played.fetch_add(
@@ -330,6 +348,7 @@ impl AudioOutput {
     /// 不该触发欠载告警。
     pub fn clear(&self) {
         self.arm_grace();
+        self.eof_draining.store(false, Ordering::Relaxed);
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.clear();
     }
@@ -339,6 +358,13 @@ impl AudioOutput {
     /// 丢弃时机，断续本身只改变「断供是否算故障」的语义。
     pub fn mark_discontinuity(&self) {
         self.arm_grace();
+    }
+
+    /// 标记「文件已到尾，进入排空」。排空尾部的断供是播完的自然形态，
+    /// 永不报欠载（宽限窗做不到——排空期间的成功填充会把它关掉）。
+    /// `clear()` / `start()` 清除本状态。
+    pub fn mark_eof(&self) {
+        self.eof_draining.store(true, Ordering::Relaxed);
     }
 
     /// 开启断续窗口（清零连击）。clear/mark_discontinuity/构造 共用。
@@ -393,6 +419,18 @@ impl AudioOutput {
     /// 取出并清除「发生过欠载」的标记。
     pub fn take_underrun(&self) -> bool {
         self.underrun.swap(false, Ordering::Relaxed)
+    }
+
+    /// 单纯清除欠载标记（不需要知道是否发生过）。
+    /// EOF 分支在 `Ok(None)` 后用：解码尾部期空队列回调留下的陈旧
+    /// 标记不应漂到最终 `deliver_audio` 触发假 WARN。
+    pub fn clear_underrun(&self) {
+        self.underrun.store(false, Ordering::Relaxed);
+    }
+
+    /// 是否处于 EOF 排空态（`mark_eof()` 后 `clear()`/`start()` 前）。
+    pub fn is_eof_draining(&self) -> bool {
+        self.eof_draining.load(Ordering::Relaxed)
     }
 
     /// 暂停播放。声卡设备冻结，时钟（`frames_played`）随之停走，
@@ -502,7 +540,7 @@ mod tests {
         let open = AtomicBool::new(true); // clear()/mark_discontinuity()/初始
         let streak = AtomicU32::new(0);
         for _ in 0..20 {
-            note_starvation(&underrun, &open, &streak, true, true);
+            note_starvation(&underrun, &open, &streak, true, false, true);
             assert!(!underrun.load(Ordering::Relaxed));
             assert!(open.load(Ordering::Relaxed), "窗口应保持开启");
         }
@@ -515,14 +553,14 @@ mod tests {
         let streak = AtomicU32::new(0);
         // 连续 8 次成功填充才关窗（GRACE_CLOSE_STREAK）。
         for i in 1..=8u32 {
-            note_starvation(&underrun, &open, &streak, true, false);
+            note_starvation(&underrun, &open, &streak, true, false, false);
             assert_eq!(
                 open.load(Ordering::Relaxed),
                 i < 8,
                 "第 {i} 次填充后窗口状态错误"
             );
         }
-        note_starvation(&underrun, &open, &streak, true, true); // 窗外再饿 = 真欠载
+        note_starvation(&underrun, &open, &streak, true, false, true); // 窗外再饿 = 真欠载
         assert!(underrun.load(Ordering::Relaxed));
     }
 
@@ -534,10 +572,10 @@ mod tests {
         let open = AtomicBool::new(true);
         let streak = AtomicU32::new(0);
         for _ in 0..20 {
-            note_starvation(&underrun, &open, &streak, true, false); // 涓流
-            note_starvation(&underrun, &open, &streak, true, false);
-            note_starvation(&underrun, &open, &streak, true, false);
-            note_starvation(&underrun, &open, &streak, true, true); // 顿挫
+            note_starvation(&underrun, &open, &streak, true, false, false); // 涓流
+            note_starvation(&underrun, &open, &streak, true, false, false);
+            note_starvation(&underrun, &open, &streak, true, false, false);
+            note_starvation(&underrun, &open, &streak, true, false, true); // 顿挫
             assert!(!underrun.load(Ordering::Relaxed), "涓流+顿挫不应报欠载");
             assert!(open.load(Ordering::Relaxed));
         }
@@ -548,7 +586,7 @@ mod tests {
         let underrun = AtomicBool::new(false);
         let open = AtomicBool::new(false);
         let streak = AtomicU32::new(99);
-        note_starvation(&underrun, &open, &streak, true, true);
+        note_starvation(&underrun, &open, &streak, true, false, true);
         assert!(underrun.load(Ordering::Relaxed));
     }
 
@@ -560,12 +598,30 @@ mod tests {
         let open = AtomicBool::new(false); // 连窗口都没开
         let streak = AtomicU32::new(0);
         for _ in 0..50 {
-            note_starvation(&underrun, &open, &streak, false, true);
+            note_starvation(&underrun, &open, &streak, false, false, true);
             assert!(!underrun.load(Ordering::Relaxed));
         }
         // 开播后同样的断供立刻如实上报。
-        note_starvation(&underrun, &open, &streak, true, true);
+        note_starvation(&underrun, &open, &streak, true, false, true);
         assert!(underrun.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn eof_draining_starves_never_report_even_after_grace_closes() {
+        // 自然播完的场景：排空期间连续成功填充会把宽限窗关掉（连击 8 次
+        // 关窗语义），随后队列见底的饥饿落在窗外——实测报出 queued_ms=2490
+        // 的自相矛盾 WARN。eof_draining 状态下无论窗口如何都不得上报。
+        let underrun = AtomicBool::new(false);
+        let open = AtomicBool::new(true);
+        let streak = AtomicU32::new(0);
+        // 排空期：成功填充把窗口关掉（模拟 drain_audio 期间的回调）。
+        for _ in 0..20 {
+            note_starvation(&underrun, &open, &streak, true, true, false);
+        }
+        assert!(!open.load(Ordering::Relaxed), "填充应已关闭宽限窗");
+        // 见底后的饥饿：EOF 态必须吞掉。
+        note_starvation(&underrun, &open, &streak, true, true, true);
+        assert!(!underrun.load(Ordering::Relaxed), "EOF 排空的饥饿不是故障");
     }
 
     #[test]
