@@ -20,16 +20,16 @@ dev *video:
     cargo watch -x run -- {{video}}
 
 debug:
-    RUST_LOG=player_app=debug cargo run -- ${VIDEO}
+    RUST_LOG=player_core=debug,gpui_video=debug cargo run -- ${VIDEO}
 
 dev-info:
-    RUST_LOG=player_app=info cargo run -- ${VIDEO}
+    RUST_LOG=player_core=info,gpui_video=info cargo run -- ${VIDEO}
 
 # 用环境变量 VIDEO 指定要播放的视频（绝对或相对路径）：
 #   VIDEO=/path/to/video.mp4 just video
 # 便于 shell 脚本/自动化传大视频测试。
 video:
-    cargo run -- ${VIDEO}
+    RUST_LOG=info cargo run -- ${VIDEO}
 
 # 只做类型/编译检查，不产出二进制
 check:
