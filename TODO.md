@@ -112,6 +112,27 @@
   exe 资源嵌入（build.rs 已就位）。实验工作流
   `windows-experimental.yml`（手动触发）待跑通；预计要修平台差异 bug
   （音频设备枚举、字体加载、文件对话框等）。
+- [ ] **本地交叉编译 Windows exe（cargo-xwin）** — 2026-09-03 POC 结论：
+  **暂缓，继续用 GitHub Actions 出 exe**；等官方合并后再切换。POC 进展与阻塞点：
+  - 工具链已就绪：`cargo-xwin 0.23.1`（binstall 安装）+ `x86_64-pc-windows-msvc`
+    target + clang 22.1.8（clang-cl/llvm-rc/lld-link/libclang 全齐）；
+    Windows SDK/CRT 由 xwin 自动下载缓存（~/.cache/cargo-xwin）。
+  - ffmpeg 依赖替代方案已验证：BtbN `ffmpeg-n9.0-latest-win64-lgpl-shared`
+    （include + MSVC .lib 导入库 + DLL），`FFMPEG_DIR` 指路即可，
+    ffmpeg-sys-next 9 的 bindgen 绑定与编译正常——不再依赖 vcpkg。
+  - 阻塞 ①（外部）：gpui 的 windows-manifest 资源在交叉编译下 llvm-rc
+    找不到 `gpui.manifest.xml`（[zed#62522]），修复 PR
+    [zed#62525] 未合并；本地已在 cargo git checkout 打同款 patch 验证可绕过
+    （临时，checkout 重建会丢）。
+  - 阻塞 ②（自身）：`player-core/src/ffmpeg_log.rs:73` 的日志回调用了
+    `__va_list_tag`/`vsnprintf`，Windows target 下 bindgen 不生成这两个符号，
+    需改写（MSVC 下 va_list 实为 `char*`，可自行 extern 声明 vsnprintf，
+    或换非 va_list 的日志方案）。
+  - 切换条件：zed#62525 合并进 main 并 bump 我们的 gpui rev；
+    届时一并修 ffmpeg_log.rs 的 Windows 兼容。
+
+[zed#62522]: https://github.com/zed-industries/zed/issues/62522
+[zed#62525]: https://github.com/zed-industries/zed/pull/62525
 - [ ] **帧通道容量按分辨率自适应** — FRAME_QUEUE_CAP 现固定 12（1080p 约
   100MB 内存），4K 下偏大；需要把通道创建挪进解码线程按视频尺寸收窄。
 - [ ] **音视频首帧对齐** — 当前音频时钟从首个采样开始计、视频从首帧校准原点，
