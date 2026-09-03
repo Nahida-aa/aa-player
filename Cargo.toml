@@ -48,11 +48,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [patch.crates-io]
-gpui = { git = "https://github.com/zed-industries/zed", rev = "d88f68217b370f7a66d0c4b4971db31c0dff6df7", version = "=0.2.2" }
-gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "d88f68217b370f7a66d0c4b4971db31c0dff6df7", version = "=0.1.0" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d88f68217b370f7a66d0c4b4971db31c0dff6df7", version = "=0.1.0" }
-gpui_wgpu = { git = "https://github.com/zed-industries/zed", rev = "d88f68217b370f7a66d0c4b4971db31c0dff6df7", version = "=0.1.0" }
-gpui_util = { git = "https://github.com/zed-industries/zed", rev = "d88f68217b370f7a66d0c4b4971db31c0dff6df7", version = "=0.1.0" }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "801c087af22dd189dc1aa49e2f370b4f04190b19", version = "=0.2.2" }
+gpui_macros = { git = "https://github.com/zed-industries/zed", rev = "801c087af22dd189dc1aa49e2f370b4f04190b19", version = "=0.1.0" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "801c087af22dd189dc1aa49e2f370b4f04190b19", version = "=0.1.0" }
+gpui_wgpu = { git = "https://github.com/zed-industries/zed", rev = "801c087af22dd189dc1aa49e2f370b4f04190b19", version = "=0.1.0" }
+gpui_util = { git = "https://github.com/zed-industries/zed", rev = "801c087af22dd189dc1aa49e2f370b4f04190b19", version = "=0.1.0" }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "allow" }
