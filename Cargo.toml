@@ -21,7 +21,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 # 库包将来可发布到 crates.io（单独设 true），app 包不发布（设 false）。

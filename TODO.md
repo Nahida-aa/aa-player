@@ -105,9 +105,10 @@
 ## 待办（未排期）
 
 - [ ] **AUR 上架** — PKGBUILD 双包模板已就绪（`packaging/aur/`，源码包 +
-  bin 包，makepkg 校验通过）；剩：打首个 tag 触发 Release 流水线 →
-  `updpkgsums` 填校验和 → 发布到 AUR。bin 包由
-  `.github/workflows/release.yml` 在 Arch 容器里构建（与用户系统 ffmpeg 同源）。
+  bin 包，makepkg 校验通过）。流程：打 tag 触发 Release 流水线（v0.1.1 已打）→
+  两包 `pkgver` 同步到 0.1.1 并 `updpkgsums` 填校验和 → 发布到 AUR。
+  bin 包由 `.github/workflows/release.yml` 在 Arch 容器里构建（与用户系统 ffmpeg 同源）。
+  注意：PKGBUILD 里的 `pkgver` 现仍是 0.1.0，改版本号后旧校验和失效，必须重填。
 - [ ] **Windows 移植** — gpui Windows 后端 + vcpkg LGPL 共享 ffmpeg +
   exe 资源嵌入（build.rs 已就位）。实验工作流
   `windows-experimental.yml`（手动触发）待跑通；预计要修平台差异 bug
