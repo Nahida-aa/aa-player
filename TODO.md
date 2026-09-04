@@ -125,12 +125,16 @@
     找不到 `gpui.manifest.xml`（[zed#62522]），修复 PR
     [zed#62525] 未合并；本地已在 cargo git checkout 打同款 patch 验证可绕过
     （临时，checkout 重建会丢）。
-  - 阻塞 ②（自身）：`player-core/src/ffmpeg_log.rs:73` 的日志回调用了
-    `__va_list_tag`/`vsnprintf`，Windows target 下 bindgen 不生成这两个符号，
-    需改写（MSVC 下 va_list 实为 `char*`，可自行 extern 声明 vsnprintf，
-    或换非 va_list 的日志方案）。
-  - 切换条件：zed#62525 合并进 main 并 bump 我们的 gpui rev；
-    届时一并修 ffmpeg_log.rs 的 Windows 兼容。
+  - 阻塞 ②（自身）——**已修**（commit `33586b9`）：`ffmpeg_log.rs` 的日志回调
+    用了 `__va_list_tag`/`vsnprintf`，Windows target 下 bindgen 不生成这两个
+    符号。注意这**不是交叉编译的问题**：GitHub Actions 的 MSVC+vcpkg job
+    同样挂在它上面（v0.1.1 首次构建即失败）。改为按平台分叉 va_list
+    （MSVC 是 `char*`）+ Windows 侧 extern 声明 UCRT 的 `vsnprintf`。
+  - 现状：打上阻塞 ① 的临时 patch 后，本地 `cargo xwin build` 能出可用的
+    `aa-player.exe`（debug 40MB，正确导入 avcodec/avformat/avutil/avfilter DLL）。
+    未做：release 构建、zip 组装（ffmpeg DLL + gpui 需要的 dxcompiler/dxil）。
+  - 切换条件：zed#62525 合并进 main 并 bump 我们的 gpui rev，
+    届时删掉临时 patch 即可常态使用。
 
 [zed#62522]: https://github.com/zed-industries/zed/issues/62522
 [zed#62525]: https://github.com/zed-industries/zed/pull/62525
