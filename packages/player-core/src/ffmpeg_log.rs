@@ -62,15 +62,63 @@ fn decide(map: &mut ThrottleMap, key: &str, now: Instant, window: Duration) -> O
     }
 }
 
+/// va_list 的 ABI 因平台而异：glibc 是 `__va_list_tag` 结构体，MSVC 是 `char*`。
+/// ffmpeg-sys 的绑定也不对称——Windows 目标下 bindgen 既不生成 `__va_list_tag`
+/// 也不生成 `vsnprintf`（variadic 相关符号被跳过），所以 Windows 侧自己声明。
+#[cfg(target_os = "windows")]
+type VaList = *mut core::ffi::c_char;
+#[cfg(not(target_os = "windows"))]
+type VaList = *mut ffmpeg_next::ffi::__va_list_tag;
+
+#[cfg(target_os = "windows")]
+unsafe extern "C" {
+    /// UCRT 导出的 C99 `vsnprintf`：返回格式化所需的长度（截断时返回该长度、
+    /// 出错返回负数），并保证 NUL 结尾——与 glibc 一致，故长度处理两侧共用。
+    fn vsnprintf(
+        buf: *mut core::ffi::c_char,
+        n: usize,
+        fmt: *const core::ffi::c_char,
+        args: VaList,
+    ) -> core::ffi::c_int;
+}
+
+/// 把 ffmpeg 的 (fmt, va_list) 格式化进 buf，返回写入长度（<=0 表示失败）。
+///
+/// SAFETY: fmt 与 args 必须合法且相互匹配（由 libavutil 的调用契约保证）。
+unsafe fn format_message(
+    buf: &mut [u8],
+    fmt: *const core::ffi::c_char,
+    args: VaList,
+) -> core::ffi::c_int {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        vsnprintf(
+            buf.as_mut_ptr() as *mut core::ffi::c_char,
+            buf.len(),
+            fmt,
+            args,
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    unsafe {
+        ffmpeg_next::ffi::vsnprintf(
+            buf.as_mut_ptr() as *mut core::ffi::c_char,
+            buf.len() as u64,
+            fmt,
+            args,
+        )
+    }
+}
+
 /// C 层回调：格式化消息后交给 [`route`]。
 ///
 /// SAFETY: 由 libavutil 调用；fmt 是合法 C 格式串，args 与之匹配
-/// （ffmpeg 保证）。vsnprintf 按 ffmpeg-sys 绑定的 va_list ABI 调用。
+/// （ffmpeg 保证）。vsnprintf 按当前的 va_list ABI 调用（见 [`VaList`]）。
 unsafe extern "C" fn trampoline(
     _avcl: *mut core::ffi::c_void,
     level: core::ffi::c_int,
     fmt: *const core::ffi::c_char,
-    args: *mut ffmpeg_next::ffi::__va_list_tag,
+    args: VaList,
 ) {
     // QUIET(-8) 是上游的显式静音请求，尊重之（它是精确级别，无分类位）；
     // INFO 及以下默认门槛已挡，这里不再重复判断（set_level 控制生成端）。
@@ -79,14 +127,7 @@ unsafe extern "C" fn trampoline(
     }
     // SAFETY: 见函数级文档；buf/len/fmt/args 均为合法匹配的调用。
     let mut buf = [0u8; 1024];
-    let n = unsafe {
-        ffmpeg_next::ffi::vsnprintf(
-            buf.as_mut_ptr() as *mut core::ffi::c_char,
-            buf.len() as u64,
-            fmt,
-            args,
-        )
-    };
+    let n = unsafe { format_message(&mut buf, fmt, args) };
     if n <= 0 {
         return;
     }
